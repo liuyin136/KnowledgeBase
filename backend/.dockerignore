@@ -1,0 +1,65 @@
+# =============================================================================
+# backend/.dockerignore — Local-First RAG Experimentation Platform v1.2
+# Applies to the backend build (context = backend/).
+# Keeps the model-downloader + runtime images lean.
+# =============================================================================
+
+# ---- Python caches ----
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+.tox
+
+# ---- Virtual envs ----
+.venv
+venv
+env
+
+# ---- Models downloaded locally during dev ----
+# The Dockerfile's stage 1 downloads models fresh into /app/models; any
+# host-side downloads (e.g. dev `python scripts/download_models.py` runs)
+# must NOT be copied into the image (bloats it by ~2.4 GB).
+models
+*.bin
+*.safetensors
+*.onnx
+*.gguf
+
+# ---- Tests + docs ----
+tests
+docs
+*.md
+!README.md
+
+# ---- VCS / OS noise ----
+.git
+.gitignore
+.DS_Store
+Thumbs.db
+
+# ---- IDE ----
+.vscode
+.idea
+*.swp
+
+# ---- Env / secrets ----
+.env
+.env.*
+!.env.example
+
+# ---- Experiment artifacts (per infra spec §5 EXPERIMENT_STORAGE_PATH) ----
+experiments
+runs
+outputs
+
+# ---- Dockerfiles (not needed inside the image) ----
+Dockerfile*
+docker-compose*
+.dockerignore

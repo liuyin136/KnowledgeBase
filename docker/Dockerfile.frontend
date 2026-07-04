@@ -1,0 +1,94 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# Dockerfile.frontend — Local-First RAG Experimentation Platform v1.2
+# Multi-stage build (standalone Next.js output → tiny runtime image).
+#
+# Build context: .. (project root)   (set in docker/docker-compose.yml)
+#   → COPY paths inside this Dockerfile are relative to the project root.
+#
+#   Stage 1 (builder) : node:22-alpine + bun (for fast installs) → next build
+#                       with `output: "standalone"` (verified in next.config.ts).
+#   Stage 2 (runner)  : node:22-alpine, copies .next/standalone + static + public,
+#                       runs `node server.js`. Final image ~150 MB.
+#
+# Why node:22-alpine instead of oven/bun as the runner base:
+#   Next.js standalone output is a Node.js bundle — `node server.js` is the
+#   official entry point. Bun can run it too, but Node 22 is the documented
+#   production runtime and avoids subtle compat issues with Next 16.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Stage 1 — builder
+# -----------------------------------------------------------------------------
+FROM node:22-alpine AS builder
+
+# Bun is used purely for fast dependency install on the host. We install it
+# inside the builder stage only (the runner stage stays Node-only).
+RUN apk add --no-cache libc6-compat \
+ && npm install -g bun@1.1.42
+
+WORKDIR /app
+
+# Next.js telemetry off — keeps build logs clean.
+ENV NEXT_TELEMETRY_DISABLED=1 \
+    NODE_ENV=production
+
+# Copy lockfile + manifests first for layer caching. The project uses bun.lock
+# (verified at repo root); fall back to package-lock.json if a future migration
+# swaps it. Both are present-tolerant via wildcards.
+COPY package.json ./
+COPY bun.lock* package-lock.json* yarn.lock* pnpm-lock.yaml* ./
+
+# Install deps. Prefer bun; fall back to npm ci if no bun.lock.
+RUN if [ -f bun.lock ]; then \
+        bun install --frozen-lockfile; \
+    elif [ -f package-lock.json ]; then \
+        npm ci; \
+    else \
+        echo "No lockfile found — running bun install without --frozen-lockfile"; \
+        bun install; \
+    fi
+
+# Copy the rest of the source. The root .dockerignore excludes node_modules,
+# .next, .git, etc., so this is clean.
+COPY . .
+
+# Sanity-check that standalone output is enabled before building. If a future
+# edit removes it, fail the build loudly instead of producing a broken image.
+RUN grep -q 'output.*standalone' next.config.ts next.config.js next.config.mjs 2>/dev/null \
+    || { echo "FATAL: next.config.* must set output: 'standalone'"; exit 1; }
+
+# Build. Standalone output lands in .next/standalone (server.js + minimal deps).
+RUN bun run build || npx next build
+
+# -----------------------------------------------------------------------------
+# Stage 2 — runner
+# -----------------------------------------------------------------------------
+FROM node:22-alpine AS runner
+
+# Run as non-root. node:alpine ships a `node` user (uid 1001).
+WORKDIR /app
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0 \
+    # Backend URL the Next.js server uses for server-side fetches. Resolvable
+    # inside the compose network as `backend`.
+    BACKEND_URL=http://backend:8000 \
+    # Empty by design — the frontend talks to its OWN /api/v1/* routes which
+    # proxy to the backend. Browser-side code never calls the backend directly
+    # (avoids CORS + leaking internal hostnames).
+    NEXT_PUBLIC_BACKEND_URL=
+
+# Copy the standalone server (includes node_modules needed at runtime).
+COPY --from=builder /app/.next/standalone ./
+# Static assets are NOT included in standalone output — copy separately.
+COPY --from=builder /app/.next/static ./.next/static
+# Public folder (favicon, robots.txt, logo.svg, etc.).
+COPY --from=builder /app/public ./public
+
+USER node
+
+EXPOSE 3000
+
+CMD ["node", "server.js"]

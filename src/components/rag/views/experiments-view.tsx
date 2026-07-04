@@ -13,11 +13,13 @@
  */
 
 import * as React from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow } from "date-fns";
-import { api } from "@/lib/api-client";
+import { api, isBackendOffline } from "@/lib/api-client";
 import type { ChunkMetadata } from "@/lib/rag/types";
 import { ViewHeader, ViewBody } from "@/components/rag/shared/view-header";
+import { BackendOffline } from "@/components/rag/shared/backend-offline";
+import { MarkdownEditor, MarkdownRender } from "@/components/rag/shared/markdown-editor";
 import { useUIStore } from "@/store/use-ui-store";
 import { cn } from "@/lib/utils";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -34,6 +36,7 @@ import {
 } from "@/components/ui/table";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import {
   Dialog,
   DialogClose,
@@ -47,6 +50,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Separator } from "@/components/ui/separator";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { toast } from "sonner";
 import {
   ArrowLeft,
   FlaskConical,
@@ -67,6 +71,9 @@ import {
   XCircle,
   Loader2,
   CircleDashed,
+  Save,
+  FileCode2,
+  Info,
 } from "lucide-react";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -461,6 +468,235 @@ function ChunkBrowser({ experimentId }: { experimentId: string }) {
   );
 }
 
+// ─── Source Document (reconstructed from chunks, with MD editor) ────────────
+/**
+ * SourceDocumentSection — v1.2 requirement #6.
+ *
+ * The Experiment node only has the `sourceFile` filename, not the full text.
+ * We reconstruct the document by concatenating chunk texts (sorted by
+ * chunkIndex) and present it in a Tabs view:
+ *   - "Rendered": react-markdown preview (read-only).
+ *   - "Raw":      MDXEditor with toolbar (editable). A "Save as new document"
+ *                 button POSTs the edited text as a new Knowledge document
+ *                 (non-destructive — the original experiment's chunks are
+ *                 untouched). The researcher can then re-run ingest on the
+ *                 edited source from the Ingest view.
+ *
+ * Backend-offline (HTTP 503) → shared <BackendOffline/> component.
+ */
+function SourceDocumentSection({
+  experimentId,
+  sourceFile,
+}: {
+  experimentId: string;
+  sourceFile?: string | null;
+}) {
+  const qc = useQueryClient();
+  const { data, isLoading, isError, error, refetch } = useQuery({
+    queryKey: ["experiment", experimentId, "chunks"],
+    queryFn: () => api.experiments.chunks(experimentId),
+  });
+
+  const chunks = ((data?.items ?? []) as ChunkRow[]).slice().sort(
+    (a, b) => (a.chunkIndex ?? 0) - (b.chunkIndex ?? 0),
+  );
+
+  // Reconstruct: join chunk texts with blank lines (preserve structure).
+  const reconstructed = React.useMemo(() => {
+    return chunks
+      .map((c) => c.text ?? c.textPreview ?? "")
+      .filter((t) => t.length > 0)
+      .join("\n\n");
+  }, [chunks]);
+
+  const [mode, setMode] = React.useState<"rendered" | "raw">("rendered");
+  const [edited, setEdited] = React.useState<string>("");
+  const [hasEdits, setHasEdits] = React.useState(false);
+
+  // Seed the editor with the reconstructed text whenever it changes
+  // (e.g. first load, or refetch). Only when the user hasn't started editing.
+  React.useEffect(() => {
+    if (!hasEdits) setEdited(reconstructed);
+  }, [reconstructed, hasEdits]);
+
+  const saveMut = useMutation({
+    mutationFn: (text: string) =>
+      api.documents.create({
+        filename: `${sourceFile ?? "document"} (edited)`,
+        text,
+        contentType: "text/markdown",
+      }),
+    onSuccess: (res) => {
+      toast.success("Saved as new document", {
+        description: `Created "${sourceFile ?? "document"} (edited)" — re-run ingest from the Ingest view to test the modified source.`,
+      });
+      qc.invalidateQueries({ queryKey: ["documents"] });
+      qc.invalidateQueries({ queryKey: ["dashboard"] });
+      setHasEdits(false);
+      void res;
+    },
+    onError: (e: unknown) => {
+      const msg = e instanceof Error ? e.message : "Failed to save document";
+      toast.error("Save failed", { description: msg });
+    },
+  });
+
+  const handleEditorChange = (v: string) => {
+    setEdited(v);
+    setHasEdits(v !== reconstructed);
+  };
+
+  const charCount = edited.length;
+  const chunkCount = chunks.length;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <FileCode2 className="h-4 w-4 text-primary" />
+          Source Document
+        </CardTitle>
+        <CardDescription className="text-xs flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span>
+            Reconstructed from <span className="font-mono">{chunkCount}</span> chunk
+            {chunkCount === 1 ? "" : "s"}
+          </span>
+          <span aria-hidden>·</span>
+          <span className="font-mono">{charCount.toLocaleString()} chars</span>
+          {sourceFile && (
+            <>
+              <span aria-hidden>·</span>
+              <span className="text-muted-foreground truncate max-w-[260px]" title={sourceFile}>
+                original: {sourceFile}
+              </span>
+            </>
+          )}
+        </CardDescription>
+        <CardAction>
+          <Tabs value={mode} onValueChange={(v) => setMode(v as "rendered" | "raw")}>
+            <TabsList className="h-7">
+              <TabsTrigger value="rendered" className="text-xs h-5 px-2.5">Rendered</TabsTrigger>
+              <TabsTrigger value="raw" className="text-xs h-5 px-2.5">Raw</TabsTrigger>
+            </TabsList>
+          </Tabs>
+        </CardAction>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {/* Loading */}
+        {isLoading && (
+          <div className="space-y-2">
+            <Skeleton className="h-5 w-2/3" />
+            <Skeleton className="h-4 w-full" />
+            <Skeleton className="h-4 w-5/6" />
+            <Skeleton className="h-4 w-3/4" />
+            <Skeleton className="h-4 w-4/5" />
+          </div>
+        )}
+
+        {/* Backend offline */}
+        {!isLoading && isError && isBackendOffline(error) && (
+          <BackendOffline
+            onRetry={() => refetch()}
+            message="The FastAPI backend is not reachable, so the experiment's chunks cannot be loaded. Start the Docker stack (`docker compose up -d`) and retry."
+          />
+        )}
+
+        {/* Generic error */}
+        {!isLoading && isError && !isBackendOffline(error) && (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Failed to load chunks</AlertTitle>
+            <AlertDescription className="flex items-center justify-between gap-3">
+              <span className="text-xs">
+                {error instanceof Error ? error.message : "Unknown error"}
+              </span>
+              <Button size="sm" variant="outline" onClick={() => refetch()}>
+                Retry
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {/* Empty */}
+        {!isLoading && !isError && chunkCount === 0 && (
+          <div className="rounded-md border border-dashed p-8 text-center">
+            <Inbox className="mx-auto h-8 w-8 text-muted-foreground mb-2" />
+            <p className="text-sm text-muted-foreground">
+              No chunks recorded for this experiment.
+            </p>
+          </div>
+        )}
+
+        {/* Rendered view */}
+        {!isLoading && !isError && chunkCount > 0 && mode === "rendered" && (
+          <div className="rounded-md border bg-background p-4 max-h-[55vh] overflow-y-auto thin-scroll">
+            <MarkdownRender value={reconstructed} />
+          </div>
+        )}
+
+        {/* Raw / editable view */}
+        {!isLoading && !isError && chunkCount > 0 && mode === "raw" && (
+          <>
+            <Alert className="border-primary/30 bg-primary/5">
+              <Info className="h-4 w-4 text-primary" />
+              <AlertDescription className="text-xs text-foreground/80">
+                Editing the reconstructed source does not modify the original
+                experiment. Click <strong>Save as new document</strong> to
+                create a new Knowledge node — then re-run ingest from the
+                Ingest view to test retrieval on the modified source.
+              </AlertDescription>
+            </Alert>
+            <MarkdownEditor
+              value={edited}
+              onChange={handleEditorChange}
+              placeholder="Edit the reconstructed markdown source…"
+              ariaLabel="Reconstructed source markdown editor"
+              className="min-h-[280px]"
+            />
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="text-xs text-muted-foreground">
+                {hasEdits ? (
+                  <span className="text-primary">● Unsaved changes</span>
+                ) : (
+                  <span>No changes</span>
+                )}
+                <span className="mx-2" aria-hidden>·</span>
+                <span className="font-mono">{charCount.toLocaleString()} chars</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={!hasEdits || saveMut.isPending}
+                  onClick={() => {
+                    setEdited(reconstructed);
+                    setHasEdits(false);
+                  }}
+                >
+                  Reset
+                </Button>
+                <Button
+                  size="sm"
+                  disabled={!hasEdits || saveMut.isPending}
+                  onClick={() => saveMut.mutate(edited)}
+                  className="gap-1.5"
+                >
+                  {saveMut.isPending ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Save className="h-3.5 w-3.5" />
+                  )}
+                  Save as new document
+                </Button>
+              </div>
+            </div>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 // ─── Detail Mode ────────────────────────────────────────────────────────────
 function DetailMode({
   experimentId,
@@ -471,7 +707,7 @@ function DetailMode({
   onBack: () => void;
   onCompareWith: (otherId: string) => void;
 }) {
-  const { data: exp, isLoading, isError, refetch } = useQuery({
+  const { data: exp, isLoading, isError, error, refetch } = useQuery({
     queryKey: ["experiment", experimentId],
     queryFn: () => api.experiments.get(experimentId),
   });
@@ -504,11 +740,19 @@ function DetailMode({
   if (isError || !exp) {
     return (
       <Card>
-        <CardContent className="pt-6">
-          <div className="flex items-center gap-2 text-sm text-destructive">
-            <AlertCircle className="h-4 w-4" /> Failed to load experiment.
-          </div>
-          <div className="flex gap-2 mt-3">
+        <CardContent className="pt-6 space-y-3">
+          {isBackendOffline(error) ? (
+            <BackendOffline
+              title="Backend offline"
+              message="The FastAPI backend is not reachable, so this experiment's metadata cannot be loaded. Start the Docker stack (`docker compose up -d`) and retry."
+              onRetry={() => refetch()}
+            />
+          ) : (
+            <div className="flex items-center gap-2 text-sm text-destructive">
+              <AlertCircle className="h-4 w-4" /> Failed to load experiment.
+            </div>
+          )}
+          <div className="flex gap-2">
             <Button variant="outline" size="sm" onClick={onBack}>← Back</Button>
             <Button variant="outline" size="sm" onClick={() => refetch()}>Retry</Button>
           </div>
@@ -565,6 +809,14 @@ function DetailMode({
       </Card>
 
       <ChunkBrowser experimentId={experimentId} />
+
+      {/* Source document editor (v1.2 requirement #6) */}
+      {!isSearchExp(exp as Experiment) && (
+        <SourceDocumentSection
+          experimentId={experimentId}
+          sourceFile={(exp as Experiment).sourceFile}
+        />
+      )}
 
       {/* Compare-with picker */}
       <ComparePickerDialog
@@ -995,7 +1247,7 @@ function ExperimentTable({
     setPage(1);
   }, [kind]);
 
-  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: ["experiments", "list", { kind, page, pageSize }],
     queryFn: () =>
       api.experiments.list({
@@ -1067,10 +1319,20 @@ function ExperimentTable({
                 ))
               ) : isError ? (
                 <TableRow>
-                  <TableCell colSpan={10} className="text-xs text-destructive">
-                    <div className="flex items-center gap-2 py-2">
-                      <AlertCircle className="h-4 w-4" /> Failed to load experiments.
-                    </div>
+                  <TableCell colSpan={10}>
+                    {isBackendOffline(error) ? (
+                      <div className="py-2">
+                        <BackendOffline
+                          compact
+                          onRetry={() => refetch()}
+                          message="The FastAPI backend is not reachable, so experiments cannot be loaded."
+                        />
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2 py-2 text-xs text-destructive">
+                        <AlertCircle className="h-4 w-4" /> Failed to load experiments.
+                      </div>
+                    )}
                   </TableCell>
                 </TableRow>
               ) : items.length === 0 ? (

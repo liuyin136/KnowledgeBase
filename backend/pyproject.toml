@@ -1,0 +1,25 @@
+[project]
+name = "rag-lab-backend"
+version = "1.2.0"
+description = "FastAPI backend for the Local-First RAG Experimentation Platform v1.2 (Neo4j + Redis + BGE-M3 on GPU). Canonical backend per the directive; the Next.js app proxies to it."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "RAG Lab Team" },
+]
+license = { text = "MIT" }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]  # line-length handled by formatter
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]

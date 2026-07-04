@@ -1,0 +1,1261 @@
+     1→"use client";
+     2→
+     3→/**
+     4→ * ExperimentsView — Experiments Page (Frontend_Workflow_Mapping v1.1 §3).
+     5→ * Three local modes: "list" | "detail" | "compare".
+     6→ *
+     7→ *   • list    — paginated table with kind filter + comparison checkbox (max 2).
+     8→ *   • detail  — observability stat cards + chunk browser + chunk inspector sheet.
+     9→ *   • compare — side-by-side stat panels + Δ comparison table + chunk/token bars.
+    10→ *
+    11→ * Auto-opens detail for `useUIStore.activeExperimentId` on mount; the back
+    12→ * button clears it and returns to list.
+    13→ */
+    14→
+    15→import * as React from "react";
+    16→import { useQuery } from "@tanstack/react-query";
+    17→import { formatDistanceToNow } from "date-fns";
+    18→import { api } from "@/lib/api-client";
+    19→import type { ChunkMetadata } from "@/lib/rag/types";
+    20→import { ViewHeader, ViewBody } from "@/components/rag/shared/view-header";
+    21→import { useUIStore } from "@/store/use-ui-store";
+    22→import { cn } from "@/lib/utils";
+    23→import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+    24→import { Button } from "@/components/ui/button";
+    25→import { Badge } from "@/components/ui/badge";
+    26→import { Checkbox } from "@/components/ui/checkbox";
+    27→import {
+    28→  Table,
+    29→  TableBody,
+    30→  TableCell,
+    31→  TableHead,
+    32→  TableHeader,
+    33→  TableRow,
+    34→} from "@/components/ui/table";
+    35→import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+    36→import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+    37→import {
+    38→  Dialog,
+    39→  DialogClose,
+    40→  DialogContent,
+    41→  DialogDescription,
+    42→  DialogFooter,
+    43→  DialogHeader,
+    44→  DialogTitle,
+    45→} from "@/components/ui/dialog";
+    46→import { Skeleton } from "@/components/ui/skeleton";
+    47→import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+    48→import { Separator } from "@/components/ui/separator";
+    49→import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+    50→import {
+    51→  ArrowLeft,
+    52→  FlaskConical,
+    53→  RefreshCw,
+    54→  Clock,
+    55→  AlertCircle,
+    56→  Eye,
+    57→  Boxes,
+    58→  Layers,
+    59→  Gauge,
+    60→  FileText,
+    61→  Hash,
+    62→  Timer,
+    63→  Settings2,
+    64→  GitCompareArrows,
+    65→  Inbox,
+    66→  CheckCircle2,
+    67→  XCircle,
+    68→  Loader2,
+    69→  CircleDashed,
+    70→} from "lucide-react";
+    71→
+    72→// ─── Types ───────────────────────────────────────────────────────────────────
+    73→type ExperimentStatus = "pending" | "running" | "completed" | "failed";
+    74→
+    75→interface Experiment {
+    76→  id: string;
+    77→  description: string;
+    78→  embeddingApproach: string;
+    79→  chunkMethod: string;
+    80→  advOption: string;
+    81→  sourceFile?: string | null;
+    82→  totalChunks: number;
+    83→  avgTokensPerChunk: number;
+    84→  totalTimeMs: number;
+    85→  status: ExperimentStatus;
+    86→  errorCode?: string | null;
+    87→  errorMessage?: string | null;
+    88→  // Search-run specific (null for ingest)
+    89→  hybridAlpha?: number | null;
+    90→  useBm25?: boolean | null;
+    91→  useReranker?: boolean | null;
+    92→  topKVector?: number | null;
+    93→  topNRerank?: number | null;
+    94→  parentContextLevels?: number | null;
+    95→  autoTuneWeights?: boolean | null;
+    96→  bestAlpha?: number | null;
+    97→  rawQuery?: string | null;
+    98→  createdAt: string;
+    99→  updatedAt: string;
+   100→}
+   101→
+   102→// Chunks endpoint returns text + parentSourceFile in addition to ChunkMetadata.
+   103→interface ChunkRow extends ChunkMetadata {
+   104→  text: string;
+   105→  parentSourceFile: string;
+   106→}
+   107→
+   108→type Mode = "list" | "detail" | "compare";
+   109→
+   110→// ─── Helpers ─────────────────────────────────────────────────────────────────
+   111→function relativeTime(d: string | Date | null | undefined): string {
+   112→  if (!d) return "—";
+   113→  try {
+   114→    return formatDistanceToNow(new Date(d), { addSuffix: true });
+   115→  } catch {
+   116→    return "—";
+   117→  }
+   118→}
+   119→
+   120→function fmtMs(ms: number | null | undefined): string {
+   121→  if (ms === null || ms === undefined || Number.isNaN(ms)) return "—";
+   122→  if (ms >= 1000) return `${(ms / 1000).toFixed(2)}s`;
+   123→  return `${Math.round(ms)}ms`;
+   124→}
+   125→
+   126→function fmtNum(n: number | null | undefined, digits = 0): string {
+   127→  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+   128→  return n.toLocaleString(undefined, { maximumFractionDigits: digits });
+   129→}
+   130→
+   131→function isSearchExp(e: Experiment): boolean {
+   132→  return e.embeddingApproach === "Query";
+   133→}
+   134→
+   135→function statusBadge(status: ExperimentStatus) {
+   136→  const map: Record<ExperimentStatus, { cls: string; icon: React.ReactNode; label: string }> = {
+   137→    completed: {
+   138→      cls: "border-transparent bg-primary/15 text-primary",
+   139→      icon: <CheckCircle2 className="h-3 w-3" />,
+   140→      label: "completed",
+   141→    },
+   142→    failed: {
+   143→      cls: "border-transparent bg-destructive/15 text-destructive",
+   144→      icon: <XCircle className="h-3 w-3" />,
+   145→      label: "failed",
+   146→    },
+   147→    running: {
+   148→      cls: "border-transparent bg-amber-500/15 text-amber-600 dark:text-amber-400",
+   149→      icon: <Loader2 className="h-3 w-3 animate-spin" />,
+   150→      label: "running",
+   151→    },
+   152→    pending: {
+   153→      cls: "border-transparent bg-slate-500/15 text-slate-600 dark:text-slate-300",
+   154→      icon: <CircleDashed className="h-3 w-3" />,
+   155→      label: "pending",
+   156→    },
+   157→  };
+   158→  const s = map[status] ?? map.pending;
+   159→  return (
+   160→    <Badge variant="outline" className={cn("gap-1 text-[10px] font-medium", s.cls)}>
+   161→      {s.icon}
+   162→      {s.label}
+   163→    </Badge>
+   164→  );
+   165→}
+   166→
+   167→function approachBadge(approach: string) {
+   168→  if (approach === "Query") {
+   169→    return <Badge variant="secondary" className="text-[10px]">Query</Badge>;
+   170→  }
+   171→  if (approach === "LongText") {
+   172→    return <Badge variant="default" className="text-[10px]">LongText</Badge>;
+   173→  }
+   174→  if (approach === "ChildChunk") {
+   175→    return <Badge className="text-[10px] bg-primary/85">ChildChunk</Badge>;
+   176→  }
+   177→  return <Badge variant="outline" className="text-[10px]">{approach}</Badge>;
+   178→}
+   179→
+   180→function chunkMethodBadge(method: string) {
+   181→  if (method === "N/A" || !method) return <span className="text-xs text-muted-foreground">N/A</span>;
+   182→  return <Badge variant="outline" className="text-[10px]">{method}</Badge>;
+   183→}
+   184→
+   185→// ─── Stat card (observability) ──────────────────────────────────────────────
+   186→function StatCard({
+   187→  icon: Icon,
+   188→  label,
+   189→  value,
+   190→  hint,
+   191→  mono,
+   192→}: {
+   193→  icon: React.ComponentType<{ className?: string }>;
+   194→  label: string;
+   195→  value: React.ReactNode;
+   196→  hint?: string;
+   197→  mono?: boolean;
+   198→}) {
+   199→  return (
+   200→    <div className="rounded-lg border bg-card p-3 flex flex-col gap-1">
+   201→      <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted-foreground">
+   202→        <Icon className="h-3 w-3" />
+   203→        {label}
+   204→      </div>
+   205→      <div className={cn("text-sm font-medium", mono && "font-mono text-xs")}>{value}</div>
+   206→      {hint && <div className="text-[10px] text-muted-foreground">{hint}</div>}
+   207→    </div>
+   208→  );
+   209→}
+   210→
+   211→// ─── Observability Panel ────────────────────────────────────────────────────
+   212→function ObservabilityPanel({ exp, chunks }: { exp: Experiment; chunks?: ChunkRow[] }) {
+   213→  const totalChunkingMs = chunks?.reduce((s, c) => s + (c.chunkingTimeMs || 0), 0);
+   214→  const totalEmbeddingMs = chunks?.reduce((s, c) => s + (c.embeddingTimeMs || 0), 0);
+   215→  const search = isSearchExp(exp);
+   216→
+   217→  return (
+   218→    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2.5">
+   219→      <StatCard icon={Boxes} label="Total chunks" value={fmtNum(exp.totalChunks)} mono />
+   220→      <StatCard
+   221→        icon={Hash}
+   222→        label="Avg tokens / chunk"
+   223→        value={fmtNum(exp.avgTokensPerChunk, 1)}
+   224→        mono
+   225→      />
+   226→      <StatCard icon={Timer} label="Total time" value={fmtMs(exp.totalTimeMs)} mono />
+   227→      <StatCard icon={Gauge} label="Status" value={statusBadge(exp.status)} />
+   228→      <StatCard icon={Layers} label="Embedding" value={approachBadge(exp.embeddingApproach)} />
+   229→      <StatCard icon={Layers} label="Chunk method" value={chunkMethodBadge(exp.chunkMethod)} />
+   230→      <StatCard icon={Settings2} label="Adv option" value={exp.advOption || "None"} mono />
+   231→      <StatCard
+   232→        icon={FileText}
+   233→        label="Source file"
+   234→        value={
+   235→          <span className="truncate block max-w-full" title={exp.sourceFile ?? ""}>
+   236→            {exp.sourceFile ?? "—"}
+   237→          </span>
+   238→        }
+   239→      />
+   240→      {chunks && (
+   241→        <>
+   242→          <StatCard icon={Timer} label="Σ Chunking ms" value={fmtMs(totalChunkingMs)} mono />
+   243→          <StatCard icon={Timer} label="Σ Embedding ms" value={fmtMs(totalEmbeddingMs)} mono />
+   244→        </>
+   245→      )}
+   246→      {search && (
+   247→        <>
+   248→          <StatCard
+   249→            icon={Settings2}
+   250→            label="Hybrid α"
+   251→            value={exp.hybridAlpha != null ? exp.hybridAlpha.toFixed(2) : "—"}
+   252→            mono
+   253→            hint={exp.autoTuneWeights ? "auto-tuned" : "manual"}
+   254→          />
+   255→          <StatCard
+   256→            icon={Settings2}
+   257→            label="BM25"
+   258→            value={exp.useBm25 ? "on" : "off"}
+   259→          />
+   260→          <StatCard
+   261→            icon={Settings2}
+   262→            label="Reranker"
+   263→            value={exp.useReranker ? "on" : "off"}
+   264→          />
+   265→          <StatCard icon={Hash} label="topK vector" value={fmtNum(exp.topKVector)} mono />
+   266→          <StatCard icon={Hash} label="topN rerank" value={fmtNum(exp.topNRerank)} mono />
+   267→          <StatCard
+   268→            icon={Settings2}
+   269→            label="Parent context"
+   270→            value={fmtNum(exp.parentContextLevels)}
+   271→            mono
+   272→          />
+   273→          {exp.autoTuneWeights && (
+   274→            <StatCard
+   275→              icon={Gauge}
+   276→              label="Best α (sweep)"
+   277→              value={exp.bestAlpha != null ? exp.bestAlpha.toFixed(2) : "—"}
+   278→              mono
+   279→            />
+   280→          )}
+   281→          {exp.rawQuery && (
+   282→            <StatCard
+   283→              icon={FileText}
+   284→              label="Raw query"
+   285→              value={
+   286→                <span className="text-xs line-clamp-2" title={exp.rawQuery}>
+   287→                  {exp.rawQuery}
+   288→                </span>
+   289→              }
+   290→            />
+   291→          )}
+   292→        </>
+   293→      )}
+   294→    </div>
+   295→  );
+   296→}
+   297→
+   298→// ─── Chunk Inspector Sheet ──────────────────────────────────────────────────
+   299→function ChunkInspectorSheet({
+   300→  chunk,
+   301→  open,
+   302→  onOpenChange,
+   303→}: {
+   304→  chunk: ChunkRow | null;
+   305→  open: boolean;
+   306→  onOpenChange: (v: boolean) => void;
+   307→}) {
+   308→  if (!chunk) return null;
+   309→  return (
+   310→    <Sheet open={open} onOpenChange={onOpenChange}>
+   311→      <SheetContent side="right" className="sm:max-w-lg overflow-y-auto thin-scroll">
+   312→        <SheetHeader>
+   313→          <SheetTitle className="text-base">Chunk inspector</SheetTitle>
+   314→          <SheetDescription className="text-xs">
+   315→            chunkId: <span className="font-mono">{chunk.chunkId}</span>
+   316→          </SheetDescription>
+   317→        </SheetHeader>
+   318→        <div className="px-4 pb-6 space-y-4 text-sm">
+   319→          <div className="space-y-1">
+   320→            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Text</div>
+   321→            <div className="rounded-md bg-muted/50 p-2.5 text-sm leading-relaxed whitespace-pre-wrap max-h-72 overflow-y-auto thin-scroll">
+   322→              {chunk.text}
+   323→            </div>
+   324→          </div>
+   325→          <Separator />
+   326→          <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+   327→            <MetaCell label="Chunk index" value={fmtNum(chunk.chunkIndex)} mono />
+   328→            <MetaCell label="Method" value={chunk.chunkMethod} />
+   329→            <MetaCell label="Embedding" value={chunk.embeddingMethod} />
+   330→            <MetaCell label="Tokens" value={fmtNum(chunk.tokenCount)} mono />
+   331→            <MetaCell label="Chunking ms" value={fmtMs(chunk.chunkingTimeMs)} mono />
+   332→            <MetaCell label="Embedding ms" value={fmtMs(chunk.embeddingTimeMs)} mono />
+   333→            <MetaCell
+   334→              label="Char range"
+   335→              value={
+   336→                chunk.charStart != null && chunk.charEnd != null
+   337→                  ? `${chunk.charStart}–${chunk.charEnd}`
+   338→                  : "—"
+   339→              }
+   340→              mono
+   341→            />
+   342→            <MetaCell label="Section" value={chunk.section ?? "—"} />
+   343→          </div>
+   344→          <div className="rounded-md border p-2 text-xs">
+   345→            <div className="text-[10px] text-muted-foreground uppercase tracking-wide mb-0.5">
+   346→              Parent source file
+   347→            </div>
+   348→            <div className="font-mono break-all">{chunk.parentSourceFile}</div>
+   349→          </div>
+   350→        </div>
+   351→      </SheetContent>
+   352→    </Sheet>
+   353→  );
+   354→}
+   355→
+   356→function MetaCell({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+   357→  return (
+   358→    <div className="rounded-md border p-2">
+   359→      <div className="text-[10px] text-muted-foreground uppercase tracking-wide">{label}</div>
+   360→      <div className={cn("text-sm mt-0.5", mono && "font-mono text-xs")}>{value}</div>
+   361→    </div>
+   362→  );
+   363→}
+   364→
+   365→// ─── Chunk Browser (detail mode) ────────────────────────────────────────────
+   366→function ChunkBrowser({ experimentId }: { experimentId: string }) {
+   367→  const { data, isLoading, isError, refetch } = useQuery({
+   368→    queryKey: ["experiment", experimentId, "chunks"],
+   369→    queryFn: () => api.experiments.chunks(experimentId),
+   370→  });
+   371→  const [active, setActive] = React.useState<ChunkRow | null>(null);
+   372→  const [open, setOpen] = React.useState(false);
+   373→
+   374→  const chunks = ((data?.items ?? []) as ChunkRow[]);
+   375→
+   376→  const openRow = (c: ChunkRow) => {
+   377→    setActive(c);
+   378→    setOpen(true);
+   379→  };
+   380→
+   381→  return (
+   382→    <Card>
+   383→      <CardHeader>
+   384→        <CardTitle className="flex items-center gap-2 text-base">
+   385→          <Boxes className="h-4 w-4 text-primary" />
+   386→          Chunk Browser
+   387→        </CardTitle>
+   388→        <CardDescription className="text-xs">
+   389→          {chunks.length} chunk{chunks.length === 1 ? "" : "s"} · click a row to inspect
+   390→        </CardDescription>
+   391→        <CardAction>
+   392→          <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => refetch()} aria-label="Refresh chunks">
+   393→            <RefreshCw className="h-3.5 w-3.5" />
+   394→          </Button>
+   395→        </CardAction>
+   396→      </CardHeader>
+   397→      <CardContent>
+   398→        {isLoading ? (
+   399→          <div className="space-y-2">
+   400→            {[0, 1, 2, 3].map((i) => (
+   401→              <Skeleton key={i} className="h-9 w-full" />
+   402→            ))}
+   403→          </div>
+   404→        ) : isError ? (
+   405→          <div className="flex items-center gap-2 text-xs text-destructive">
+   406→            <AlertCircle className="h-4 w-4" /> Failed to load chunks.
+   407→          </div>
+   408→        ) : chunks.length === 0 ? (
+   409→          <div className="rounded-md border border-dashed p-6 text-center text-xs text-muted-foreground">
+   410→            No chunks recorded for this experiment.
+   411→          </div>
+   412→        ) : (
+   413→          <div className="rounded-md border max-h-96 overflow-y-auto thin-scroll">
+   414→            <Table>
+   415→              <TableHeader className="sticky top-0 bg-background z-10">
+   416→                <TableRow>
+   417→                  <TableHead className="w-[50px]">#</TableHead>
+   418→                  <TableHead className="w-[110px]">Method</TableHead>
+   419→                  <TableHead className="w-[110px]">Embedding</TableHead>
+   420→                  <TableHead className="w-[70px] text-right">Tokens</TableHead>
+   421→                  <TableHead className="w-[80px] text-right">Chunk ms</TableHead>
+   422→                  <TableHead className="w-[80px] text-right">Embed ms</TableHead>
+   423→                  <TableHead className="w-[110px]">Section</TableHead>
+   424→                  <TableHead className="min-w-[260px]">Preview</TableHead>
+   425→                  <TableHead className="w-[40px]"></TableHead>
+   426→                </TableRow>
+   427→              </TableHeader>
+   428→              <TableBody>
+   429→                {chunks.map((c) => (
+   430→                  <TableRow
+   431→                    key={c.chunkId}
+   432→                    className="group cursor-pointer"
+   433→                    onClick={() => openRow(c)}
+   434→                  >
+   435→                    <TableCell className="font-mono text-xs">{c.chunkIndex}</TableCell>
+   436→                    <TableCell>{chunkMethodBadge(c.chunkMethod)}</TableCell>
+   437→                    <TableCell>
+   438→                      <Badge variant="outline" className="text-[10px]">{c.embeddingMethod}</Badge>
+   439→                    </TableCell>
+   440→                    <TableCell className="text-right font-mono text-xs">{fmtNum(c.tokenCount)}</TableCell>
+   441→                    <TableCell className="text-right font-mono text-xs">{fmtMs(c.chunkingTimeMs)}</TableCell>
+   442→                    <TableCell className="text-right font-mono text-xs">{fmtMs(c.embeddingTimeMs)}</TableCell>
+   443→                    <TableCell className="text-[10px] text-muted-foreground truncate max-w-[110px]" title={c.section ?? ""}>
+   444→                      {c.section ?? "—"}
+   445→                    </TableCell>
+   446→                    <TableCell className="text-xs text-muted-foreground line-clamp-1 max-w-[280px]">
+   447→                      {c.textPreview}
+   448→                    </TableCell>
+   449→                    <TableCell>
+   450→                      <Eye className="h-3 w-3 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
+   451→                    </TableCell>
+   452→                  </TableRow>
+   453→                ))}
+   454→              </TableBody>
+   455→            </Table>
+   456→          </div>
+   457→        )}
+   458→      </CardContent>
+   459→      <ChunkInspectorSheet chunk={active} open={open} onOpenChange={setOpen} />
+   460→    </Card>
+   461→  );
+   462→}
+   463→
+   464→// ─── Detail Mode ────────────────────────────────────────────────────────────
+   465→function DetailMode({
+   466→  experimentId,
+   467→  onBack,
+   468→  onCompareWith,
+   469→}: {
+   470→  experimentId: string;
+   471→  onBack: () => void;
+   472→  onCompareWith: (otherId: string) => void;
+   473→}) {
+   474→  const { data: exp, isLoading, isError, refetch } = useQuery({
+   475→    queryKey: ["experiment", experimentId],
+   476→    queryFn: () => api.experiments.get(experimentId),
+   477→  });
+   478→  const [pickerOpen, setPickerOpen] = React.useState(false);
+   479→  const [otherId, setOtherId] = React.useState<string>("");
+   480→
+   481→  const { data: listData } = useQuery({
+   482→    queryKey: ["experiments", "list", { kind: "all", page: 1, pageSize: 100 }],
+   483→    queryFn: () => api.experiments.list({ page: 1, pageSize: 100 }),
+   484→    enabled: pickerOpen,
+   485→  });
+   486→  const candidates = (listData?.items ?? []).filter(
+   487→    (e: Experiment) => e.id !== experimentId
+   488→  );
+   489→
+   490→  if (isLoading) {
+   491→    return (
+   492→      <div className="space-y-4">
+   493→        <Skeleton className="h-8 w-32" />
+   494→        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+   495→          {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => (
+   496→            <Skeleton key={i} className="h-16 w-full" />
+   497→          ))}
+   498→        </div>
+   499→        <Skeleton className="h-64 w-full" />
+   500→      </div>
+   501→    );
+   502→  }
+   503→
+   504→  if (isError || !exp) {
+   505→    return (
+   506→      <Card>
+   507→        <CardContent className="pt-6">
+   508→          <div className="flex items-center gap-2 text-sm text-destructive">
+   509→            <AlertCircle className="h-4 w-4" /> Failed to load experiment.
+   510→          </div>
+   511→          <div className="flex gap-2 mt-3">
+   512→            <Button variant="outline" size="sm" onClick={onBack}>← Back</Button>
+   513→            <Button variant="outline" size="sm" onClick={() => refetch()}>Retry</Button>
+   514→          </div>
+   515→        </CardContent>
+   516→      </Card>
+   517→    );
+   518→  }
+   519→
+   520→  return (
+   521→    <div className="space-y-4">
+   522→      <div className="flex items-center justify-between gap-2 flex-wrap">
+   523→        <Button variant="ghost" size="sm" onClick={onBack} className="gap-1">
+   524→          <ArrowLeft className="h-4 w-4" /> Back to list
+   525→        </Button>
+   526→        <Button variant="outline" size="sm" onClick={() => setPickerOpen(true)} className="gap-1.5">
+   527→          <GitCompareArrows className="h-3.5 w-3.5" /> Compare with…
+   528→        </Button>
+   529→      </div>
+   530→
+   531→      <Card>
+   532→        <CardHeader>
+   533→          <CardTitle className="flex items-center gap-2 text-base">
+   534→            <FlaskConical className="h-4 w-4 text-primary" />
+   535→            <span className="truncate">{exp.description}</span>
+   536→          </CardTitle>
+   537→          <CardDescription className="text-xs flex flex-wrap items-center gap-x-2 gap-y-1">
+   538→            <span className="font-mono">{exp.id}</span>
+   539→            <span aria-hidden>·</span>
+   540→            <span className="flex items-center gap-1">
+   541→              <Clock className="h-3 w-3" /> Created {relativeTime(exp.createdAt)}
+   542→            </span>
+   543→            <span aria-hidden>·</span>
+   544→            <span>Updated {relativeTime(exp.updatedAt)}</span>
+   545→          </CardDescription>
+   546→        </CardHeader>
+   547→        <CardContent className="space-y-4">
+   548→          {exp.status === "failed" && (
+   549→            <Alert variant="destructive">
+   550→              <AlertCircle className="h-4 w-4" />
+   551→              <AlertTitle>
+   552→                Experiment failed
+   553→                {exp.errorCode && <span className="font-mono ml-1">({exp.errorCode})</span>}
+   554→              </AlertTitle>
+   555→              <AlertDescription>{exp.errorMessage ?? "No error message provided."}</AlertDescription>
+   556→            </Alert>
+   557→          )}
+   558→          <div>
+   559→            <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground mb-2">
+   560→              Observability
+   561→            </h3>
+   562→            <ObservabilityPanel exp={exp as Experiment} />
+   563→          </div>
+   564→        </CardContent>
+   565→      </Card>
+   566→
+   567→      <ChunkBrowser experimentId={experimentId} />
+   568→
+   569→      {/* Compare-with picker */}
+   570→      <ComparePickerDialog
+   571→        open={pickerOpen}
+   572→        onOpenChange={setPickerOpen}
+   573→        candidates={candidates}
+   574→        otherId={otherId}
+   575→        setOtherId={setOtherId}
+   576→        onConfirm={() => {
+   577→          if (otherId) {
+   578→            setPickerOpen(false);
+   579→            onCompareWith(otherId);
+   580→          }
+   581→        }}
+   582→      />
+   583→    </div>
+   584→  );
+   585→}
+   586→
+   587→function ComparePickerDialog({
+   588→  open,
+   589→  onOpenChange,
+   590→  candidates,
+   591→  otherId,
+   592→  setOtherId,
+   593→  onConfirm,
+   594→}: {
+   595→  open: boolean;
+   596→  onOpenChange: (v: boolean) => void;
+   597→  candidates: Experiment[];
+   598→  otherId: string;
+   599→  setOtherId: (v: string) => void;
+   600→  onConfirm: () => void;
+   601→}) {
+   602→  return (
+   603→    <Dialog open={open} onOpenChange={onOpenChange}>
+   604→      <DialogContent className="sm:max-w-md">
+   605→        <DialogHeader>
+   606→          <DialogTitle>Compare with…</DialogTitle>
+   607→          <DialogDescription>Pick another experiment to compare side-by-side.</DialogDescription>
+   608→        </DialogHeader>
+   609→        <Select value={otherId} onValueChange={setOtherId}>
+   610→          <SelectTrigger className="w-full">
+   611→            <SelectValue placeholder="Select an experiment" />
+   612→          </SelectTrigger>
+   613→          <SelectContent>
+   614→            {candidates.length === 0 ? (
+   615→              <SelectItem value="__none" disabled>No other experiments</SelectItem>
+   616→            ) : (
+   617→              candidates.map((e) => (
+   618→                <SelectItem key={e.id} value={e.id}>
+   619→                  {e.description?.slice(0, 60) ?? e.id}
+   620→                </SelectItem>
+   621→              ))
+   622→            )}
+   623→          </SelectContent>
+   624→        </Select>
+   625→        <DialogFooter>
+   626→          <DialogClose asChild>
+   627→            <Button variant="outline" size="sm">Cancel</Button>
+   628→          </DialogClose>
+   629→          <Button size="sm" disabled={!otherId || otherId === "__none"} onClick={onConfirm}>
+   630→            Compare
+   631→          </Button>
+   632→        </DialogFooter>
+   633→      </DialogContent>
+   634→    </Dialog>
+   635→  );
+   636→}
+   637→
+   638→// ─── Compare Mode ───────────────────────────────────────────────────────────
+   639→function CompareMode({
+   640→  ids,
+   641→  onBack,
+   642→}: {
+   643→  ids: [string, string];
+   644→  onBack: () => void;
+   645→}) {
+   646→  const q1 = useQuery({
+   647→    queryKey: ["experiment", ids[0]],
+   648→    queryFn: () => api.experiments.get(ids[0]),
+   649→  });
+   650→  const q2 = useQuery({
+   651→    queryKey: ["experiment", ids[1]],
+   652→    queryFn: () => api.experiments.get(ids[1]),
+   653→  });
+   654→  const c1 = useQuery({
+   655→    queryKey: ["experiment", ids[0], "chunks"],
+   656→    queryFn: () => api.experiments.chunks(ids[0]),
+   657→  });
+   658→  const c2 = useQuery({
+   659→    queryKey: ["experiment", ids[1], "chunks"],
+   660→    queryFn: () => api.experiments.chunks(ids[1]),
+   661→  });
+   662→
+   663→  const a = q1.data as Experiment | undefined;
+   664→  const b = q2.data as Experiment | undefined;
+   665→  const chunksA = (c1.data?.items ?? []) as ChunkRow[];
+   666→  const chunksB = (c2.data?.items ?? []) as ChunkRow[];
+   667→
+   668→  const loading = q1.isLoading || q2.isLoading;
+   669→  const error = q1.isError || q2.isError;
+   670→
+   671→  if (loading) {
+   672→    return (
+   673→      <div className="space-y-4">
+   674→        <Skeleton className="h-8 w-32" />
+   675→        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+   676→          <Skeleton className="h-48 w-full" />
+   677→          <Skeleton className="h-48 w-full" />
+   678→        </div>
+   679→        <Skeleton className="h-64 w-full" />
+   680→      </div>
+   681→    );
+   682→  }
+   683→
+   684→  if (error || !a || !b) {
+   685→    return (
+   686→      <Card>
+   687→        <CardContent className="pt-6">
+   688→          <div className="flex items-center gap-2 text-sm text-destructive">
+   689→            <AlertCircle className="h-4 w-4" /> Failed to load one or both experiments.
+   690→          </div>
+   691→          <Button variant="outline" size="sm" className="mt-3" onClick={onBack}>← Back</Button>
+   692→        </CardContent>
+   693→      </Card>
+   694→    );
+   695→  }
+   696→
+   697→  return (
+   698→    <div className="space-y-4">
+   699→      <div className="flex items-center justify-between gap-2 flex-wrap">
+   700→        <Button variant="ghost" size="sm" onClick={onBack} className="gap-1">
+   701→          <ArrowLeft className="h-4 w-4" /> Back to list
+   702→        </Button>
+   703→        <Badge variant="secondary" className="gap-1 text-xs">
+   704→          <GitCompareArrows className="h-3 w-3" /> Comparing 2 experiments
+   705→        </Badge>
+   706→      </div>
+   707→
+   708→      {/* Side-by-side stat panels */}
+   709→      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+   710→        <CompareExperimentColumn exp={a} label="A" chunks={chunksA} />
+   711→        <CompareExperimentColumn exp={b} label="B" chunks={chunksB} />
+   712→      </div>
+   713→
+   714→      {/* Comparison table */}
+   715→      <ComparisonTable a={a} b={b} chunksA={chunksA} chunksB={chunksB} />
+   716→
+   717→      {/* Bar comparison */}
+   718→      <BarComparison a={a} b={b} chunksA={chunksA} chunksB={chunksB} />
+   719→
+   720→      <p className="text-xs text-muted-foreground italic">
+   721→        Comparison helps you see how changing one factor (embedding approach OR chunk method) affects retrieval metadata.
+   722→      </p>
+   723→    </div>
+   724→  );
+   725→}
+   726→
+   727→function CompareExperimentColumn({
+   728→  exp,
+   729→  label,
+   730→  chunks,
+   731→}: {
+   732→  exp: Experiment;
+   733→  label: string;
+   734→  chunks: ChunkRow[];
+   735→}) {
+   736→  return (
+   737→    <Card>
+   738→      <CardHeader>
+   739→        <div className="flex items-center gap-2">
+   740→          <Badge variant="default" className="text-[10px]">{label}</Badge>
+   741→          <CardTitle className="text-base truncate">{exp.description}</CardTitle>
+   742→        </div>
+   743→        <CardDescription className="text-xs font-mono">{exp.id}</CardDescription>
+   744→      </CardHeader>
+   745→      <CardContent>
+   746→        <ObservabilityPanel exp={exp} chunks={chunks} />
+   747→      </CardContent>
+   748→    </Card>
+   749→  );
+   750→}
+   751→
+   752→// ─── Comparison Table ───────────────────────────────────────────────────────
+   753→function ComparisonTable({
+   754→  a,
+   755→  b,
+   756→  chunksA,
+   757→  chunksB,
+   758→}: {
+   759→  a: Experiment;
+   760→  b: Experiment;
+   761→  chunksA: ChunkRow[];
+   762→  chunksB: ChunkRow[];
+   763→}) {
+   764→  const totalChunkingA = chunksA.reduce((s, c) => s + (c.chunkingTimeMs || 0), 0);
+   765→  const totalChunkingB = chunksB.reduce((s, c) => s + (c.chunkingTimeMs || 0), 0);
+   766→  const totalEmbedA = chunksA.reduce((s, c) => s + (c.embeddingTimeMs || 0), 0);
+   767→  const totalEmbedB = chunksB.reduce((s, c) => s + (c.embeddingTimeMs || 0), 0);
+   768→
+   769→  type Row = {
+   770→    metric: string;
+   771→    a: React.ReactNode;
+   772→    b: React.ReactNode;
+   773→    delta?: { value: string; positive: boolean } | null;
+   774→  };
+   775→
+   776→  const numDelta = (av: number | null | undefined, bv: number | null | undefined, fmt: (n: number) => string) => {
+   777→    if (av == null || bv == null) return null;
+   778→    const d = bv - av;
+   779→    const sign = d > 0 ? "+" : "";
+   780→    return { value: `${sign}${fmt(d)}`, positive: d >= 0 };
+   781→  };
+   782→
+   783→  const rows: Row[] = [
+   784→    {
+   785→      metric: "Embedding approach",
+   786→      a: approachBadge(a.embeddingApproach),
+   787→      b: approachBadge(b.embeddingApproach),
+   788→    },
+   789→    {
+   790→      metric: "Chunk method",
+   791→      a: chunkMethodBadge(a.chunkMethod),
+   792→      b: chunkMethodBadge(b.chunkMethod),
+   793→    },
+   794→    {
+   795→      metric: "Total chunks",
+   796→      a: fmtNum(a.totalChunks),
+   797→      b: fmtNum(b.totalChunks),
+   798→      delta: numDelta(a.totalChunks, b.totalChunks, (n) => fmtNum(n)),
+   799→    },
+   800→    {
+   801→      metric: "Avg tokens / chunk",
+   802→      a: fmtNum(a.avgTokensPerChunk, 1),
+   803→      b: fmtNum(b.avgTokensPerChunk, 1),
+   804→      delta: numDelta(a.avgTokensPerChunk, b.avgTokensPerChunk, (n) => n.toFixed(1)),
+   805→    },
+   806→    {
+   807→      metric: "Total time (ms)",
+   808→      a: fmtMs(a.totalTimeMs),
+   809→      b: fmtMs(b.totalTimeMs),
+   810→      delta: numDelta(a.totalTimeMs, b.totalTimeMs, (n) => `${Math.round(n)}ms`),
+   811→    },
+   812→    {
+   813→      metric: "Σ Chunking time (ms)",
+   814→      a: chunksA.length ? fmtMs(totalChunkingA) : "—",
+   815→      b: chunksB.length ? fmtMs(totalChunkingB) : "—",
+   816→      delta: chunksA.length && chunksB.length ? numDelta(totalChunkingA, totalChunkingB, (n) => `${Math.round(n)}ms`) : null,
+   817→    },
+   818→    {
+   819→      metric: "Σ Embedding time (ms)",
+   820→      a: chunksA.length ? fmtMs(totalEmbedA) : "—",
+   821→      b: chunksB.length ? fmtMs(totalEmbedB) : "—",
+   822→      delta: chunksA.length && chunksB.length ? numDelta(totalEmbedA, totalEmbedB, (n) => `${Math.round(n)}ms`) : null,
+   823→    },
+   824→    {
+   825→      metric: "Status",
+   826→      a: statusBadge(a.status),
+   827→      b: statusBadge(b.status),
+   828→    },
+   829→    {
+   830→      metric: "Source file",
+   831→      a: <span className="text-xs truncate block max-w-[180px]" title={a.sourceFile ?? ""}>{a.sourceFile ?? "—"}</span>,
+   832→      b: <span className="text-xs truncate block max-w-[180px]" title={b.sourceFile ?? ""}>{b.sourceFile ?? "—"}</span>,
+   833→    },
+   834→  ];
+   835→
+   836→  return (
+   837→    <Card>
+   838→      <CardHeader>
+   839→        <CardTitle className="text-base">Metric Comparison</CardTitle>
+   840→        <CardDescription className="text-xs">
+   841→          Δ = B − A. <span className="text-primary">teal</span> for positive, muted for negative.
+   842→        </CardDescription>
+   843→      </CardHeader>
+   844→      <CardContent>
+   845→        <div className="rounded-md border overflow-hidden">
+   846→          <Table>
+   847→            <TableHeader>
+   848→              <TableRow>
+   849→                <TableHead className="w-[180px]">Metric</TableHead>
+   850→                <TableHead className="w-[20%]">Experiment A</TableHead>
+   851→                <TableHead className="w-[20%]">Experiment B</TableHead>
+   852→                <TableHead className="w-[80px] text-right">Δ</TableHead>
+   853→              </TableRow>
+   854→            </TableHeader>
+   855→            <TableBody>
+   856→              {rows.map((r) => (
+   857→                <TableRow key={r.metric}>
+   858→                  <TableCell className="text-xs font-medium text-muted-foreground">{r.metric}</TableCell>
+   859→                  <TableCell>{r.a}</TableCell>
+   860→                  <TableCell>{r.b}</TableCell>
+   861→                  <TableCell className="text-right">
+   862→                    {r.delta ? (
+   863→                      <span
+   864→                        className={cn(
+   865→                          "font-mono text-xs",
+   866→                          r.delta.positive ? "text-primary" : "text-muted-foreground"
+   867→                        )}
+   868→                      >
+   869→                        {r.delta.value}
+   870→                      </span>
+   871→                    ) : (
+   872→                      <span className="text-muted-foreground text-xs">—</span>
+   873→                    )}
+   874→                  </TableCell>
+   875→                </TableRow>
+   876→              ))}
+   877→            </TableBody>
+   878→          </Table>
+   879→        </div>
+   880→      </CardContent>
+   881→    </Card>
+   882→  );
+   883→}
+   884→
+   885→// ─── Bar Comparison ─────────────────────────────────────────────────────────
+   886→function BarComparison({
+   887→  a,
+   888→  b,
+   889→  chunksA,
+   890→  chunksB,
+   891→}: {
+   892→  a: Experiment;
+   893→  b: Experiment;
+   894→  chunksA: ChunkRow[];
+   895→  chunksB: ChunkRow[];
+   896→}) {
+   897→  if (chunksA.length === 0 && chunksB.length === 0) return null;
+   898→
+   899→  const maxChunks = Math.max(chunksA.length, chunksB.length, 1);
+   900→  const maxTokens = Math.max(a.avgTokensPerChunk, b.avgTokensPerChunk, 1);
+   901→
+   902→  const Bar = ({
+   903→    label,
+   904→    valueA,
+   905→    valueB,
+   906→    fmtVal,
+   907→  }: {
+   908→    label: string;
+   909→    valueA: number;
+   910→    valueB: number;
+   911→    fmtVal: (n: number) => string;
+   912→  }) => {
+   913→    const max = Math.max(valueA, valueB, 1);
+   914→    return (
+   915→      <div className="space-y-1.5">
+   916→        <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div>
+   917→        <div className="space-y-1">
+   918→          <BarRow label="A" value={valueA} max={max} fmtVal={fmtVal} />
+   919→          <BarRow label="B" value={valueB} max={max} fmtVal={fmtVal} />
+   920→        </div>
+   921→      </div>
+   922→    );
+   923→  };
+   924→
+   925→  const BarRow = ({
+   926→    label,
+   927→    value,
+   928→    max,
+   929→    fmtVal,
+   930→  }: {
+   931→    label: string;
+   932→    value: number;
+   933→    max: number;
+   934→    fmtVal: (n: number) => string;
+   935→  }) => (
+   936→    <div className="flex items-center gap-2">
+   937→      <span className="text-[10px] font-mono w-3 text-muted-foreground">{label}</span>
+   938→      <div className="flex-1 h-3 rounded bg-muted overflow-hidden">
+   939→        <div
+   940→          className={cn(
+   941→            "h-full rounded transition-all",
+   942→            label === "A" ? "bg-primary/70" : "bg-primary"
+   943→          )}
+   944→          style={{ width: `${Math.max(2, (value / max) * 100)}%` }}
+   945→        />
+   946→      </div>
+   947→      <span className="text-[10px] font-mono w-14 text-right">{fmtVal(value)}</span>
+   948→    </div>
+   949→  );
+   950→
+   951→  return (
+   952→    <Card>
+   953→      <CardHeader>
+   954→        <CardTitle className="text-base">Distribution</CardTitle>
+   955→        <CardDescription className="text-xs">
+   956→          Quick visual comparison of chunk count and average tokens.
+   957→        </CardDescription>
+   958→      </CardHeader>
+   959→      <CardContent className="space-y-4">
+   960→        <Bar
+   961→          label="Chunk count"
+   962→          valueA={chunksA.length}
+   963→          valueB={chunksB.length}
+   964→          fmtVal={(n) => fmtNum(n)}
+   965→        />
+   966→        <Bar
+   967→          label="Avg tokens / chunk"
+   968→          valueA={a.avgTokensPerChunk}
+   969→          valueB={b.avgTokensPerChunk}
+   970→          fmtVal={(n) => fmtNum(n, 1)}
+   971→        />
+   972→        <div className="text-[10px] text-muted-foreground">
+   973→          Max chunks (A: {chunksA.length}, B: {chunksB.length}) · Max avg tokens: {fmtNum(maxTokens, 1)}
+   974→        </div>
+   975→      </CardContent>
+   976→    </Card>
+   977→  );
+   978→}
+   979→
+   980→// ─── List Mode ──────────────────────────────────────────────────────────────
+   981→function ExperimentTable({
+   982→  kind,
+   983→  onOpen,
+   984→  compareIds,
+   985→  setCompareIds,
+   986→}: {
+   987→  kind: "all" | "ingest" | "search";
+   988→  onOpen: (id: string) => void;
+   989→  compareIds: string[];
+   990→  setCompareIds: (ids: string[]) => void;
+   991→}) {
+   992→  const [page, setPage] = React.useState(1);
+   993→  const pageSize = 15;
+   994→  React.useEffect(() => {
+   995→    setPage(1);
+   996→  }, [kind]);
+   997→
+   998→  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+   999→    queryKey: ["experiments", "list", { kind, page, pageSize }],
+  1000→    queryFn: () =>
+  1001→      api.experiments.list({
+  1002→        page,
+  1003→        pageSize,
+  1004→        kind: kind === "all" ? undefined : kind,
+  1005→      }),
+  1006→  });
+  1007→
+  1008→  const items = (data?.items ?? []) as Experiment[];
+  1009→  const total = data?.total ?? 0;
+  1010→  const hasMore = data?.hasMore ?? false;
+  1011→
+  1012→  const toggleCompare = (id: string, checked: boolean) => {
+  1013→    if (checked) {
+  1014→      const next = [...compareIds, id].slice(-2);
+  1015→      setCompareIds(next);
+  1016→    } else {
+  1017→      setCompareIds(compareIds.filter((x) => x !== id));
+  1018→    }
+  1019→  };
+  1020→
+  1021→  return (
+  1022→    <Card>
+  1023→      <CardHeader>
+  1024→        <CardTitle className="text-base">Experiments</CardTitle>
+  1025→        <CardDescription className="text-xs">
+  1026→          {total} experiment{total === 1 ? "" : "s"} · page {page}
+  1027→        </CardDescription>
+  1028→        <CardAction>
+  1029→          <Button
+  1030→            variant="ghost"
+  1031→            size="icon"
+  1032→            className="h-7 w-7"
+  1033→            onClick={() => refetch()}
+  1034→            aria-label="Refresh experiments"
+  1035→          >
+  1036→            <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} />
+  1037→          </Button>
+  1038→        </CardAction>
+  1039→      </CardHeader>
+  1040→      <CardContent className="space-y-3">
+  1041→        <div className="rounded-md border overflow-hidden">
+  1042→          <Table>
+  1043→            <TableHeader>
+  1044→              <TableRow>
+  1045→                <TableHead className="w-[40px]">
+  1046→                  <span className="sr-only">Select for comparison</span>
+  1047→                </TableHead>
+  1048→                <TableHead className="min-w-[200px]">Description</TableHead>
+  1049→                <TableHead className="w-[100px]">Approach</TableHead>
+  1050→                <TableHead className="w-[120px]">Chunk method</TableHead>
+  1051→                <TableHead className="w-[70px] text-right">Chunks</TableHead>
+  1052→                <TableHead className="w-[80px] text-right">Avg tok</TableHead>
+  1053→                <TableHead className="w-[80px] text-right">Time</TableHead>
+  1054→                <TableHead className="w-[90px]">Status</TableHead>
+  1055→                <TableHead className="w-[140px]">Source</TableHead>
+  1056→                <TableHead className="w-[110px]">Created</TableHead>
+  1057→              </TableRow>
+  1058→            </TableHeader>
+  1059→            <TableBody>
+  1060→              {isLoading ? (
+  1061→                Array.from({ length: 5 }).map((_, i) => (
+  1062→                  <TableRow key={i}>
+  1063→                    <TableCell colSpan={10}>
+  1064→                      <Skeleton className="h-9 w-full" />
+  1065→                    </TableCell>
+  1066→                  </TableRow>
+  1067→                ))
+  1068→              ) : isError ? (
+  1069→                <TableRow>
+  1070→                  <TableCell colSpan={10} className="text-xs text-destructive">
+  1071→                    <div className="flex items-center gap-2 py-2">
+  1072→                      <AlertCircle className="h-4 w-4" /> Failed to load experiments.
+  1073→                    </div>
+  1074→                  </TableCell>
+  1075→                </TableRow>
+  1076→              ) : items.length === 0 ? (
+  1077→                <TableRow>
+  1078→                  <TableCell colSpan={10}>
+  1079→                    <div className="py-10 text-center">
+  1080→                      <Inbox className="mx-auto h-8 w-8 text-muted-foreground mb-2" />
+  1081→                      <p className="text-sm text-muted-foreground">
+  1082→                        No experiments yet. Start an ingest or run a search.
+  1083→                      </p>
+  1084→                    </div>
+  1085→                  </TableCell>
+  1086→                </TableRow>
+  1087→              ) : (
+  1088→                items.map((e) => {
+  1089→                  const checked = compareIds.includes(e.id);
+  1090→                  const compareDisabled = !checked && compareIds.length >= 2;
+  1091→                  return (
+  1092→                    <TableRow
+  1093→                      key={e.id}
+  1094→                      className="group cursor-pointer hover:bg-muted/50"
+  1095→                      onClick={() => onOpen(e.id)}
+  1096→                    >
+  1097→                      <TableCell onClick={(ev) => ev.stopPropagation()}>
+  1098→                        <Checkbox
+  1099→                          checked={checked}
+  1100→                          disabled={compareDisabled}
+  1101→                          onCheckedChange={(v) => toggleCompare(e.id, Boolean(v))}
+  1102→                          aria-label={`Select ${e.id} for comparison`}
+  1103→                        />
+  1104→                      </TableCell>
+  1105→                      <TableCell className="max-w-[280px]">
+  1106→                        <div className="text-sm line-clamp-1">{e.description}</div>
+  1107→                        <div className="text-[10px] font-mono text-muted-foreground">{e.id}</div>
+  1108→                      </TableCell>
+  1109→                      <TableCell>{approachBadge(e.embeddingApproach)}</TableCell>
+  1110→                      <TableCell>{chunkMethodBadge(e.chunkMethod)}</TableCell>
+  1111→                      <TableCell className="text-right font-mono text-xs">{fmtNum(e.totalChunks)}</TableCell>
+  1112→                      <TableCell className="text-right font-mono text-xs">{fmtNum(e.avgTokensPerChunk, 1)}</TableCell>
+  1113→                      <TableCell className="text-right font-mono text-xs">{fmtMs(e.totalTimeMs)}</TableCell>
+  1114→                      <TableCell>{statusBadge(e.status)}</TableCell>
+  1115→                      <TableCell className="text-xs text-muted-foreground truncate max-w-[140px]" title={e.sourceFile ?? ""}>
+  1116→                        {e.sourceFile ?? "—"}
+  1117→                      </TableCell>
+  1118→                      <TableCell className="text-[10px] text-muted-foreground whitespace-nowrap">
+  1119→                        {relativeTime(e.createdAt)}
+  1120→                      </TableCell>
+  1121→                    </TableRow>
+  1122→                  );
+  1123→                })
+  1124→              )}
+  1125→            </TableBody>
+  1126→          </Table>
+  1127→        </div>
+  1128→
+  1129→        {/* Pagination */}
+  1130→        {total > pageSize && (
+  1131→          <div className="flex items-center justify-between text-xs">
+  1132→            <span className="text-muted-foreground">
+  1133→              Showing {(page - 1) * pageSize + 1}–{Math.min(page * pageSize, total)} of {total}
+  1134→            </span>
+  1135→            <div className="flex gap-1">
+  1136→              <Button
+  1137→                variant="outline"
+  1138→                size="sm"
+  1139→                disabled={page <= 1}
+  1140→                onClick={() => setPage((p) => Math.max(1, p - 1))}
+  1141→              >
+  1142→                Prev
+  1143→              </Button>
+  1144→              <Button
+  1145→                variant="outline"
+  1146→                size="sm"
+  1147→                disabled={!hasMore}
+  1148→                onClick={() => setPage((p) => p + 1)}
+  1149→              >
+  1150→                Next
+  1151→              </Button>
+  1152→            </div>
+  1153→          </div>
+  1154→        )}
+  1155→      </CardContent>
+  1156→    </Card>
+  1157→  );
+  1158→}
+  1159→
+  1160→// ─── Main View ──────────────────────────────────────────────────────────────
+  1161→export function ExperimentsView() {
+  1162→  const { activeExperimentId, setActiveExperiment } = useUIStore();
+  1163→  const [mode, setMode] = React.useState<Mode>("list");
+  1164→  const [selectedId, setSelectedId] = React.useState<string | null>(null);
+  1165→  const [compareIds, setCompareIds] = React.useState<string[]>([]);
+  1166→  const [comparePair, setComparePair] = React.useState<[string, string] | null>(null);
+  1167→  const [kind, setKind] = React.useState<"all" | "ingest" | "search">("all");
+  1168→
+  1169→  // Auto-open detail if activeExperimentId is set when the view mounts.
+  1170→  React.useEffect(() => {
+  1171→    if (activeExperimentId) {
+  1172→      setSelectedId(activeExperimentId);
+  1173→      setMode("detail");
+  1174→    }
+  1175→  }, [activeExperimentId]);
+  1176→
+  1177→  const openDetail = (id: string) => {
+  1178→    setSelectedId(id);
+  1179→    setMode("detail");
+  1180→  };
+  1181→
+  1182→  const backToList = () => {
+  1183→    setSelectedId(null);
+  1184→    setMode("list");
+  1185→    // Clear activeExperimentId so re-entering the view starts at the list.
+  1186→    if (activeExperimentId) setActiveExperiment(null);
+  1187→  };
+  1188→
+  1189→  const startCompare = (ids: [string, string]) => {
+  1190→    setComparePair(ids);
+  1191→    setMode("compare");
+  1192→  };
+  1193→
+  1194→  const backFromCompare = () => {
+  1195→    setComparePair(null);
+  1196→    setMode("list");
+  1197→    setCompareIds([]);
+  1198→    if (activeExperimentId) setActiveExperiment(null);
+  1199→  };
+  1200→
+  1201→  return (
+  1202→    <>
+  1203→      <ViewHeader
+  1204→        title="Experiments"
+  1205→        description="History, metadata & comparison"
+  1206→        icon={FlaskConical}
+  1207→        actions={
+  1208→          mode === "list" && (
+  1209→            <ToggleGroup
+  1210→              type="single"
+  1211→              value={kind}
+  1212→              onValueChange={(v) => v && setKind(v as "all" | "ingest" | "search")}
+  1213→              className="rounded-md border bg-background"
+  1214→              size="sm"
+  1215→            >
+  1216→              <ToggleGroupItem value="all" className="text-xs h-7 px-3">All</ToggleGroupItem>
+  1217→              <ToggleGroupItem value="ingest" className="text-xs h-7 px-3">Ingest</ToggleGroupItem>
+  1218→              <ToggleGroupItem value="search" className="text-xs h-7 px-3">Search</ToggleGroupItem>
+  1219→            </ToggleGroup>
+  1220→          )
+  1221→        }
+  1222→      />
+  1223→      <ViewBody>
+  1224→        {mode === "list" && (
+  1225→          <div className="space-y-3">
+  1226→            <ExperimentTable
+  1227→              kind={kind}
+  1228→              onOpen={openDetail}
+  1229→              compareIds={compareIds}
+  1230→              setCompareIds={setCompareIds}
+  1231→            />
+  1232→            {compareIds.length === 2 && (
+  1233→              <div className="sticky bottom-4 z-20">
+  1234→                <Button
+  1235→                  className="w-full shadow-lg gap-2"
+  1236→                  onClick={() => startCompare([compareIds[0], compareIds[1]])}
+  1237→                >
+  1238→                  <GitCompareArrows className="h-4 w-4" />
+  1239→                  Compare selected ({compareIds.length} experiments) →
+  1240→                </Button>
+  1241→              </div>
+  1242→            )}
+  1243→          </div>
+  1244→        )}
+  1245→
+  1246→        {mode === "detail" && selectedId && (
+  1247→          <DetailMode
+  1248→            experimentId={selectedId}
+  1249→            onBack={backToList}
+  1250→            onCompareWith={(otherId) => startCompare([selectedId, otherId])}
+  1251→          />
+  1252→        )}
+  1253→
+  1254→        {mode === "compare" && comparePair && (
+  1255→          <CompareMode ids={comparePair} onBack={backFromCompare} />
+  1256→        )}
+  1257→      </ViewBody>
+  1258→    </>
+  1259→  );
+  1260→}
+  1261→

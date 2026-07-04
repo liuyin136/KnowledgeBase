@@ -1,0 +1,22 @@
+# =============================================================================
+# Root docker-compose.yml — Local-First RAG Experimentation Platform v1.2
+#
+# Thin wrapper so `docker compose <cmd>` (run from the project root) works
+# without having to pass `-f docker/docker-compose.yml` every time.
+#
+# The real stack lives at docker/docker-compose.yml (per task spec — preferred
+# layout). This file just includes it via Compose v2's `include:` directive.
+#
+# Usage:
+#   docker compose build
+#   docker compose run --rm backend python scripts/download_models.py
+#   docker compose run --rm backend python scripts/init_neo4j.py
+#   docker compose up -d
+#   docker compose ps
+#   docker compose logs -f backend
+#   docker compose down            # stop + remove containers (volumes kept)
+#   docker compose down -v         # also drop neo4j_data + redis_data volumes
+# =============================================================================
+
+include:
+  - path: docker/docker-compose.yml
