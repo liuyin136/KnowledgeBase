@@ -27,6 +27,13 @@ import {
   Activity,
   Cpu,
   Layers,
+  Server,
+  Database,
+  ServerOff,
+  RefreshCw,
+  Terminal,
+  AlertTriangle,
+  Zap,
 } from "lucide-react";
 
 import { api, APIError } from "@/lib/api-client";
@@ -36,6 +43,8 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
 // ─── Types (typed inline since dashboard returns a loose shape) ─────────────
@@ -81,6 +90,19 @@ interface DashboardData {
     embeddingDim: number;
     stack: string;
     v1Scope: string;
+  };
+  health: {
+    backend: {
+      status: "online" | "offline";
+      configured: boolean;
+      detail?: string | null;
+    };
+    neo4j: {
+      status: "online" | "offline";
+      uri: string;
+      user: string;
+      error?: string;
+    };
   };
 }
 
@@ -178,7 +200,47 @@ export function DashboardView() {
     },
   });
 
+  // POST /api/v1/neo4j/init — initialize the Neo4j schema (constraints +
+  // vector + fulltext indexes). Idempotent. Only meaningful once Neo4j is up.
+  const neo4jInitMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch("/api/v1/neo4j/init", { method: "POST" });
+      const text = await res.text();
+      const body = text ? JSON.parse(text) : null;
+      if (!res.ok) {
+        throw new APIError(body, res.status);
+      }
+      return body as {
+        applied: string[];
+        errors: { step: string; error: string }[];
+        embeddingDim: number;
+        indexes: { name: string; type: string }[];
+      };
+    },
+    onSuccess: (res) => {
+      const errCount = res.errors?.length ?? 0;
+      if (errCount === 0) {
+        toast.success(
+          `Neo4j schema initialized — ${res.indexes?.length ?? 0} indexes present`,
+        );
+      } else {
+        toast.warning(`Neo4j init: ${res.errors.length} step(s) failed`, {
+          description: res.errors.map((e) => `${e.step}: ${e.error}`).join(" · "),
+        });
+      }
+      qc.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+    onError: (err) => {
+      const msg = err instanceof APIError ? err.message : "Failed to init Neo4j schema";
+      toast.error("Neo4j init failed", { description: msg });
+    },
+  });
+
   const stats = data?.stats;
+  const health = data?.health;
+  const backendOffline = health?.backend.status === "offline";
+  const neo4jOffline = health?.neo4j.status === "offline";
+  const anyOffline = backendOffline || neo4jOffline;
   const isEmpty =
     !!stats &&
     stats.experiments.total === 0 &&
@@ -197,18 +259,84 @@ export function DashboardView() {
         description="System health & quick stats"
         icon={LayoutDashboard}
         actions={
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => seedMutation.mutate()}
-            disabled={seedMutation.isPending}
-          >
-            <Sparkles className="h-4 w-4" />
-            {seedMutation.isPending ? "Seeding…" : "Seed sample docs"}
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => refetch()}
+              aria-label="Refresh dashboard"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">Refresh</span>
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => seedMutation.mutate()}
+              disabled={seedMutation.isPending || anyOffline}
+              title={anyOffline ? "Backend offline — seeding unavailable" : "Seed sample documents"}
+            >
+              <Sparkles className="h-4 w-4" />
+              {seedMutation.isPending ? "Seeding…" : "Seed sample docs"}
+            </Button>
+          </div>
         }
       />
       <ViewBody className="space-y-8">
+        {/* Offline banner */}
+        {anyOffline && !isLoading && (
+          <Alert className="border-amber-500/40 bg-amber-500/5">
+            <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+            <AlertTitle className="text-amber-900 dark:text-amber-100">
+              Backend services offline
+            </AlertTitle>
+            <AlertDescription className="text-amber-900/80 dark:text-amber-200/80">
+              <p className="leading-relaxed">
+                Start the Docker stack (
+                <code className="font-mono text-xs">docker compose up -d</code>
+                ) to enable data operations. The UI is viewable but ingest /
+                search / experiments will return errors until both the FastAPI
+                backend and Neo4j are healthy.
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => refetch()}
+                  className="gap-1.5 border-amber-500/40 text-amber-900 hover:bg-amber-500/10 dark:text-amber-100"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  Re-check health
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={neo4jOffline || neo4jInitMutation.isPending}
+                  onClick={() => neo4jInitMutation.mutate()}
+                  className="gap-1.5 border-amber-500/40 text-amber-900 hover:bg-amber-500/10 dark:text-amber-100"
+                  title={
+                    neo4jOffline
+                      ? "Neo4j must be online before initializing the schema."
+                      : "Initialize Neo4j schema (constraints + vector + fulltext indexes)"
+                  }
+                >
+                  <Zap className="h-3.5 w-3.5" />
+                  {neo4jInitMutation.isPending ? "Initializing…" : "Init Neo4j schema"}
+                </Button>
+                <a
+                  href="/api/v1/neo4j/init"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-900 hover:bg-amber-500/10 dark:text-amber-100"
+                >
+                  <Terminal className="h-3 w-3" />
+                  /api/v1/neo4j/init
+                </a>
+              </div>
+            </AlertDescription>
+          </Alert>
+        )}
+
         {isError && (
           <Card className="border-red-500/30 bg-red-500/5">
             <CardContent className="py-4 text-sm text-red-700 dark:text-red-400 flex items-center justify-between gap-3">
@@ -220,8 +348,33 @@ export function DashboardView() {
           </Card>
         )}
 
+        {/* System Connections — health cards (top, prominent) */}
+        <section aria-label="System connections">
+          <h2 className="text-sm font-medium text-muted-foreground mb-3 flex items-center gap-2">
+            <Server className="h-4 w-4" /> System Connections
+          </h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <BackendHealthCard
+              loading={isLoading}
+              status={health?.backend.status}
+              configured={health?.backend.configured}
+              detail={health?.backend.detail ?? null}
+            />
+            <Neo4jHealthCard
+              loading={isLoading}
+              status={health?.neo4j.status}
+              uri={health?.neo4j.uri}
+              user={health?.neo4j.user}
+              error={health?.neo4j.error}
+              onInit={() => neo4jInitMutation.mutate()}
+              initPending={neo4jInitMutation.isPending}
+              initDisabled={neo4jOffline}
+            />
+          </div>
+        </section>
+
         {/* Empty state */}
-        {isEmpty && !isLoading && (
+        {isEmpty && !isLoading && !anyOffline && (
           <Card className="border-dashed">
             <CardContent className="py-12 flex flex-col items-center text-center gap-4">
               <div className="flex h-14 w-14 items-center justify-center rounded-full bg-primary/10 text-primary">
@@ -483,5 +636,206 @@ function SystemRow({
         <div className="text-sm font-medium mt-0.5 break-words">{value}</div>
       </div>
     </div>
+  );
+}
+
+// ─── Health cards (v1.2 system connections) ──────────────────────────────────
+
+function StatusBadge({ status }: { status: "online" | "offline" | undefined }) {
+  if (!status) {
+    return (
+      <Badge variant="outline" className="text-[10px] gap-1">
+        <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground" />
+        unknown
+      </Badge>
+    );
+  }
+  if (status === "online") {
+    return (
+      <Badge variant="outline" className="text-[10px] gap-1 border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400">
+        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+        online
+      </Badge>
+    );
+  }
+  return (
+    <Badge variant="outline" className="text-[10px] gap-1 border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-400">
+      <span className="h-1.5 w-1.5 rounded-full bg-red-500" />
+      offline
+    </Badge>
+  );
+}
+
+function BackendHealthCard({
+  loading,
+  status,
+  configured,
+  detail,
+}: {
+  loading: boolean;
+  status: "online" | "offline" | undefined;
+  configured: boolean | undefined;
+  detail: string | null;
+}) {
+  const offline = status === "offline";
+  return (
+    <Card className={cn(offline ? "border-red-500/30 bg-red-500/5" : "border-emerald-500/20")}>
+      <CardContent className="p-4">
+        <div className="flex items-start justify-between gap-2 mb-3">
+          <div className="flex items-center gap-2">
+            <div
+              className={cn(
+                "flex h-9 w-9 items-center justify-center rounded-lg shrink-0",
+                offline
+                  ? "bg-red-500/10 text-red-600 dark:text-red-400"
+                  : "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+              )}
+            >
+              {offline ? <ServerOff className="h-5 w-5" /> : <Server className="h-5 w-5" />}
+            </div>
+            <div>
+              <div className="text-sm font-semibold">FastAPI Backend</div>
+              <div className="text-[10px] text-muted-foreground">
+                BGE-M3 embeddings · hybrid retrieval · reranker
+              </div>
+            </div>
+          </div>
+          {loading ? (
+            <Skeleton className="h-5 w-16 rounded-full" />
+          ) : (
+            <StatusBadge status={status} />
+          )}
+        </div>
+        {loading ? (
+          <div className="space-y-1.5">
+            <Skeleton className="h-3 w-1/2" />
+            <Skeleton className="h-3 w-2/3" />
+          </div>
+        ) : (
+          <dl className="space-y-1 text-xs">
+            <div className="flex items-baseline justify-between gap-2">
+              <dt className="text-muted-foreground">Configured</dt>
+              <dd className="font-mono">
+                {configured ? "yes (BACKEND_URL set)" : "no (BACKEND_URL missing)"}
+              </dd>
+            </div>
+            {detail && (
+              <div className="flex items-baseline justify-between gap-2 min-w-0">
+                <dt className="text-muted-foreground shrink-0">Detail</dt>
+                <dd className="font-mono text-right truncate" title={detail}>
+                  {detail}
+                </dd>
+              </div>
+            )}
+            {offline && (
+              <div className="text-[11px] text-red-700/80 dark:text-red-300/80 mt-2 pt-2 border-t border-red-500/20">
+                Start the backend: <code className="font-mono">docker compose up -d backend</code>
+              </div>
+            )}
+          </dl>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function Neo4jHealthCard({
+  loading,
+  status,
+  uri,
+  user,
+  error,
+  onInit,
+  initPending,
+  initDisabled,
+}: {
+  loading: boolean;
+  status: "online" | "offline" | undefined;
+  uri: string | undefined;
+  user: string | undefined;
+  error?: string;
+  onInit: () => void;
+  initPending: boolean;
+  initDisabled: boolean;
+}) {
+  const offline = status === "offline";
+  return (
+    <Card className={cn(offline ? "border-red-500/30 bg-red-500/5" : "border-emerald-500/20")}>
+      <CardContent className="p-4">
+        <div className="flex items-start justify-between gap-2 mb-3">
+          <div className="flex items-center gap-2">
+            <div
+              className={cn(
+                "flex h-9 w-9 items-center justify-center rounded-lg shrink-0",
+                offline
+                  ? "bg-red-500/10 text-red-600 dark:text-red-400"
+                  : "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+              )}
+            >
+              <Database className="h-5 w-5" />
+            </div>
+            <div>
+              <div className="text-sm font-semibold">Neo4j Database</div>
+              <div className="text-[10px] text-muted-foreground">
+                Knowledge graph · vector index · BM25 fulltext
+              </div>
+            </div>
+          </div>
+          {loading ? (
+            <Skeleton className="h-5 w-16 rounded-full" />
+          ) : (
+            <StatusBadge status={status} />
+          )}
+        </div>
+        {loading ? (
+          <div className="space-y-1.5">
+            <Skeleton className="h-3 w-1/2" />
+            <Skeleton className="h-3 w-2/3" />
+          </div>
+        ) : (
+          <dl className="space-y-1 text-xs">
+            <div className="flex items-baseline justify-between gap-2 min-w-0">
+              <dt className="text-muted-foreground shrink-0">URI</dt>
+              <dd className="font-mono text-right truncate" title={uri ?? ""}>
+                {uri ?? "—"}
+              </dd>
+            </div>
+            <div className="flex items-baseline justify-between gap-2">
+              <dt className="text-muted-foreground">User</dt>
+              <dd className="font-mono">{user ?? "—"}</dd>
+            </div>
+            {error && (
+              <div className="text-[11px] text-red-700/80 dark:text-red-300/80 mt-2 pt-2 border-t border-red-500/20 break-words">
+                <span className="font-medium">Error: </span>
+                <span className="font-mono">{error}</span>
+              </div>
+            )}
+            {!offline && (
+              <div className="flex justify-end mt-2 pt-2 border-t">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={onInit}
+                  disabled={initPending || initDisabled}
+                  className="gap-1.5 h-7 text-xs"
+                >
+                  {initPending ? (
+                    <RefreshCw className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <Zap className="h-3 w-3" />
+                  )}
+                  {initPending ? "Initializing…" : "Init schema"}
+                </Button>
+              </div>
+            )}
+            {offline && (
+              <div className="text-[11px] text-red-700/80 dark:text-red-300/80 mt-2 pt-2 border-t border-red-500/20">
+                Start Neo4j: <code className="font-mono">docker compose up -d neo4j</code>
+              </div>
+            )}
+          </dl>
+        )}
+      </CardContent>
+    </Card>
   );
 }

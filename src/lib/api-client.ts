@@ -107,3 +107,17 @@ export const api = {
 };
 
 export type { SearchResponse };
+
+/**
+ * Detect a v1.2 backend-offline error (FastAPI unreachable).
+ * Returns true when the API route proxied to the FastAPI backend and the backend
+ * was unavailable/unreachable (HTTP 503 with BACKEND_UNAVAILABLE or
+ * BACKEND_UNREACHABLE). Use this to show the shared <BackendOffline/> component
+ * instead of a generic error state.
+ */
+export function isBackendOffline(err: unknown): boolean {
+  return (
+    err instanceof APIError &&
+    (err.code === "BACKEND_UNAVAILABLE" || err.code === "BACKEND_UNREACHABLE")
+  );
+}

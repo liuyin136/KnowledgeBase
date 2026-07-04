@@ -1,0 +1,67 @@
+# =============================================================================
+# Root .dockerignore — Local-First RAG Experimentation Platform v1.2
+# Applies to the frontend build (context = project root).
+# =============================================================================
+
+# ---- VCS ----
+.git
+.gitignore
+.gitattributes
+
+# ---- Node / Next.js ----
+node_modules
+.next
+.vercel
+.cache
+.turbo
+*.log
+dev.log
+server.log
+
+# ---- Bun ----
+.bun
+
+# ---- Build artifacts ----
+dist
+build
+out
+*.tsbuildinfo
+
+# ---- Sandboxes / tooling ----
+tool-results
+agent-ctx
+download
+examples
+mini-services
+
+# ---- Docs / config that don't belong in the frontend image ----
+upload
+*.md
+!README.md
+docker
+docker-compose.yml
+Caddyfile
+eslint.config.mjs
+tsconfig.json
+tailwind.config.ts
+postcss.config.mjs
+components.json
+
+# ---- Env / secrets ----
+.env
+.env.*
+!.env.example
+
+# ---- Local data ----
+db
+*.db
+*.sqlite
+*.sqlite3
+prisma/*.db
+
+# ---- OS noise ----
+.DS_Store
+Thumbs.db
+
+# ---- Backend (built separately; context = backend/) ----
+backend

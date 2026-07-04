@@ -1,24 +1,11 @@
-/**
- * POST /api/v1/memory-carts — create a cart.
- * GET  /api/v1/memory-carts — list carts.
- */
-import { NextRequest, NextResponse } from "next/server";
-import { withErrors, parseBody } from "@/lib/rag/api-helpers";
-import { ValidationError } from "@/lib/rag/errors";
-import * as store from "@/lib/rag/store";
+/** POST /api/v1/memory-carts → proxy. GET → proxy. */
+import { NextRequest } from "next/server";
+import { proxyToBackend } from "@/lib/rag/backend-client";
+import { withErrors } from "@/lib/rag/api-helpers";
 
 export async function POST(req: NextRequest) {
-  return withErrors(async () => {
-    const body = await parseBody<{ name: string; description?: string }>(req);
-    if (!body.name?.trim()) throw new ValidationError("name is required");
-    const id = await store.createMemoryCart({ name: body.name, description: body.description });
-    return NextResponse.json({ id }, { status: 201 });
-  });
+  return withErrors(() => proxyToBackend(req, "/api/v1/memory-carts", { method: "POST" }));
 }
-
-export async function GET() {
-  return withErrors(async () => {
-    const items = await store.listMemoryCarts();
-    return NextResponse.json({ items, total: items.length });
-  });
+export async function GET(req: NextRequest) {
+  return withErrors(() => proxyToBackend(req, "/api/v1/memory-carts"));
 }

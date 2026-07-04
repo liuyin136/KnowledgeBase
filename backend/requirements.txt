@@ -1,0 +1,28 @@
+# Local-First RAG Experimentation Platform v1.2 — Backend dependencies
+# Python 3.12 (per infrastructure-environment-spec_v1.1.md §1)
+#
+# Install:  pip install -r requirements.txt
+#
+# Notes:
+#  • torch is installed via the standard PyPI wheel (cu121 build). For a
+#    CUDA-locked environment, override with the PyTorch index URL:
+#      pip install torch --index-url https://download.pytorch.org/whl/cu121
+#  • neo4j>=5.20 is required for `CREATE VECTOR INDEX ... OPTIONS` + fulltext
+#    indexes (Neo4j 5.x vector support).
+
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+pydantic-settings==2.6.1
+neo4j==5.26.0
+redis==5.2.0
+rq==1.16.2
+sentence-transformers==3.3.1
+transformers==4.46.3
+torch==2.5.1
+numpy==1.26.4
+python-multipart==0.0.17
+httpx==0.28.1
+tenacity==9.0.0
+structlog==24.4.0
+huggingface-hub==0.26.5

@@ -29,9 +29,10 @@ import {
   Hash,
 } from "lucide-react";
 
-import { api, APIError } from "@/lib/api-client";
+import { api, APIError, isBackendOffline } from "@/lib/api-client";
 import { useUIStore } from "@/store/use-ui-store";
 import { ViewHeader, ViewBody } from "@/components/rag/shared/view-header";
+import { BackendOffline } from "@/components/rag/shared/backend-offline";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -552,7 +553,7 @@ function DocumentsListCard({
   onSelect: (id: string) => void;
   onDeleted: (id: string) => void;
 }) {
-  const { data, isLoading, isError, refetch } = useQuery<{ items: DocumentItem[]; total: number }>({
+  const { data, isLoading, isError, error, refetch } = useQuery<{ items: DocumentItem[]; total: number }>({
     queryKey: ["documents", { page: 1, pageSize: 50 }],
     queryFn: () => api.documents.list({ page: 1, pageSize: 50 }),
   });
@@ -593,12 +594,22 @@ function DocumentsListCard({
             ))}
           </div>
         ) : isError ? (
-          <div className="text-sm text-red-600 dark:text-red-400 py-4 text-center">
-            Failed to load documents.{" "}
-            <button className="underline" onClick={() => refetch()}>
-              Retry
-            </button>
-          </div>
+          isBackendOffline(error) ? (
+            <div className="py-4">
+              <BackendOffline
+                compact
+                onRetry={() => refetch()}
+                message="Backend offline — document list unavailable."
+              />
+            </div>
+          ) : (
+            <div className="text-sm text-red-600 dark:text-red-400 py-4 text-center">
+              Failed to load documents.{" "}
+              <button className="underline" onClick={() => refetch()}>
+                Retry
+              </button>
+            </div>
+          )
         ) : items.length === 0 ? (
           <div className="py-8 text-center text-sm text-muted-foreground">
             No documents yet. Upload one above — or seed sample docs from the Dashboard.

@@ -30,7 +30,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { api, APIError } from "@/lib/api-client";
+import { api, APIError, isBackendOffline } from "@/lib/api-client";
 import type {
   SearchConfig,
   SearchResult,
@@ -40,6 +40,7 @@ import type {
 } from "@/lib/rag/types";
 import { useUIStore } from "@/store/use-ui-store";
 import { ViewHeader, ViewBody } from "@/components/rag/shared/view-header";
+import { BackendOffline } from "@/components/rag/shared/backend-offline";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
@@ -917,9 +918,17 @@ export function SearchView() {
                   </SelectContent>
                 </Select>
                 {experimentsQuery.isError && (
-                  <p className="text-[11px] text-destructive">
-                    Failed to load experiments
-                  </p>
+                  isBackendOffline(experimentsQuery.error) ? (
+                    <BackendOffline
+                      compact
+                      onRetry={() => experimentsQuery.refetch()}
+                      message="Backend offline — experiment list unavailable."
+                    />
+                  ) : (
+                    <p className="text-[11px] text-destructive">
+                      Failed to load experiments
+                    </p>
+                  )
                 )}
               </div>
             </Card>
@@ -1016,9 +1025,19 @@ export function SearchView() {
                     <Skeleton className="h-6 w-full" />
                   </div>
                 ) : historyQuery.isError ? (
-                  <div className="p-4 text-sm text-destructive">
-                    Failed to load search history
-                  </div>
+                  isBackendOffline(historyQuery.error) ? (
+                    <div className="p-4">
+                      <BackendOffline
+                        compact
+                        onRetry={() => historyQuery.refetch()}
+                        message="Backend offline — search history unavailable."
+                      />
+                    </div>
+                  ) : (
+                    <div className="p-4 text-sm text-destructive">
+                      Failed to load search history
+                    </div>
+                  )
                 ) : (historyQuery.data?.items ?? []).length === 0 ? (
                   <div className="p-6 text-center text-sm text-muted-foreground">
                     No past searches yet.
@@ -1292,9 +1311,17 @@ export function SearchView() {
                     </SelectContent>
                   </Select>
                   {cartsQuery.isError && (
-                    <p className="text-[11px] text-destructive">
-                      Failed to load carts
-                    </p>
+                    isBackendOffline(cartsQuery.error) ? (
+                      <BackendOffline
+                        compact
+                        onRetry={() => cartsQuery.refetch()}
+                        message="Backend offline — carts unavailable."
+                      />
+                    ) : (
+                      <p className="text-[11px] text-destructive">
+                        Failed to load carts
+                      </p>
+                    )
                   )}
                 </div>
               )}

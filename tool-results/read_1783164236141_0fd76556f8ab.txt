@@ -1,0 +1,985 @@
+     1→"use client";
+     2→
+     3→/**
+     4→ * MemoryView — Memory Cart Page (Frontend_Workflow_Mapping v1.1 §3).
+     5→ * Two-column layout:
+     6→ *   • Left (~340px): create-cart form + carts list.
+     7→ *   • Right: cart detail with checkbox selection table + add-memories dialog
+     8→ *           + collapsible global memory browser.
+     9→ *
+    10→ * All server state via TanStack Query. Mutations invalidate the relevant keys.
+    11→ */
+    12→
+    13→import * as React from "react";
+    14→import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+    15→import { formatDistanceToNow } from "date-fns";
+    16→import { api } from "@/lib/api-client";
+    17→import type { Memory, MemoryCart } from "@/lib/rag/types";
+    18→import { ViewHeader, ViewBody } from "@/components/rag/shared/view-header";
+    19→import { toast } from "sonner";
+    20→import { cn } from "@/lib/utils";
+    21→import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+    22→import { Button } from "@/components/ui/button";
+    23→import { Input } from "@/components/ui/input";
+    24→import { Textarea } from "@/components/ui/textarea";
+    25→import { Label } from "@/components/ui/label";
+    26→import { Badge } from "@/components/ui/badge";
+    27→import { Checkbox } from "@/components/ui/checkbox";
+    28→import {
+    29→  Table,
+    30→  TableBody,
+    31→  TableCell,
+    32→  TableHead,
+    33→  TableHeader,
+    34→  TableRow,
+    35→} from "@/components/ui/table";
+    36→import {
+    37→  Dialog,
+    38→  DialogClose,
+    39→  DialogContent,
+    40→  DialogDescription,
+    41→  DialogFooter,
+    42→  DialogHeader,
+    43→  DialogTitle,
+    44→  DialogTrigger,
+    45→} from "@/components/ui/dialog";
+    46→import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+    47→import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+    48→import { Skeleton } from "@/components/ui/skeleton";
+    49→import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+    50→import { Separator } from "@/components/ui/separator";
+    51→import {
+    52→  ShoppingCart,
+    53→  Plus,
+    54→  Pencil,
+    55→  RefreshCw,
+    56→  ChevronDown,
+    57→  ChevronRight,
+    58→  Clock,
+    59→  AlertCircle,
+    60→  Eye,
+    61→  Inbox,
+    62→  ListPlus,
+    63→  Search as SearchIcon,
+    64→} from "lucide-react";
+    65→
+    66→// ─── helpers ─────────────────────────────────────────────────────────────────
+    67→function relativeTime(d: string | Date | null | undefined): string {
+    68→  if (!d) return "—";
+    69→  try {
+    70→    return formatDistanceToNow(new Date(d), { addSuffix: true });
+    71→  } catch {
+    72→    return "—";
+    73→  }
+    74→}
+    75→
+    76→function fmtScore(n: number | null | undefined): string {
+    77→  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+    78→  return n.toFixed(3);
+    79→}
+    80→
+    81→function fmtMs(ms: number | null | undefined): string {
+    82→  if (ms === null || ms === undefined || Number.isNaN(ms)) return "—";
+    83→  if (ms >= 1000) return `${(ms / 1000).toFixed(2)}s`;
+    84→  return `${Math.round(ms)}ms`;
+    85→}
+    86→
+    87→// Extended memory type returned by the cart detail endpoint (full memory rows).
+    88→type CartMemory = Memory;
+    89→
+    90→// ─── Create Cart ─────────────────────────────────────────────────────────────
+    91→function CreateCartCard({ onCreated }: { onCreated: (id: string) => void }) {
+    92→  const qc = useQueryClient();
+    93→  const [name, setName] = React.useState("");
+    94→  const [description, setDescription] = React.useState("");
+    95→
+    96→  const createMut = useMutation({
+    97→    mutationFn: () =>
+    98→      api.memoryCarts.create({
+    99→        name: name.trim(),
+   100→        description: description.trim() || undefined,
+   101→      }),
+   102→    onSuccess: (data) => {
+   103→      toast.success("Cart created", { description: `"${name.trim()}"` });
+   104→      qc.invalidateQueries({ queryKey: ["carts"] });
+   105→      setName("");
+   106→      setDescription("");
+   107→      onCreated(data.id);
+   108→    },
+   109→    onError: (e: unknown) => {
+   110→      const msg = e instanceof Error ? e.message : "Failed to create cart";
+   111→      toast.error("Create failed", { description: msg });
+   112→    },
+   113→  });
+   114→
+   115→  const canSubmit = name.trim().length > 0 && !createMut.isPending;
+   116→
+   117→  return (
+   118→    <Card>
+   119→      <CardHeader>
+   120→        <CardTitle className="flex items-center gap-2 text-base">
+   121→          <Plus className="h-4 w-4 text-primary" />
+   122→          Create Cart
+   123→        </CardTitle>
+   124→        <CardDescription className="text-xs">
+   125→          A cart groups curated memories for export or sharing.
+   126→        </CardDescription>
+   127→      </CardHeader>
+   128→      <CardContent className="space-y-3">
+   129→        <div className="space-y-1.5">
+   130→          <Label htmlFor="cart-name" className="text-xs">Name</Label>
+   131→          <Input
+   132→            id="cart-name"
+   133→            placeholder="e.g. Best hybrid-search hits"
+   134→            value={name}
+   135→            onChange={(e) => setName(e.target.value)}
+   136→            onKeyDown={(e) => {
+   137→              if (e.key === "Enter" && canSubmit) createMut.mutate();
+   138→            }}
+   139→            disabled={createMut.isPending}
+   140→          />
+   141→        </div>
+   142→        <div className="space-y-1.5">
+   143→          <Label htmlFor="cart-desc" className="text-xs">
+   144→            Description <span className="text-muted-foreground">(optional)</span>
+   145→          </Label>
+   146→          <Textarea
+   147→            id="cart-desc"
+   148→            placeholder="What this cart is for…"
+   149→            value={description}
+   150→            onChange={(e) => setDescription(e.target.value)}
+   151→            rows={2}
+   152→            disabled={createMut.isPending}
+   153→            className="resize-none"
+   154→          />
+   155→        </div>
+   156→        <Button
+   157→          className="w-full"
+   158→          size="sm"
+   159→          disabled={!canSubmit}
+   160→          onClick={() => createMut.mutate()}
+   161→        >
+   162→          {createMut.isPending ? "Creating…" : "Create Cart"}
+   163→        </Button>
+   164→      </CardContent>
+   165→    </Card>
+   166→  );
+   167→}
+   168→
+   169→// ─── Carts List ──────────────────────────────────────────────────────────────
+   170→function CartsList({
+   171→  selectedId,
+   172→  onSelect,
+   173→}: {
+   174→  selectedId: string | null;
+   175→  onSelect: (id: string) => void;
+   176→}) {
+   177→  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+   178→    queryKey: ["carts"],
+   179→    queryFn: () => api.memoryCarts.list(),
+   180→  });
+   181→
+   182→  const carts = data?.items ?? [];
+   183→
+   184→  return (
+   185→    <Card>
+   186→      <CardHeader>
+   187→        <CardTitle className="text-base">Memory Carts</CardTitle>
+   188→        <CardDescription className="text-xs">
+   189→          {carts.length} cart{carts.length === 1 ? "" : "s"}
+   190→        </CardDescription>
+   191→        <CardAction>
+   192→          <Button
+   193→            variant="ghost"
+   194→            size="icon"
+   195→            className="h-7 w-7"
+   196→            onClick={() => refetch()}
+   197→            aria-label="Refresh carts"
+   198→          >
+   199→            <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} />
+   200→          </Button>
+   201→        </CardAction>
+   202→      </CardHeader>
+   203→      <CardContent className="pt-0">
+   204→        {isLoading ? (
+   205→          <div className="space-y-2">
+   206→            {[0, 1, 2].map((i) => (
+   207→              <Skeleton key={i} className="h-16 w-full rounded-md" />
+   208→            ))}
+   209→          </div>
+   210→        ) : isError ? (
+   211→          <div className="flex items-center gap-2 text-xs text-destructive">
+   212→            <AlertCircle className="h-4 w-4" /> Failed to load carts.
+   213→          </div>
+   214→        ) : carts.length === 0 ? (
+   215→          <div className="rounded-md border border-dashed p-6 text-center">
+   216→            <Inbox className="mx-auto h-6 w-6 text-muted-foreground mb-2" />
+   217→            <p className="text-xs text-muted-foreground">
+   218→              No carts yet. Create one to start curating retrieval results.
+   219→            </p>
+   220→          </div>
+   221→        ) : (
+   222→          <div className="space-y-2 max-h-[55vh] overflow-y-auto thin-scroll pr-1">
+   223→            {carts.map((c: MemoryCart) => (
+   224→              <button
+   225→                key={c.id}
+   226→                onClick={() => onSelect(c.id)}
+   227→                aria-current={selectedId === c.id}
+   228→                className={cn(
+   229→                  "w-full text-left rounded-md border p-3 transition-all hover:shadow-sm hover:border-primary/40 hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+   230→                  selectedId === c.id && "ring-2 ring-primary border-primary bg-accent/40 shadow-sm"
+   231→                )}
+   232→              >
+   233→                <div className="flex items-start justify-between gap-2">
+   234→                  <div className="font-medium text-sm truncate">{c.name}</div>
+   235→                  <Badge variant="secondary" className="shrink-0 font-mono text-[10px]">
+   236→                    {c.memoryCount}
+   237→                  </Badge>
+   238→                </div>
+   239→                {c.description && (
+   240→                  <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{c.description}</p>
+   241→                )}
+   242→                <div className="text-[10px] text-muted-foreground mt-1.5 flex items-center gap-1">
+   243→                  <Clock className="h-3 w-3" />
+   244→                  Updated {relativeTime(c.updatedAt)}
+   245→                </div>
+   246→              </button>
+   247→            ))}
+   248→          </div>
+   249→        )}
+   250→      </CardContent>
+   251→    </Card>
+   252→  );
+   253→}
+   254→
+   255→// ─── Memory Detail Sheet ────────────────────────────────────────────────────
+   256→function MemoryDetailSheet({
+   257→  memory,
+   258→  open,
+   259→  onOpenChange,
+   260→}: {
+   261→  memory: CartMemory | null;
+   262→  open: boolean;
+   263→  onOpenChange: (v: boolean) => void;
+   264→}) {
+   265→  if (!memory) return null;
+   266→  return (
+   267→    <Sheet open={open} onOpenChange={onOpenChange}>
+   268→      <SheetContent side="right" className="sm:max-w-lg overflow-y-auto thin-scroll">
+   269→        <SheetHeader>
+   270→          <SheetTitle className="text-base">Memory detail</SheetTitle>
+   271→          <SheetDescription className="text-xs">
+   272→            id: <span className="font-mono">{memory.id}</span>
+   273→          </SheetDescription>
+   274→        </SheetHeader>
+   275→        <div className="px-4 pb-6 space-y-4 text-sm">
+   276→          <div className="space-y-1">
+   277→            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Query</div>
+   278→            <div className="rounded-md bg-muted/50 p-2.5 text-sm leading-relaxed">{memory.queryText}</div>
+   279→          </div>
+   280→          <div className="space-y-1">
+   281→            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Chunk text</div>
+   282→            <div className="rounded-md bg-muted/50 p-2.5 text-sm leading-relaxed whitespace-pre-wrap max-h-72 overflow-y-auto thin-scroll">
+   283→              {memory.chunkText ?? "—"}
+   284→            </div>
+   285→          </div>
+   286→          <Separator />
+   287→          <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+   288→            <ScoreCell label="Final score" value={fmtScore(memory.score)} highlight />
+   289→            <ScoreCell label="Vector" value={fmtScore(memory.vectorScore)} />
+   290→            <ScoreCell label="BM25" value={fmtScore(memory.bm25Score)} />
+   291→            <ScoreCell label="Fused" value={fmtScore(memory.fusedScore)} />
+   292→            <ScoreCell label="Reranker" value={fmtScore(memory.rerankerScore)} />
+   293→            <ScoreCell label="Success" value={fmtScore(memory.successScore)} />
+   294→          </div>
+   295→          {memory.notes && (
+   296→            <div className="space-y-1">
+   297→              <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Notes</div>
+   298→              <div className="rounded-md bg-muted/50 p-2.5 text-sm">{memory.notes}</div>
+   299→            </div>
+   300→          )}
+   301→          <div className="text-[10px] text-muted-foreground flex items-center gap-1">
+   302→            <Clock className="h-3 w-3" />
+   303→            Created {relativeTime(memory.createdAt)}
+   304→          </div>
+   305→        </div>
+   306→      </SheetContent>
+   307→    </Sheet>
+   308→  );
+   309→}
+   310→
+   311→function ScoreCell({ label, value, highlight }: { label: string; value: string; highlight?: boolean }) {
+   312→  return (
+   313→    <div className="rounded-md border p-2">
+   314→      <div className="text-[10px] text-muted-foreground uppercase tracking-wide">{label}</div>
+   315→      <div className={cn("font-mono text-sm mt-0.5", highlight && "text-primary font-semibold")}>{value}</div>
+   316→    </div>
+   317→  );
+   318→}
+   319→
+   320→// ─── Add Memories Dialog ────────────────────────────────────────────────────
+   321→function AddMemoriesDialog({
+   322→  cartId,
+   323→  existingIds,
+   324→}: {
+   325→  cartId: string;
+   326→  existingIds: Set<string>;
+   327→}) {
+   328→  const qc = useQueryClient();
+   329→  const [open, setOpen] = React.useState(false);
+   330→  const [selected, setSelected] = React.useState<Set<string>>(new Set());
+   331→  const [search, setSearch] = React.useState("");
+   332→
+   333→  // Load all recent memories when the dialog opens.
+   334→  const { data, isLoading, isError } = useQuery({
+   335→    queryKey: ["memories", "all", 1, 100],
+   336→    queryFn: () => api.memories.list({ page: 1, pageSize: 100 }),
+   337→    enabled: open,
+   338→  });
+   339→
+   340→  React.useEffect(() => {
+   341→    if (!open) {
+   342→      setSelected(new Set());
+   343→      setSearch("");
+   344→    }
+   345→  }, [open]);
+   346→
+   347→  const addMut = useMutation({
+   348→    mutationFn: (ids: string[]) => api.memoryCarts.patch(cartId, { addMemoryIds: ids }),
+   349→    onSuccess: (_data, ids) => {
+   350→      toast.success(`Added ${ids.length} memor${ids.length === 1 ? "y" : "ies"} to cart`);
+   351→      qc.invalidateQueries({ queryKey: ["cart", cartId] });
+   352→      qc.invalidateQueries({ queryKey: ["carts"] });
+   353→      setOpen(false);
+   354→    },
+   355→    onError: (e: unknown) => {
+   356→      const msg = e instanceof Error ? e.message : "Failed to add memories";
+   357→      toast.error("Add failed", { description: msg });
+   358→    },
+   359→  });
+   360→
+   361→  const memories = (data?.items ?? []) as Memory[];
+   362→  const candidates = memories.filter(
+   363→    (m) => !existingIds.has(m.id) && (!search || m.queryText.toLowerCase().includes(search.toLowerCase()))
+   364→  );
+   365→
+   366→  const toggle = (id: string) => {
+   367→    setSelected((prev) => {
+   368→      const next = new Set(prev);
+   369→      if (next.has(id)) next.delete(id);
+   370→      else next.add(id);
+   371→      return next;
+   372→    });
+   373→  };
+   374→
+   375→  return (
+   376→    <Dialog open={open} onOpenChange={setOpen}>
+   377→      <DialogTrigger asChild>
+   378→        <Button variant="outline" size="sm">
+   379→          <ListPlus className="h-3.5 w-3.5" /> Add memories
+   380→        </Button>
+   381→      </DialogTrigger>
+   382→      <DialogContent className="sm:max-w-2xl">
+   383→        <DialogHeader>
+   384→          <DialogTitle>Add memories to cart</DialogTitle>
+   385→          <DialogDescription>
+   386→            Select recent memories to add. Memories already in this cart are hidden.
+   387→          </DialogDescription>
+   388→        </DialogHeader>
+   389→        <div className="space-y-2">
+   390→          <div className="relative">
+   391→            <SearchIcon className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+   392→            <Input
+   393→              placeholder="Filter by query text…"
+   394→              value={search}
+   395→              onChange={(e) => setSearch(e.target.value)}
+   396→              className="pl-8 h-8 text-sm"
+   397→            />
+   398→          </div>
+   399→          <div className="rounded-md border max-h-[50vh] overflow-y-auto thin-scroll">
+   400→            {isLoading ? (
+   401→              <div className="p-3 space-y-2">
+   402→                {[0, 1, 2, 3].map((i) => (
+   403→                  <Skeleton key={i} className="h-10 w-full" />
+   404→                ))}
+   405→              </div>
+   406→            ) : isError ? (
+   407→              <div className="p-4 text-xs text-destructive flex items-center gap-2">
+   408→                <AlertCircle className="h-4 w-4" /> Failed to load memories.
+   409→              </div>
+   410→            ) : candidates.length === 0 ? (
+   411→              <div className="p-6 text-center text-xs text-muted-foreground">
+   412→                No memories available to add.
+   413→              </div>
+   414→            ) : (
+   415→              <ul className="divide-y">
+   416→                {candidates.map((m) => {
+   417→                  const checked = selected.has(m.id);
+   418→                  return (
+   419→                    <li key={m.id}>
+   420→                      <label
+   421→                        className={cn(
+   422→                          "flex items-start gap-2.5 p-2.5 cursor-pointer hover:bg-accent/50 transition-colors",
+   423→                          checked && "bg-accent/40"
+   424→                        )}
+   425→                      >
+   426→                        <Checkbox
+   427→                          checked={checked}
+   428→                          onCheckedChange={() => toggle(m.id)}
+   429→                          className="mt-0.5"
+   430→                          aria-label={`Select memory ${m.id}`}
+   431→                        />
+   432→                        <div className="min-w-0 flex-1">
+   433→                          <div className="text-sm truncate">{m.queryText}</div>
+   434→                          {m.chunkText && (
+   435→                            <div className="text-xs text-muted-foreground line-clamp-1 mt-0.5">{m.chunkText}</div>
+   436→                          )}
+   437→                          <div className="text-[10px] text-muted-foreground mt-1 flex items-center gap-2">
+   438→                            <span className="font-mono">score {fmtScore(m.score)}</span>
+   439→                            <span>{relativeTime(m.createdAt)}</span>
+   440→                          </div>
+   441→                        </div>
+   442→                      </label>
+   443→                    </li>
+   444→                  );
+   445→                })}
+   446→              </ul>
+   447→            )}
+   448→          </div>
+   449→          {selected.size > 0 && (
+   450→            <div className="text-xs text-muted-foreground">
+   451→              {selected.size} selected
+   452→            </div>
+   453→          )}
+   454→        </div>
+   455→        <DialogFooter>
+   456→          <DialogClose asChild>
+   457→            <Button variant="outline" size="sm">Cancel</Button>
+   458→          </DialogClose>
+   459→          <Button
+   460→            size="sm"
+   461→            disabled={selected.size === 0 || addMut.isPending}
+   462→            onClick={() => addMut.mutate(Array.from(selected))}
+   463→          >
+   464→            {addMut.isPending
+   465→              ? "Adding…"
+   466→              : `Add ${selected.size > 0 ? selected.size : ""} selected`}
+   467→          </Button>
+   468→        </DialogFooter>
+   469→      </DialogContent>
+   470→    </Dialog>
+   471→  );
+   472→}
+   473→
+   474→// ─── Edit Cart Dialog ────────────────────────────────────────────────────────
+   475→function EditCartDialog({
+   476→  cartId,
+   477→  name,
+   478→  description,
+   479→}: {
+   480→  cartId: string;
+   481→  name: string;
+   482→  description: string | null;
+   483→}) {
+   484→  const qc = useQueryClient();
+   485→  const [open, setOpen] = React.useState(false);
+   486→  const [n, setN] = React.useState(name);
+   487→  const [d, setD] = React.useState(description ?? "");
+   488→
+   489→  React.useEffect(() => {
+   490→    if (open) {
+   491→      setN(name);
+   492→      setD(description ?? "");
+   493→    }
+   494→  }, [open, name, description]);
+   495→
+   496→  const saveMut = useMutation({
+   497→    mutationFn: () =>
+   498→      api.memoryCarts.patch(cartId, {
+   499→        name: n.trim(),
+   500→        description: d.trim() || undefined,
+   501→      }),
+   502→    onSuccess: () => {
+   503→      toast.success("Cart updated");
+   504→      qc.invalidateQueries({ queryKey: ["cart", cartId] });
+   505→      qc.invalidateQueries({ queryKey: ["carts"] });
+   506→      setOpen(false);
+   507→    },
+   508→    onError: (e: unknown) => {
+   509→      const msg = e instanceof Error ? e.message : "Failed to update cart";
+   510→      toast.error("Update failed", { description: msg });
+   511→    },
+   512→  });
+   513→
+   514→  return (
+   515→    <Dialog open={open} onOpenChange={setOpen}>
+   516→      <DialogTrigger asChild>
+   517→        <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="Edit cart">
+   518→          <Pencil className="h-3.5 w-3.5" />
+   519→        </Button>
+   520→      </DialogTrigger>
+   521→      <DialogContent className="sm:max-w-md">
+   522→        <DialogHeader>
+   523→          <DialogTitle>Edit cart</DialogTitle>
+   524→          <DialogDescription>Rename or update the description.</DialogDescription>
+   525→        </DialogHeader>
+   526→        <div className="space-y-3">
+   527→          <div className="space-y-1.5">
+   528→            <Label htmlFor="edit-name" className="text-xs">Name</Label>
+   529→            <Input id="edit-name" value={n} onChange={(e) => setN(e.target.value)} disabled={saveMut.isPending} />
+   530→          </div>
+   531→          <div className="space-y-1.5">
+   532→            <Label htmlFor="edit-desc" className="text-xs">Description</Label>
+   533→            <Textarea
+   534→              id="edit-desc"
+   535→              value={d}
+   536→              onChange={(e) => setD(e.target.value)}
+   537→              rows={3}
+   538→              disabled={saveMut.isPending}
+   539→              className="resize-none"
+   540→            />
+   541→          </div>
+   542→        </div>
+   543→        <DialogFooter>
+   544→          <DialogClose asChild>
+   545→            <Button variant="outline" size="sm">Cancel</Button>
+   546→          </DialogClose>
+   547→          <Button
+   548→            size="sm"
+   549→            disabled={!n.trim() || saveMut.isPending}
+   550→            onClick={() => saveMut.mutate()}
+   551→          >
+   552→            {saveMut.isPending ? "Saving…" : "Save changes"}
+   553→          </Button>
+   554→        </DialogFooter>
+   555→      </DialogContent>
+   556→    </Dialog>
+   557→  );
+   558→}
+   559→
+   560→// ─── Memory Selection Table (cart detail) ───────────────────────────────────
+   561→function MemorySelectionTable({ cartId, memories }: { cartId: string; memories: CartMemory[] }) {
+   562→  const qc = useQueryClient();
+   563→  const [detail, setDetail] = React.useState<CartMemory | null>(null);
+   564→  const [detailOpen, setDetailOpen] = React.useState(false);
+   565→
+   566→  // Optimistic toggle: replace the selection with the remaining checked ids.
+   567→  const toggleMut = useMutation({
+   568→    mutationFn: (memoryIds: string[]) => api.memoryCarts.patch(cartId, { memoryIds }),
+   569→    onMutate: async (memoryIds: string[]) => {
+   570→      await qc.cancelQueries({ queryKey: ["cart", cartId] });
+   571→      const prev = qc.getQueryData<{ memories: CartMemory[] }>(["cart", cartId]);
+   572→      if (prev) {
+   573→        const set = new Set(memoryIds);
+   574→        qc.setQueryData(["cart", cartId], {
+   575→          ...prev,
+   576→          memories: prev.memories.filter((m) => set.has(m.id)),
+   577→        });
+   578→      }
+   579→      return { prev };
+   580→    },
+   581→    onSuccess: (_data, memoryIds) => {
+   582→      toast.success(`Updated selection (${memoryIds.length} memor${memoryIds.length === 1 ? "y" : "ies"})`);
+   583→      qc.invalidateQueries({ queryKey: ["cart", cartId] });
+   584→      qc.invalidateQueries({ queryKey: ["carts"] });
+   585→    },
+   586→    onError: (e: unknown, _vars, ctx) => {
+   587→      if (ctx?.prev) qc.setQueryData(["cart", cartId], ctx.prev);
+   588→      const msg = e instanceof Error ? e.message : "Failed to update selection";
+   589→      toast.error("Update failed", { description: msg });
+   590→    },
+   591→  });
+   592→
+   593→  const handleToggle = (id: string, checked: boolean) => {
+   594→    const next = memories.filter((m) => (m.id === id ? checked : true)).map((m) => m.id);
+   595→    toggleMut.mutate(next);
+   596→  };
+   597→
+   598→  const openDetail = (m: CartMemory) => {
+   599→    setDetail(m);
+   600→    setDetailOpen(true);
+   601→  };
+   602→
+   603→  if (memories.length === 0) {
+   604→    return (
+   605→      <div className="rounded-md border border-dashed p-8 text-center">
+   606→        <Inbox className="mx-auto h-8 w-8 text-muted-foreground mb-2" />
+   607→        <p className="text-sm text-muted-foreground">
+   608→          No memories in this cart yet.
+   609→        </p>
+   610→        <p className="text-xs text-muted-foreground mt-1">
+   611→          Use <span className="font-medium">Add memories</span> to curate retrieval results.
+   612→        </p>
+   613→      </div>
+   614→    );
+   615→  }
+   616→
+   617→  return (
+   618→    <>
+   619→      <div className="rounded-md border max-h-[60vh] overflow-y-auto thin-scroll">
+   620→        <Table>
+   621→          <TableHeader className="sticky top-0 bg-background z-10">
+   622→            <TableRow>
+   623→              <TableHead className="w-[40px]"></TableHead>
+   624→              <TableHead className="min-w-[160px]">Query</TableHead>
+   625→              <TableHead className="min-w-[220px]">Chunk text</TableHead>
+   626→              <TableHead className="w-[70px] text-right">Score</TableHead>
+   627→              <TableHead className="w-[70px] text-right">Vector</TableHead>
+   628→              <TableHead className="w-[70px] text-right">BM25</TableHead>
+   629→              <TableHead className="w-[70px] text-right">Rerank</TableHead>
+   630→              <TableHead className="w-[110px]">Created</TableHead>
+   631→              <TableHead className="w-[40px]"></TableHead>
+   632→            </TableRow>
+   633→          </TableHeader>
+   634→          <TableBody>
+   635→            {memories.map((m) => (
+   636→              <TableRow
+   637→                key={m.id}
+   638→                data-state={m.selected ? "selected" : undefined}
+   639→                className="group"
+   640→              >
+   641→                <TableCell>
+   642→                  <Checkbox
+   643→                    checked={true}
+   644→                    onCheckedChange={(v) => handleToggle(m.id, Boolean(v))}
+   645→                    aria-label={`Keep memory ${m.id} in cart`}
+   646→                  />
+   647→                </TableCell>
+   648→                <TableCell className="max-w-[200px]">
+   649→                  <button
+   650→                    className="text-left text-sm hover:text-primary hover:underline line-clamp-2"
+   651→                    onClick={() => openDetail(m)}
+   652→                  >
+   653→                    {m.queryText}
+   654→                  </button>
+   655→                </TableCell>
+   656→                <TableCell className="max-w-[260px]">
+   657→                  <button
+   658→                    className="text-left text-xs text-muted-foreground hover:text-primary line-clamp-2 text-left"
+   659→                    onClick={() => openDetail(m)}
+   660→                  >
+   661→                    {m.chunkText ?? "—"}
+   662→                  </button>
+   663→                </TableCell>
+   664→                <TableCell className="text-right font-mono text-xs">{fmtScore(m.score)}</TableCell>
+   665→                <TableCell className="text-right font-mono text-xs text-muted-foreground">{fmtScore(m.vectorScore)}</TableCell>
+   666→                <TableCell className="text-right font-mono text-xs text-muted-foreground">{fmtScore(m.bm25Score)}</TableCell>
+   667→                <TableCell className="text-right font-mono text-xs text-muted-foreground">{fmtScore(m.rerankerScore)}</TableCell>
+   668→                <TableCell className="text-[10px] text-muted-foreground whitespace-nowrap">
+   669→                  {relativeTime(m.createdAt)}
+   670→                </TableCell>
+   671→                <TableCell>
+   672→                  <Button
+   673→                    variant="ghost"
+   674→                    size="icon"
+   675→                    className="h-6 w-6 opacity-0 group-hover:opacity-100 transition-opacity"
+   676→                    onClick={() => openDetail(m)}
+   677→                    aria-label="View memory detail"
+   678→                  >
+   679→                    <Eye className="h-3 w-3" />
+   680→                  </Button>
+   681→                </TableCell>
+   682→              </TableRow>
+   683→            ))}
+   684→          </TableBody>
+   685→        </Table>
+   686→      </div>
+   687→      <MemoryDetailSheet memory={detail} open={detailOpen} onOpenChange={setDetailOpen} />
+   688→    </>
+   689→  );
+   690→}
+   691→
+   692→// ─── Cart Detail ────────────────────────────────────────────────────────────
+   693→function CartDetail({ cartId }: { cartId: string }) {
+   694→  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+   695→    queryKey: ["cart", cartId],
+   696→    queryFn: () => api.memoryCarts.get(cartId),
+   697→  });
+   698→
+   699→  if (isLoading) {
+   700→    return (
+   701→      <Card>
+   702→        <CardHeader>
+   703→          <Skeleton className="h-5 w-1/3" />
+   704→          <Skeleton className="h-3 w-1/4 mt-2" />
+   705→        </CardHeader>
+   706→        <CardContent className="space-y-2">
+   707→          {[0, 1, 2].map((i) => (
+   708→            <Skeleton key={i} className="h-10 w-full" />
+   709→          ))}
+   710→        </CardContent>
+   711→      </Card>
+   712→    );
+   713→  }
+   714→
+   715→  if (isError || !data) {
+   716→    return (
+   717→      <Card>
+   718→        <CardContent className="pt-6">
+   719→          <div className="flex items-center gap-2 text-sm text-destructive">
+   720→            <AlertCircle className="h-4 w-4" /> Failed to load cart detail.
+   721→          </div>
+   722→          <Button variant="outline" size="sm" className="mt-3" onClick={() => refetch()}>
+   723→            Retry
+   724→          </Button>
+   725→        </CardContent>
+   726→      </Card>
+   727→    );
+   728→  }
+   729→
+   730→  const memories = (data.memories ?? []) as CartMemory[];
+   731→  const existingIds = new Set(memories.map((m) => m.id));
+   732→
+   733→  return (
+   734→    <Card>
+   735→      <CardHeader>
+   736→        <div className="flex items-start justify-between gap-2 min-w-0">
+   737→          <div className="min-w-0">
+   738→            <CardTitle className="flex items-center gap-2 text-base truncate">
+   739→              <ShoppingCart className="h-4 w-4 text-primary shrink-0" />
+   740→              <span className="truncate">{data.name}</span>
+   741→            </CardTitle>
+   742→            <CardDescription className="text-xs mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+   743→              <span>{memories.length} memor{memories.length === 1 ? "y" : "ies"}</span>
+   744→              <span aria-hidden>·</span>
+   745→              <span className="flex items-center gap-1">
+   746→                <Clock className="h-3 w-3" />
+   747→                Created {relativeTime(data.createdAt)}
+   748→              </span>
+   749→              <span aria-hidden>·</span>
+   750→              <span>Updated {relativeTime(data.updatedAt)}</span>
+   751→            </CardDescription>
+   752→          </div>
+   753→          <div className="flex items-center gap-1 shrink-0">
+   754→            <Button
+   755→              variant="ghost"
+   756→              size="icon"
+   757→              className="h-7 w-7"
+   758→              onClick={() => refetch()}
+   759→              aria-label="Refresh cart"
+   760→            >
+   761→              <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} />
+   762→            </Button>
+   763→            <EditCartDialog
+   764→              cartId={cartId}
+   765→              name={data.name}
+   766→              description={data.description}
+   767→            />
+   768→          </div>
+   769→        </div>
+   770→        {data.description && (
+   771→          <p className="text-xs text-muted-foreground mt-1">{data.description}</p>
+   772→        )}
+   773→        <CardAction>
+   774→          <AddMemoriesDialog cartId={cartId} existingIds={existingIds} />
+   775→        </CardAction>
+   776→      </CardHeader>
+   777→      <CardContent>
+   778→        <MemorySelectionTable cartId={cartId} memories={memories} />
+   779→      </CardContent>
+   780→    </Card>
+   781→  );
+   782→}
+   783→
+   784→// ─── All Memories Browser (collapsible) ─────────────────────────────────────
+   785→function AllMemoriesSection() {
+   786→  const [open, setOpen] = React.useState(false);
+   787→  const [expFilter, setExpFilter] = React.useState<string>("all");
+   788→
+   789→  // Search-experiments for the filter dropdown.
+   790→  const { data: expData } = useQuery({
+   791→    queryKey: ["experiments", "list", { kind: "search" }],
+   792→    queryFn: () => api.experiments.list({ page: 1, pageSize: 50, kind: "search" }),
+   793→  });
+   794→  const searchExps = expData?.items ?? [];
+   795→
+   796→  const { data, isLoading, isError } = useQuery({
+   797→    queryKey: ["memories", "all", 1, 50, expFilter],
+   798→    queryFn: () =>
+   799→      api.memories.list({
+   800→        page: 1,
+   801→        pageSize: 50,
+   802→        experimentId: expFilter === "all" ? undefined : expFilter,
+   803→      }),
+   804→    enabled: open,
+   805→  });
+   806→
+   807→  const memories = (data?.items ?? []) as Memory[];
+   808→
+   809→  // Mutation to toggle a memory in/out of the most recent cart via set selection.
+   810→  // For the global browser we use addMemoryIds when not selected; for removal we
+   811→  // would need to know which cart contains it. v1 keeps the browser as
+   812→  // read-only + "add to cart" via per-row dropdown. Simplest: show selected
+   813→  // badge and a quick "add to cart" picker.
+   814→  const [detail, setDetail] = React.useState<Memory | null>(null);
+   815→  const [detailOpen, setDetailOpen] = React.useState(false);
+   816→
+   817→  return (
+   818→    <Card>
+   819→      <Collapsible open={open} onOpenChange={setOpen}>
+   820→        <CardHeader>
+   821→          <CardTitle className="text-base">All Memories</CardTitle>
+   822→          <CardDescription className="text-xs">
+   823→            Browse all retrieval memories across experiments.
+   824→          </CardDescription>
+   825→          <CardAction>
+   826→            <CollapsibleTrigger asChild>
+   827→              <Button variant="ghost" size="sm" className="h-7 gap-1">
+   828→                {open ? "Hide" : "Show"}
+   829→                {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+   830→              </Button>
+   831→            </CollapsibleTrigger>
+   832→          </CardAction>
+   833→        </CardHeader>
+   834→        <CollapsibleContent>
+   835→          <CardContent className="space-y-3">
+   836→            <div className="flex items-center gap-2 flex-wrap">
+   837→              <Label htmlFor="exp-filter" className="text-xs text-muted-foreground">Filter by experiment</Label>
+   838→              <Select value={expFilter} onValueChange={setExpFilter}>
+   839→                <SelectTrigger id="exp-filter" className="h-8 w-[260px] text-xs">
+   840→                  <SelectValue placeholder="All experiments" />
+   841→                </SelectTrigger>
+   842→                <SelectContent>
+   843→                  <SelectItem value="all">All experiments</SelectItem>
+   844→                  {searchExps.map((e) => (
+   845→                    <SelectItem key={e.id} value={e.id}>
+   846→                      {e.description?.slice(0, 60) ?? e.id}
+   847→                    </SelectItem>
+   848→                  ))}
+   849→                </SelectContent>
+   850→              </Select>
+   851→              <span className="text-[10px] text-muted-foreground">
+   852→                {memories.length} shown
+   853→              </span>
+   854→            </div>
+   855→            <div className="rounded-md border max-h-96 overflow-y-auto thin-scroll">
+   856→              {isLoading ? (
+   857→                <div className="p-3 space-y-2">
+   858→                  {[0, 1, 2, 3].map((i) => (
+   859→                    <Skeleton key={i} className="h-10 w-full" />
+   860→                  ))}
+   861→                </div>
+   862→              ) : isError ? (
+   863→                <div className="p-4 text-xs text-destructive flex items-center gap-2">
+   864→                  <AlertCircle className="h-4 w-4" /> Failed to load memories.
+   865→                </div>
+   866→              ) : memories.length === 0 ? (
+   867→                <div className="p-6 text-center text-xs text-muted-foreground">
+   868→                  No memories found. Run a search to populate.
+   869→                </div>
+   870→              ) : (
+   871→                <Table>
+   872→                  <TableHeader className="sticky top-0 bg-background z-10">
+   873→                    <TableRow>
+   874→                      <TableHead className="min-w-[180px]">Query</TableHead>
+   875→                      <TableHead className="min-w-[240px]">Chunk text</TableHead>
+   876→                      <TableHead className="w-[70px] text-right">Score</TableHead>
+   877→                      <TableHead className="w-[100px]">In cart</TableHead>
+   878→                      <TableHead className="w-[110px]">Created</TableHead>
+   879→                    </TableRow>
+   880→                  </TableHeader>
+   881→                  <TableBody>
+   882→                    {memories.map((m) => (
+   883→                      <TableRow key={m.id} className="group">
+   884→                        <TableCell className="max-w-[200px]">
+   885→                          <button
+   886→                            className="text-left text-sm hover:text-primary hover:underline line-clamp-2"
+   887→                            onClick={() => {
+   888→                              setDetail(m);
+   889→                              setDetailOpen(true);
+   890→                            }}
+   891→                          >
+   892→                            {m.queryText}
+   893→                          </button>
+   894→                        </TableCell>
+   895→                        <TableCell className="max-w-[280px]">
+   896→                          <button
+   897→                            className="text-left text-xs text-muted-foreground hover:text-primary line-clamp-2 text-left"
+   898→                            onClick={() => {
+   899→                              setDetail(m);
+   900→                              setDetailOpen(true);
+   901→                            }}
+   902→                          >
+   903→                            {m.chunkText ?? "—"}
+   904→                          </button>
+   905→                        </TableCell>
+   906→                        <TableCell className="text-right font-mono text-xs">{fmtScore(m.score)}</TableCell>
+   907→                        <TableCell>
+   908→                          {m.selected ? (
+   909→                            <Badge variant="default" className="text-[10px]">in cart</Badge>
+   910→                          ) : (
+   911→                            <Badge variant="outline" className="text-[10px] text-muted-foreground">—</Badge>
+   912→                          )}
+   913→                        </TableCell>
+   914→                        <TableCell className="text-[10px] text-muted-foreground whitespace-nowrap">
+   915→                          {relativeTime(m.createdAt)}
+   916→                        </TableCell>
+   917→                      </TableRow>
+   918→                    ))}
+   919→                  </TableBody>
+   920→                </Table>
+   921→              )}
+   922→            </div>
+   923→          </CardContent>
+   924→        </CollapsibleContent>
+   925→      </Collapsible>
+   926→
+   927→      <MemoryDetailSheet
+   928→        memory={detail as CartMemory | null}
+   929→        open={detailOpen}
+   930→        onOpenChange={setDetailOpen}
+   931→      />
+   932→    </Card>
+   933→  );
+   934→}
+   935→
+   936→// ─── Cart Detail Placeholder ────────────────────────────────────────────────
+   937→function CartDetailPlaceholder() {
+   938→  return (
+   939→    <Card className="border-dashed">
+   940→      <CardContent className="pt-10 pb-10 flex flex-col items-center justify-center text-center">
+   941→        <div className="h-12 w-12 rounded-full bg-primary/10 flex items-center justify-center mb-3">
+   942→          <ShoppingCart className="h-5 w-5 text-primary" />
+   943→        </div>
+   944→        <p className="text-sm font-medium">Select a cart to view its memories</p>
+   945→        <p className="text-xs text-muted-foreground mt-1 max-w-xs">
+   946→          Pick a cart from the list to inspect and curate its retrieval results.
+   947→        </p>
+   948→      </CardContent>
+   949→    </Card>
+   950→  );
+   951→}
+   952→
+   953→// ─── Main View ──────────────────────────────────────────────────────────────
+   954→export function MemoryView() {
+   955→  const [selectedCartId, setSelectedCartId] = React.useState<string | null>(null);
+   956→
+   957→  return (
+   958→    <>
+   959→      <ViewHeader
+   960→        title="Memory Cart"
+   961→        description="Curate retrieval memories into shareable carts"
+   962→        icon={ShoppingCart}
+   963→      />
+   964→      <ViewBody>
+   965→        <div className="grid gap-4 lg:grid-cols-[340px_minmax(0,1fr)]">
+   966→          {/* Left column */}
+   967→          <div className="space-y-4">
+   968→            <CreateCartCard onCreated={(id) => setSelectedCartId(id)} />
+   969→            <CartsList selectedId={selectedCartId} onSelect={setSelectedCartId} />
+   970→          </div>
+   971→          {/* Right column */}
+   972→          <div className="space-y-4">
+   973→            {selectedCartId ? (
+   974→              <CartDetail cartId={selectedCartId} />
+   975→            ) : (
+   976→              <CartDetailPlaceholder />
+   977→            )}
+   978→            <AllMemoriesSection />
+   979→          </div>
+   980→        </div>
+   981→      </ViewBody>
+   982→    </>
+   983→  );
+   984→}
+   985→
