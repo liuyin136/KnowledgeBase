@@ -1,0 +1,224 @@
+// Prisma schema for Local-First RAG Experimentation Platform v1
+// Maps the Neo4j graph schema (neo4j-schema-v1.1.md) to Prisma/SQLite.
+// Parent-child hierarchy: Knowledge -[HAS_CHUNK]-> KnowledgeChunk (via parentId FK).
+// UserQuery -[HAS_CHUNK]-> UserQueryChunk. Memory links UserQuery -> KnowledgeChunk.
+// MemoryCart -[CONTAINS]-> Memory. Experiment is the top-level observability node.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// Top-level experiment / observability node. One per ingest OR search run.
+model Experiment {
+  id                   String             @id @default(cuid())
+  description          String
+  embeddingApproach    String             // "LongText" | "ChildChunk" | "Query"
+  chunkMethod          String             // "LongText" | "Recursive" | "Semantic" | "Structure-Aware" | "N/A"
+  advOption            String             @default("None") // v1 always "None"
+  sourceFile           String?
+  totalChunks          Int                @default(0)
+  avgTokensPerChunk    Float              @default(0)
+  totalTimeMs          Float              @default(0)
+  status               String             @default("pending") // pending|running|completed|failed
+  errorCode            String?
+  errorMessage         String?
+  // Search-run specific config snapshot (null for ingest experiments)
+  hybridAlpha          Float?
+  useBm25              Boolean?
+  useReranker          Boolean?
+  topKVector           Int?
+  topNRerank           Int?
+  parentContextLevels  Int?
+  autoTuneWeights      Boolean?
+  bestAlpha            Float? // result of adaptive sweep
+  rawQuery             String?
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+
+  knowledge            Knowledge[]
+  chunks               KnowledgeChunk[]
+  userQueries          UserQuery[]
+  memories             Memory[]
+  searchRuns           SearchRun[]
+}
+
+/// Parent document node (:Knowledge). Holds the LongText embedding vector when embeddingApproach=LongText.
+model Knowledge {
+  id               String           @id @default(cuid())
+  experimentId     String
+  experiment       Experiment       @relation(fields: [experimentId], references: [id], onDelete: Cascade)
+  sourceFile       String
+  totalTokens      Int              @default(0)
+  embeddingMethod  String           // "LongText"
+  text             String           // full document text (for parent context + BM25)
+  // Vector stored as JSON-encoded number[] (cosine computed in-memory).
+  // SQLite has no native vector type; this keeps v1 simple and research-scale.
+  vector           String           // JSON number[]
+  embeddingTimeMs  Float            @default(0)
+  createdAt        DateTime         @default(now())
+
+  chunks           KnowledgeChunk[]
+
+  @@index([experimentId])
+}
+
+/// Child chunk node (:KnowledgeChunk). Linked to parent via parentId (HAS_CHUNK semantics).
+model KnowledgeChunk {
+  id               String           @id @default(cuid())
+  experimentId     String
+  experiment       Experiment       @relation(fields: [experimentId], references: [id], onDelete: Cascade)
+  parentId         String
+  parent           Knowledge        @relation(fields: [parentId], references: [id], onDelete: Cascade)
+  chunkIndex       Int
+  text             String
+  tokenCount       Int
+  chunkMethod      String           // "Recursive" | "Semantic" | "Structure-Aware" | "LongText"
+  chunkingTimeMs   Float            @default(0)
+  embeddingMethod  String           // "ChildChunk"
+  embeddingTimeMs  Float            @default(0)
+  vector           String           // JSON number[]
+  // Observability metadata
+  charStart        Int?
+  charEnd          Int?
+  section          String?          // for Structure-Aware (markdown heading path)
+  createdAt        DateTime         @default(now())
+
+  memories         Memory[]
+
+  @@index([experimentId])
+  @@index([parentId])
+  @@index([chunkMethod])
+}
+
+/// User query node (:UserQuery). Holds the query embedding vector.
+model UserQuery {
+  id               String           @id @default(cuid())
+  experimentId     String?
+  experiment       Experiment?      @relation(fields: [experimentId], references: [id], onDelete: SetNull)
+  text             String
+  totalTokens      Int              @default(0)
+  embeddingMethod  String           @default("LongText")
+  vector           String           // JSON number[]
+  embeddingTimeMs  Float            @default(0)
+  createdAt        DateTime         @default(now())
+
+  chunks           UserQueryChunk[]
+  memories         Memory[]
+
+  @@index([experimentId])
+}
+
+/// Optional query chunks for long queries (:UserQueryChunk).
+model UserQueryChunk {
+  id               String           @id @default(cuid())
+  parentQueryId    String
+  parent           UserQuery        @relation(fields: [parentQueryId], references: [id], onDelete: Cascade)
+  chunkIndex       Int
+  text             String
+  tokenCount       Int
+  embeddingTimeMs  Float            @default(0)
+  vector           String           // JSON number[]
+  createdAt        DateTime         @default(now())
+
+  @@index([parentQueryId])
+}
+
+/// Memory node (:Memory). Links a UserQuery to retrieved KnowledgeChunks (TRIGGERED/RETRIEVED).
+model Memory {
+  id               String           @id @default(cuid())
+  userQueryId      String
+  userQuery        UserQuery        @relation(fields: [userQueryId], references: [id], onDelete: Cascade)
+  experimentId     String?
+  experiment       Experiment?      @relation(fields: [experimentId], references: [id], onDelete: SetNull)
+  chunkId          String?
+  chunk            KnowledgeChunk?  @relation(fields: [chunkId], references: [id], onDelete: SetNull)
+  queryText        String
+  chunkText        String?
+  score            Float?
+  vectorScore      Float?
+  bm25Score        Float?
+  fusedScore       Float?
+  rerankerScore    Float?
+  notes            String?
+  successScore     Float?
+  createdAt        DateTime         @default(now())
+
+  carts            MemoryCart[]     @relation("MemoryCartItems")
+
+  @@index([userQueryId])
+  @@index([experimentId])
+}
+
+/// MemoryCart node (:MemoryCart). Curated collection of memories (CONTAINS).
+model MemoryCart {
+  id               String           @id @default(cuid())
+  name             String
+  description      String?
+  researcherId     String?          // future multi-user (always null in v1)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  memories         Memory[]         @relation("MemoryCartItems")
+
+  @@index([researcherId])
+}
+
+/// Search run record (one per POST /search). Stores config snapshot + result count for history.
+model SearchRun {
+  id               String           @id @default(cuid())
+  experimentId     String?
+  experiment       Experiment?      @relation(fields: [experimentId], references: [id], onDelete: SetNull)
+  rawQuery         String
+  hybridAlpha      Float
+  useBm25          Boolean
+  useReranker      Boolean
+  topKVector       Int
+  topNRerank       Int
+  parentContextLevels Int           @default(1)
+  autoTuneWeights  Boolean          @default(false)
+  bestAlpha        Float?
+  resultCount      Int              @default(0)
+  topScore         Float?
+  searchTimeMs     Float            @default(0)
+  createdAt        DateTime         @default(now())
+
+  @@index([experimentId])
+  @@index([createdAt])
+}
+
+/// Document store (uploaded source files metadata + content).
+model Document {
+  id               String           @id @default(cuid())
+  filename         String
+  contentType      String
+  size             Int
+  text             String
+  createdAt        DateTime         @default(now())
+}
+
+/// Long-running job state (ingest / search). Persisted for resilience across requests.
+model Job {
+  id               String           @id @default(cuid())
+  type             String           // "ingest" | "search"
+  experimentId     String?
+  status           String           @default("queued") // queued|running|completed|failed
+  progress         Int              @default(0)        // 0-100
+  total            Int              @default(0)
+  current          Int              @default(0)
+  errorCode        String?
+  errorMessage     String?
+  // Incremental per-chunk metadata emitted during ingest (JSON array of ChunkMetadata).
+  events           String           @default("[]")
+  result           String?          // JSON final result (search results snapshot)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  @@index([type])
+  @@index([status])
+  @@index([experimentId])
+}

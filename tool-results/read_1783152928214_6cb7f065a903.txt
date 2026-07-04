@@ -1,0 +1,616 @@
+     1→# Implementation Plan: Local-First RAG Experimentation Platform v1.1
+     2→
+     3→**Version**: 1.0  
+     4→**Date**: 2026-07-04  
+     5→**Status**: Ready for Execution (Contract-First, 6-Slice Vertical Roadmap)  
+     6→**Aligned With**:
+     7→- [Backend_Design_Scope_v1.1.md](./Backend_Design_Scope_v1.1.md) (single source of truth for scope, architecture, pipelines, success criteria)
+     8→- [API_Interface_Design_v1.1.md](./API_Interface_Design_v1.1.md) (stable REST contract, types, error semantics)
+     9→- [backend-directory-structure_v1.1.md](./backend-directory-structure_v1.1.md) (project layout)
+    10→- [Frontend_Workflow_Mapping_v1.1.md](./Frontend_Workflow_Mapping_v1.1.md) (workflows + component mapping)
+    11→- [infrastructure-environment-spec_v1.1.md](./infrastructure-environment-spec_v1.1.md) (Docker, models, GTX 3070 Ti constraints)
+    12→- [neo4j-schema-v1.1.md](./neo4j-schema-v1.1.md) (nodes, relationships, indexes)
+    13→- [error-handling-retry-strategy_v1.1.md](./error-handling-retry-strategy_v1.1.md) (exception hierarchy + retry)
+    14→
+    15→---
+    16→
+    17→## Overview
+    18→
+    19→Build a **local-first RAG experimentation platform** that lets a researcher systematically compare embedding approaches (`LongText` vs `ChildChunk`) and chunking methods (`Recursive` | `Semantic` | `Structure-Aware`) with full parent-child awareness, hybrid retrieval (vector + optional BM25 + reranker), rich observability, and curation via Memory + MemoryCart.
+    20→
+    21→The implementation strictly follows the **6 thin vertical slices** defined in Backend_Design_Scope_v1.1.md so that after Slice 1 a researcher can already run real, observable Long-Text experiments. Every pipeline step emits `ChunkMetadata` and `ExperimentRun` for learnability. The system targets **GTX 3070 Ti (8 GB VRAM)** with models ≤ 7 B parameters (primary: BGE-M3).
+    22→
+    23→**Core workflows supported end-to-end**:
+    24→1. Ingest (document upload + configurable chunk/embed + live progress + metadata)
+    25→2. Hybrid Search (tunable parent-level retrieval + child expansion + Memory Cart add)
+    26→3. Memory Cart (curation)
+    27→4. Experiments (history, detail, side-by-side comparison, observability browser)
+    28→
+    29→**Non-goals for v1** (explicit guardrails): Late Chunking, Agentic Chunking, GraphRAG, Structured Chat, multi-user auth.
+    30→
+    31→**Success criteria** (from Backend_Design_Scope):
+    32→- Researcher can run controlled experiments comparing approaches/parameters.
+    33→- Every run produces rich, queryable observability data in Neo4j.
+    34→- Hybrid Search baseline with parent-child awareness is tunable and observable.
+    35→- System runs reliably on target hardware.
+    36→
+    37→This plan decomposes the work into **ordered, verifiable S/M tasks** with explicit acceptance criteria, verification steps, dependencies, and files touched. It follows vertical slicing so each increment leaves a **working, testable system**.
+    38→
+    39→---
+    40→
+    41→## Architecture Decisions & Key Principles (Via Negativa + Tinkering)
+    42→
+    43→**Decisions** (drawn directly from the design docs):
+    44→- **Vertical slices win**: One complete feature path at a time (e.g. "researcher can run a Long-Text ingest experiment with full metadata" before adding ChildChunk). Avoid horizontal layering (all DB then all API then all UI).
+    45→- **Strict module boundaries** (non-negotiable):
+    46→  - `ChunkingModule` → only finds boundaries (never embeds).
+    47→  - `EmbeddingModule` → only produces vectors (never chunks).
+    48→  - `PipelineOrchestrator` → owns coordination, timing, metadata emission, transactions, experiment lifecycle.
+    49→- **Parent-child hierarchy is the foundation** for all meaningful retrieval experiments (`:Knowledge` → `[:HAS_CHUNK]` → `:KnowledgeChunk`).
+    50→- **Observability is first-class**: `ChunkMetadata` (per-chunk tokens, timings, method, experiment_id) and `ExperimentRun` are emitted at every step and persisted/queryable.
+    51→- **Contract-first API**: Pydantic schemas in `schemas/` are the single source of truth. `api/` layer is thin HTTP only. Error shape is always `{"error": {"code", "message", "details"}}`.
+    52→- **Standard paths only in v1**: No Late/Agentic logic. All extensibility prepared via clean module structure + feature flags (post-v1).
+    53→- **Local-first infrastructure**: Docker + NVIDIA CUDA base + Neo4j 5.x (vector HNSW + fulltext) + Redis (jobs/progress) + separate `api-worker`. One-time model download + index init scripts.
+    54→- **Frontend architecture**: Next.js 15 App Router + TypeScript + shadcn/ui (neutral + teal) + TanStack Query v5 (server state) + Zustand (client state) + react-hook-form + zod. Long-running progress via SSE or polling.
+    55→- **Tinkering enabled by design** (Antifragility): Every tunable parameter (`hybridAlpha`, `chunkMethod`, `embeddingApproach`, `useBm25`, `useReranker`, `topKVector`, `topNRerank`, `parentContextLevels`) is explicit in request bodies, logged per run, and visible on Experiments page. Researcher can rapidly iterate and compare.
+    56→- **Via Negativa (what we deliberately avoid)**: No premature abstraction, no over-engineering for v2 features, no leaking internal stack traces, no retry on permanent failures (validation, model load), no storing large files in Neo4j (only metadata + vectors).
+    57→
+    58→**Dependency graph (bottom-up order)**:
+    59→```
+    60→Neo4j schema + indexes + models
+    61→    ↓
+    62→Core services (chunking/embedding/metadata/orchestrator) + error handling
+    63→    ↓
+    64→API schemas + thin endpoints + workers (job status)
+    65→    ↓
+    66→Frontend types/clients + workflow pages (Ingest first, then Search/Memory/Experiments)
+    67→    ↓
+    68→Integration tests + contract tests + observability polish
+    69→```
+    70→
+    71→---
+    72→
+    73→## Task List (Granular, Verifiable, Vertical)
+    74→
+    75→All tasks are sized so one focused session can complete + verify them. Checkpoints after every major phase.
+    76→
+    77→### Phase 0: Infrastructure, Scaffolding & Contracts (Foundation — can start immediately)
+    78→
+    79→**Task 0.1: Backend project scaffolding + core configuration + exception hierarchy**
+    80→
+    81→**Description:** Create exact directory tree per `backend-directory-structure_v1.1.md`. Implement `core/config.py` (Pydantic Settings for NEO4J_*, REDIS_URL, MODEL_PATH, CUDA_VISIBLE_DEVICES), `core/exceptions.py` (RAGBaseException + subclasses per error-handling spec), `core/logging.py` (structured JSON logs with experiment_id/correlation_id), constants/enums for ChunkMethod/EmbeddingApproach. Add basic `main.py` with FastAPI lifespan that initializes Neo4j driver + Redis.
+    82→
+    83→**Acceptance criteria:**
+    84→- [ ] Directory tree exactly matches spec (app/api/v1/, services/, db/, workers/, schemas/, models/, utils/)
+    85→- [ ] `from app.core.config import settings` loads env vars correctly; validation errors raised on missing required vars
+    86→- [ ] Custom exceptions inherit correctly; `status_code` and `code` attributes present
+    87→- [ ] `uvicorn app.main:app` starts and `/health` (or root) returns 200 without DB connection yet
+    88→
+    89→**Verification:**
+    90→- [ ] `python -c "from app.main import app; print('imports OK')"`
+    91→- [ ] Pytest collection succeeds on `tests/`
+    92→- [ ] `.env.example` documents all variables from infrastructure spec
+    93→
+    94→**Dependencies:** None  
+    95→**Files likely touched:** ~6 files (pyproject.toml, requirements.txt or uv.lock, app/main.py, app/core/*.py, .env.example, README.md)  
+    96→**Estimated scope:** Medium (Scaffold + config)
+    97→
+    98→**Task 0.2: Docker multi-stage build + docker-compose.yml + one-time scripts (models + Neo4j init)**
+    99→
+   100→**Description:** Implement `docker/Dockerfile` (multi-stage: model-downloader stage with huggingface_hub + git-lfs, runtime stage based on `nvidia/cuda:13.3.0-devel-ubuntu26.04` or approved base + Python 3.12/3.13, minimal deps). Create `docker-compose.yml` with services: neo4j (5.20-community + APOC if needed), redis:7-alpine, backend (GPU reserved), api-worker (GPU reserved, runs RQ worker or equivalent), frontend. Implement stub `scripts/download_models.py` (downloads BGE-M3 + optional small reranker to MODEL_PATH) and `scripts/init_neo4j.py` (runs Cypher for constraints + vector indexes + fulltext indexes).
+   101→
+   102→**Acceptance criteria:**
+   103→- [ ] `docker compose build --no-cache` succeeds for all services
+   104→- [ ] `docker compose run --rm backend python scripts/download_models.py` downloads BGE-M3 without error and places in /app/models
+   105→- [ ] `docker compose run --rm backend python scripts/init_neo4j.py` creates all constraints and indexes listed in neo4j-schema-v1.1.md (vector 1024-dim cosine on Knowledge & KnowledgeChunk, fulltext on text fields)
+   106→- [ ] GPU visible: `docker compose run --rm backend nvidia-smi` shows the card
+   107→
+   108→**Verification:**
+   109→- [ ] `docker compose ps` shows healthy services after `up -d`
+   110→- [ ] Neo4j Browser or `cypher-shell` confirms indexes exist
+   111→- [ ] No OOM or permission errors on model download
+   112→
+   113→**Dependencies:** None (parallel with 0.1)  
+   114→**Files:** Dockerfile, docker-compose.yml, scripts/*.py, .dockerignore  
+   115→**Estimated scope:** Medium
+   116→
+   117→**Task 0.3: Neo4j client wrapper + vector index helper + basic CRUD for core nodes**
+   118→
+   119→**Description:** Implement thin `db/neo4j_client.py` (driver singleton, context-managed sessions/transactions, retry on transient errors). Implement `db/vector_index.py` helpers. Add methods to create/get :Experiment, :Knowledge, :KnowledgeChunk nodes and relationships per neo4j-schema. Use parameterized Cypher. Add basic timing utils.
+   120→
+   121→**Acceptance criteria:**
+   122→- [ ] `Neo4jClient` can create Experiment node and return its id
+   123→- [ ] Can create Knowledge node with vector property (list[float]) and HAS_CHUNK relationship to a KnowledgeChunk
+   124→- [ ] Vector index creation is idempotent (IF NOT EXISTS)
+   125→- [ ] All writes use transactions; transient Neo4j errors trigger retry (max 2)
+   126→
+   127→**Verification:**
+   128→- [ ] Unit tests in `tests/unit/test_neo4j_client.py` pass (mock driver or integration with test container)
+   129→- [ ] Manual: create experiment → verify in Neo4j Browser
+   130→
+   131→**Dependencies:** Task 0.1, Task 0.2 (running Neo4j)  
+   132→**Files:** app/db/neo4j_client.py, app/db/vector_index.py, app/utils/timing.py, tests/unit/test_neo4j_client.py  
+   133→**Estimated scope:** Small-Medium
+   134→
+   135→**Task 0.4: Frontend Next.js 15 + shadcn/ui + state management scaffolding + navigation**
+   136→
+   137→**Description:** Initialize `frontend/` with Next.js 15 (App Router, TypeScript, Tailwind, ESLint). Install and configure shadcn/ui (neutral theme + teal accent, dark mode). Set up TanStack Query v5 provider, Zustand store skeleton, react-hook-form + zod. Create root layout with sidebar navigation (Dashboard, Ingest, Hybrid Search, Memory Cart, Experiments) matching Frontend_Workflow_Mapping_v1.1.md. Add stub pages for each route. Add OpenAPI client generation or manual TypeScript types matching API_Interface_Design (or use `openapi-typescript` later).
+   138→
+   139→**Acceptance criteria:**
+   140→- [ ] `npm run dev` starts on port 3000; no console errors
+   141→- [ ] Sidebar renders all 5 nav links; clicking navigates (even if page is placeholder)
+   142→- [ ] Dark mode + teal accent visible; responsive on mobile
+   143→- [ ] TanStack Query devtools available in dev mode; basic query example works
+   144→
+   145→**Verification:**
+   146→- [ ] `npm run build` succeeds with no type errors
+   147→- [ ] Lighthouse or manual: core web vitals baseline recorded (for later optimization)
+   148→
+   149→**Dependencies:** None (parallel)  
+   150→**Files:** Many in frontend/ (package.json, next.config.ts, app/layout.tsx, app/globals.css, components/ui/*, app/(pages)/*, lib/api-client.ts or generated)  
+   151→**Estimated scope:** Medium (scaffolding + design system)
+   152→
+   153→### Checkpoint 0: Foundation Ready (After Phase 0)
+   154→
+   155→- [ ] Full stack boots cleanly via `docker compose up -d`
+   156→- [ ] Models present, Neo4j constraints + vector/fulltext indexes created
+   157→- [ ] Backend imports + basic health OK; frontend dev server responsive with navigation
+   158→- [ ] Researcher can run `docker compose run --rm backend python scripts/init_neo4j.py` again safely (idempotent)
+   159→- [ ] Plan reviewed; go/no-go for Phase 1
+   160→
+   161→---
+   162→
+   163→### Phase 1: Slice 1 — Experiment Scaffolding + Long-Text Ingest + Basic Metadata (First Vertical Slice — Researcher Can Already Experiment)
+   164→
+   165→**Task 1.1: Pydantic schemas for Experiment, IngestConfig, Document + Experiment API endpoints (contract-first)**
+   166→
+   167→**Description:** Create `schemas/experiment.py`, `schemas/ingest.py`, `schemas/document.py`, `schemas/common.py` (Pagination, ErrorResponse) exactly matching types and error contract in API_Interface_Design_v1.1.md and Backend_Design_Scope. Implement thin `api/v1/experiments.py` and `api/v1/documents.py` routers (POST/GET/DELETE with pagination). Wire into `api/v1/router.py`. Add dependency for experiment context if needed. Use Pydantic v2 strict mode.
+   168→
+   169→**Acceptance criteria:**
+   170→- [ ] POST /api/v1/experiments accepts valid IngestConfig payload and returns 201 {id, status, created_at, ...}
+   171→- [ ] GET /api/v1/experiments returns paginated list with correct shape
+   172→- [ ] All non-2xx responses use exact `{"error": {"code", "message", "details"}}` shape
+   173→- [ ] OpenAPI schema at /docs reflects the contract (no drift)
+   174→
+   175→**Verification:**
+   176→- [ ] `pytest tests/contract/test_api_contract.py` or similar passes (validate against expected OpenAPI)
+   177→- [ ] Manual curl POST → GET cycle works; Neo4j has :Experiment node
+   178→- [ ] FastAPI validation errors return 422 with proper error code
+   179→
+   180→**Dependencies:** Task 0.1 (core + exceptions)  
+   181→**Files:** app/schemas/*.py (4-5 files), app/api/v1/experiments.py, app/api/v1/documents.py, app/api/v1/router.py, app/main.py (include router)  
+   182→**Estimated scope:** Small-Medium (contract is already defined)
+   183→
+   184→**Task 1.2: EmbeddingModule (standard LongText path) + model loading singleton**
+   185→
+   186→**Description:** Implement `services/embedding.py`: `EmbeddingModule` class with `embed_text(text: str) -> list[float]` using BGE-M3 (via sentence-transformers or transformers + optimum). Handle model loading once (lifespan or module-level with lock). Support batching for future but keep simple for v1. Add timing around embedding call. Integrate with error handling (EmbeddingError on failure, retry via tenacity only on transient).
+   187→
+   188→**Acceptance criteria:**
+   189→- [ ] `embed_text("hello world")` returns 1024-dim vector (BGE-M3)
+   190→- [ ] Model loads into GPU memory on first call; subsequent calls reuse
+   191→- [ ] Embedding time is measured and returned in metadata later
+   192→- [ ] CUDA OOM or load failure raises EmbeddingError (not swallowed)
+   193→
+   194→**Verification:**
+   195→- [ ] Unit test mocks model or uses small test model; real GPU test in integration
+   196→- [ ] VRAM usage after load < ~4-5 GB for BGE-M3 (comfortable headroom)
+   197→
+   198→**Dependencies:** Task 0.2 (models downloaded), Task 0.1 (config)  
+   199→**Files:** app/services/embedding.py, app/core/lifespan.py or main.py (model preload optional), tests/unit/test_embedding.py  
+   200→**Estimated scope:** Small (focused module)
+   201→
+   202→**Task 1.3: ChunkingModule for Long-Text path (direct or simple sliding-window)**
+   203→
+   204→**Description:** Implement `services/chunking.py`: `ChunkingModule` with `determine_boundaries(text, method) -> list[dict]` or direct long-text splitter. For LongText path in v1: either treat whole document as one "chunk" (stored as :Knowledge) or apply simple sliding window (~25-30k tokens, 10% overlap) using tokenizer. Do **not** implement Recursive/Semantic/Structure-Aware yet (those come in Slice 2). Emit basic chunk metadata skeleton.
+   205→
+   206→**Acceptance criteria:**
+   207→- [ ] For a 10k token document, LongText path produces 1 or few parent-level chunks
+   208→- [ ] Token count calculated correctly (use model tokenizer or tiktoken)
+   209→- [ ] Overlap logic works if sliding window chosen; boundaries respect sentence/paragraph where possible
+   210→- [ ] Method="LongText" or equivalent recorded
+   211→
+   212→**Verification:**
+   213→- [ ] Unit tests with sample texts of varying length
+   214→- [ ] Token counts match expected for BGE-M3 tokenizer
+   215→
+   216→**Dependencies:** Task 0.1, Task 1.2 (tokenizer access)  
+   217→**Files:** app/services/chunking.py, app/utils/tokenization.py, tests/unit/test_chunking.py  
+   218→**Estimated scope:** Small
+   219→
+   220→**Task 1.4: MetadataService + basic ExperimentRun / ChunkMetadata emission**
+   221→
+   222→**Description:** Implement `services/metadata.py`: factory functions `create_chunk_metadata(...) -> ChunkMetadata`, `create_experiment_run(...) -> ExperimentRun` (or dicts matching the interfaces in design docs). These are pure and called by orchestrator. Persist as node properties or separate nodes as per neo4j-schema.
+   223→
+   224→**Acceptance criteria:**
+   225→- [ ] Metadata dicts contain all required fields (chunk_id, parent_doc_id, chunk_method, embedding_method, token_count, timings, experiment_id, etc.)
+   226→- [ ] Can be serialized to JSON for API responses without loss
+   227→
+   228→**Verification:**
+   229→- [ ] Unit tests assert presence of all fields and correct types
+   230→- [ ] Sample metadata appears in Neo4j node properties after ingest
+   231→
+   232→**Dependencies:** Task 0.3 (neo4j models)  
+   233→**Files:** app/services/metadata.py, app/models/neo4j_models.py (pydantic or dataclass versions), tests/unit/test_metadata.py  
+   234→**Estimated scope:** Small
+   235→
+   236→**Task 1.5: PipelineOrchestrator for Long-Text Ingest flow + job status tracking**
+   237→
+   238→**Description:** Implement `services/orchestrator.py`: `ingest_long_text(document, config, experiment_id)` that coordinates ChunkingModule → EmbeddingModule → MetadataService → Neo4j persist (Knowledge + optional windows as chunks) → update Experiment status. Make the whole flow idempotent where possible. Integrate with workers (RQ/Celery/FastAPI BackgroundTasks + Redis) so API returns 202 immediately. Implement `get_ingest_status(job_id)` that polls Redis or DB for progress + last error.
+   239→
+   240→**Acceptance criteria:**
+   241→- [ ] POST /ingest (or unified) with LongText config triggers background job; API returns 202 {jobId, experimentId, status}
+   242→- [ ] On success: :Knowledge node + vector exists, Experiment.status = "completed", total_time_ms recorded
+   243→- [ ] On transient embedding failure: tenacity retries (max 3, exp backoff); permanent failure marks status="failed" + error details
+   244→- [ ] GET /ingest/{jobId}/status returns current state (running/completed/failed) + any ChunkMetadata emitted so far
+   245→
+   246→**Verification:**
+   247→- [ ] End-to-end integration test (tests/integration/test_ingest_flow.py): upload small .txt, poll until completed, assert Neo4j state + metadata
+   248→- [ ] Failed job (e.g. bad model path) surfaces error via status endpoint and Experiment node
+   249→
+   250→**Dependencies:** Tasks 1.1–1.4, Task 0.3 (neo4j writes), workers setup  
+   251→**Files:** app/services/orchestrator.py, app/workers/tasks.py, app/workers/progress.py, app/api/v1/ingest.py, app/db/neo4j_client.py (add persist methods)  
+   252→**Estimated scope:** Medium-Large (core orchestration — split further if session >2h)
+   253→
+   254→**Task 1.6: Wire ingest + document upload endpoints + basic error propagation**
+   255→
+   256→**Description:** Complete `api/v1/ingest.py` and `api/v1/documents.py` (multipart upload handling, store file temporarily or stream, trigger orchestrator). Ensure all errors from services bubble up through global exception handler to the standard error shape. Add correlation_id propagation.
+   257→
+   258→**Acceptance criteria:**
+   259→- [ ] Multipart POST /documents or direct to /ingest accepts PDF/TXT/MD and triggers LongText ingest
+   260→- [ ] 4xx/5xx errors always return the contract error JSON (never HTML or stack trace)
+   261→- [ ] experiment_id and job_id flow through logs and responses
+   262→
+   263→**Verification:**
+   264→- [ ] Contract test + manual error injection (bad file, OOM simulation) produces correct codes (VALIDATION_ERROR, INGEST_FAILED, etc.)
+   265→- [ ] Structured logs contain experiment_id on error paths
+   266→
+   267→**Dependencies:** Task 1.5, Task 0.1 (exceptions + logging)  
+   268→**Files:** app/api/v1/ingest.py, app/api/v1/documents.py, app/core/exceptions.py (global handler in main.py), tests/contract/  
+   269→**Estimated scope:** Small
+   270→
+   271→**Task 1.7: Basic unit + integration tests for Slice 1 + observability check**
+   272→
+   273→**Description:** Add tests for chunking, embedding, metadata, orchestrator happy path + error paths. Add one integration test that exercises full Long-Text ingest and verifies Experiment + Knowledge nodes + metadata queryable via future GET /experiments/{id}/chunks.
+   274→
+   275→**Acceptance criteria:**
+   276→- [ ] All new unit tests pass (`pytest tests/unit/ -k "chunking or embedding or metadata or orchestrator"`)
+   277→- [ ] Integration test passes end-to-end on GPU-enabled runner
+   278→- [ ] Researcher can query Neo4j for ChunkMetadata-like properties after a run
+   279→
+   280→**Verification:**
+   281→- [ ] CI-like: `pytest --cov=app/services --cov=app/api` reports >70% on new code (or explicit list of covered paths)
+   282→- [ ] Manual: run ingest via curl or simple frontend stub → see experiment in list
+   283→
+   284→**Dependencies:** All previous in Phase 1  
+   285→**Files:** tests/unit/test_*.py (new), tests/integration/test_ingest_flow.py, pyproject.toml (pytest config)  
+   286→**Estimated scope:** Small-Medium
+   287→
+   288→### Checkpoint 1: Slice 1 Complete — First Working Experiment Loop
+   289→
+   290→- [ ] Researcher can: create experiment → upload document → configure LongText ingest → poll status → view completed experiment with metadata/timings in Neo4j or via API
+   291→- [ ] All tests pass; build clean
+   292→- [ ] Observability data (tokens, embedding time, total_time_ms) visible and correct
+   293→- [ ] Ready for researcher tinkering with LongText path (different docs, monitor VRAM)
+   294→
+   295→**Parallelization note**: While Phase 1 executes, frontend types can be generated from OpenAPI spec (once Task 1.1 done) and basic Ingest page UI can be built in parallel by another agent/session (form for config + file upload + progress polling + results table).
+   296→
+   297→---
+   298→
+   299→### Phase 2: Slice 2 + 3 — Child-Chunk Ingest + Parent-Child Linking + Query Embedding
+   300→
+   301→**Task 2.1: Extend ChunkingModule with Recursive, Semantic, Structure-Aware strategies (standard paths only)**
+   302→
+   303→**Description:** Add implementations inside `ChunkingModule` for the three supported methods (use langchain text_splitters or equivalent simple recursive/semantic logic; Structure-Aware can be markdown/header-aware or basic). Keep logic pure (no embedding). Update determine_boundaries signature to accept config.chunk_method. For Semantic, keep simple (no heavy LLM calls in v1).
+   304→
+   305→**Acceptance criteria:**
+   306→- [ ] Recursive produces overlapping chunks of target size
+   307→- [ ] Semantic produces chunks based on sentence similarity or basic clustering (acceptable simple version)
+   308→- [ ] Structure-Aware respects headings/sections if input is markdown
+   309→- [ ] All methods record chunk_method and chunk_index correctly
+   310→
+   311→**Verification:**
+   312→- [ ] Unit tests with sample markdown/text assert correct number of chunks and boundaries
+   313→- [ ] No embedding calls inside chunking module (pure boundary detection)
+   314→
+   315→**Dependencies:** Task 1.3  
+   316→**Files:** app/services/chunking.py (extend), tests/unit/test_chunking.py (add cases)  
+   317→**Estimated scope:** Medium
+   318→
+   319→**Task 2.2: Extend orchestrator + metadata for ChildChunk path + parent-child persistence**
+   320→
+   321→**Description:** Add `ingest_child_chunk(...)` flow in orchestrator. For each boundary: create chunk_text → embed (via EmbeddingModule) → create ChunkMetadata → persist :KnowledgeChunk + vector + HAS_CHUNK relationship from parent :Knowledge. Support both LongText parent + child chunks in same experiment if configured. Update Experiment.total_chunks, avg_tokens_per_chunk etc.
+   322→
+   323→**Acceptance criteria:**
+   324→- [ ] Ingest with embeddingApproach="ChildChunk" + any chunkMethod produces multiple :KnowledgeChunk nodes linked to one :Knowledge
+   325→- [ ] Parent vector (if LongText also stored) and child vectors coexist correctly
+   326→- [ ] Metadata includes parent_doc_id, chunk_index, token_count, timings per chunk
+   327→
+   328→**Verification:**
+   329→- [ ] Integration test: ChildChunk ingest → query Neo4j for HAS_CHUNK relationships and count
+   330→- [ ] ExperimentRun metadata reflects total_chunks > 1 and correct avg
+   331→
+   332→**Dependencies:** Tasks 1.4, 1.5, 2.1  
+   333→**Files:** app/services/orchestrator.py (new method), app/services/metadata.py (extend), app/db/neo4j_client.py (persist_chunk + link)  
+   334→**Estimated scope:** Medium
+   335→
+   336→**Task 2.3: Query Embedding pipeline (UserQuery + optional UserQueryChunk)**
+   337→
+   338→**Description:** Implement query embedding path (for later search). Create :UserQuery node (long-text vector) and optional :UserQueryChunk if query is long. Reuse EmbeddingModule. Add to orchestrator or new query service.
+   339→
+   340→**Acceptance criteria:**
+   341→- [ ] Embedding a raw query produces :UserQuery node with vector and metadata
+   342→- [ ] Long query can be optionally chunked (reuse chunking logic) → :UserQueryChunk nodes
+   343→
+   344→**Verification:**
+   345→- [ ] Unit/integration test creates UserQuery and retrieves its vector
+   346→
+   347→**Dependencies:** Task 1.2 (embedding), Task 2.1 (chunking reuse)  
+   348→**Files:** app/services/orchestrator.py or new query_embedding.py, app/db/neo4j_client.py (persist_user_query)  
+   349→**Estimated scope:** Small
+   350→
+   351→### Checkpoint 2: ChildChunk + Query Embedding Working
+   352→
+   353→- [ ] Researcher can run ChildChunk experiments (different chunk methods) and see parent-child graph in Neo4j
+   354→- [ ] Query embedding path ready for retrieval slice
+   355→- [ ] All previous Slice 1 functionality still works (regression free)
+   356→
+   357→---
+   358→
+   359→### Phase 3: Slice 4 + 5 — Hybrid Search Baseline + BM25 + Reranker Toggle
+   360→
+   361→**Task 3.1: RetrievalModule — parent-level vector search + child max-pooling + result assembly**
+   362→
+   363→**Description:** Implement `services/retrieval.py`: `hybrid_search(raw_query, config: SearchConfig, experiment_id?)`. Step 1: embed query. Step 2: parent-level vector search on :Knowledge (cosine, topK). Step 3: for each parent fetch top child chunks via max-pooling or score propagation. Step 4: optional RRF fusion if BM25 later. Return scored SearchResult list with full metadata (parent context, chunk text, scores, config used).
+   364→
+   365→**Acceptance criteria:**
+   366→- [ ] Vector-only search returns relevant parents + their child chunks with scores
+   367→- [ ] Child max-pooling logic implemented and documented
+   368→- [ ] SearchResult shape matches API spec; includes experiment_id linkage if provided
+   369→- [ ] All retrieval parameters logged in metadata
+   370→
+   371→**Verification:**
+   372→- [ ] Integration test with known documents: query returns expected chunks with high similarity
+   373→- [ ] Manual: different hybridAlpha values change result ordering as expected
+   374→
+   375→**Dependencies:** Phase 2 (child chunks exist), Task 2.3 (query embed)  
+   376→**Files:** app/services/retrieval.py, app/db/neo4j_client.py (vector_search_parents, get_child_chunks, etc.), tests/unit/test_retrieval.py  
+   377→**Estimated scope:** Medium-Large (core retrieval logic)
+   378→
+   379→**Task 3.2: Add BM25 + RRF + optional reranker toggle (Slice 5)**
+   380→
+   381→**Description:** Extend RetrievalModule. Add fulltext BM25 search on :Knowledge / :KnowledgeChunk (using Neo4j fulltext indexes). Implement RRF (Reciprocal Rank Fusion) to combine vector + BM25 scores when useBm25=true. Add optional small cross-encoder reranker (BGE-reranker or Jina) on top-N results when useReranker=true. All toggles explicit in SearchConfig and logged.
+   382→
+   383→**Acceptance criteria:**
+   384→- [ ] useBm25=true changes results vs pure vector (measurable difference)
+   385→- [ ] RRF fusion implemented correctly (higher combined score for docs good in both)
+   386→- [ ] useReranker=true re-scores top results and improves precision on test set (qualitative OK for v1)
+   387→- [ ] Search still fast on target hardware
+   388→
+   389→**Verification:**
+   390→- [ ] Side-by-side comparison test (same query, different config flags) shows expected behavior
+   391→- [ ] Performance: p95 search < few seconds even with reranker on modest corpus
+   392→
+   393→**Dependencies:** Task 3.1, Neo4j fulltext indexes (already in Phase 0)  
+   394→**Files:** app/services/retrieval.py (extend), app/db/neo4j_client.py (fulltext search methods)  
+   395→**Estimated scope:** Medium
+   396→
+   397→**Task 3.3: Search API endpoints + history + metadata exposure**
+   398→
+   399→**Description:** Implement `api/v1/search.py`: POST /search (rawQuery + config + optional experimentId) → returns {searchId, results, metadata}. GET /searches/history (paginated). Ensure SearchConfig validation and full logging of parameters used.
+   400→
+   401→**Acceptance criteria:**
+   402→- [ ] POST /search returns results with parent context, scores, chunk metadata
+   403→- [ ] History endpoint lists past searches with config snapshot
+   404→- [ ] experimentId filter works (only search within that experiment's data)
+   405→
+   406→**Verification:**
+   407→- [ ] Contract test + manual search returns expected shape
+   408→- [ ] Changing hybridAlpha / useReranker visibly affects results and is recorded
+   409→
+   410→**Dependencies:** Task 3.1/3.2, Task 1.1 (schemas)  
+   411→**Files:** app/api/v1/search.py, app/schemas/search.py, app/services/orchestrator.py (search orchestration)  
+   412→**Estimated scope:** Small-Medium
+   413→
+   414→### Checkpoint 3: Tunable Hybrid Search Working End-to-End
+   415→
+   416→- [ ] Researcher can run searches with different configs (alpha, BM25 on/off, reranker on/off) and see impact immediately
+   417→- [ ] Results include rich metadata for analysis
+   418→- [ ] Search history persisted and re-runnable
+   419→
+   420→---
+   421→
+   422→### Phase 4: Slice 6 — Memory Store + Memory Cart + Full Frontend Workflows
+   423→
+   424→**Task 4.1: Memory + MemoryCart domain + API (create, list, patch selection)**
+   425→
+   426→**Description:** Implement Memory and MemoryCart schemas, services, and api/v1/memory.py endpoints (POST /memories, POST /memory-carts, GET /memory-carts, PATCH /memory-carts/{id} for selection updates). Persist :Memory nodes linked from UserQuery → RETRIEVED → KnowledgeChunk. :MemoryCart CONTAINS Memories. Add basic curation logic.
+   427→
+   428→**Acceptance criteria:**
+   429→- [ ] From search results, user can "add to memory cart" → creates Memory + links
+   430→- [ ] MemoryCart can be created, listed, and updated with selected memories
+   431→- [ ] Relationships correct in Neo4j
+   432→
+   433→**Verification:**
+   434→- [ ] Full flow: search → add to cart → view cart shows selected chunks with context
+   435→
+   436→**Dependencies:** Phase 3 (search results exist)  
+   437→**Files:** app/schemas/memory.py, app/api/v1/memory.py, app/services/memory.py or orchestrator extension, app/db/neo4j_client.py  
+   438→**Estimated scope:** Medium
+   439→
+   440→**Task 4.2: Complete frontend pages for all 4 workflows + Experiments observability (Ingest, Hybrid Search, Memory Cart, Experiments)**
+   441→
+   442→**Description:** Build production-quality pages per Frontend_Workflow_Mapping_v1.1.md using shadcn components:
+   443→- Ingest: config form (embeddingApproach, chunkMethod), file upload, live progress (polling or SSE), per-chunk metadata table, chunk inspector drawer, link to experiment on done.
+   444→- Hybrid Search: query input + SearchConfig controls (sliders, toggles for BM25/reranker, topK), results list with scores/badges/parent context, multi-select + "Add to Memory Cart", past searches history.
+   445→- Memory Cart: list of carts, detail with checkbox selection table, save/edit.
+   446→- Experiments: table (id, date, description, embedding_approach, chunk_method, #chunks, total_time), click → detail with full stats + chunk browser + observability panel, basic side-by-side comparison of two experiments.
+   447→Use TanStack Query for all data fetching, optimistic updates where helpful, Zod validation on forms.
+   448→
+   449→**Acceptance criteria:**
+   450→- [ ] All pages load without errors; dark mode + teal theme consistent
+   451→- [ ] Ingest flow works end-to-end (upload → progress updates → experiment created with metadata visible)
+   452→- [ ] Search config changes affect results; "Add to Memory Cart" persists
+   453→- [ ] Experiments table sortable/filterable; detail shows ChunkMetadata table + timings; comparison mode works for 2 experiments
+   454→- [ ] Accessible (basic a11y: labels, keyboard nav, contrast)
+   455→
+   456→**Verification:**
+   457→- [ ] Manual user journey test for each workflow
+   458→- [ ] `npm run build` clean; no TypeScript errors
+   459→- [ ] TanStack Query cache invalidation works after mutations (new experiment appears in list)
+   460→
+   461→**Dependencies:** Phase 0.4 (scaffolding), Phase 1-3 (working APIs), Task 4.1  
+   462→**Files:** frontend/app/(ingest|search|memory|experiments)/page.tsx + components/* (many, but each page/component task can be split if needed)  
+   463→**Estimated scope:** Large — recommend splitting into 4 sub-tasks (one per page) if one agent
+   464→
+   465→**Task 4.3: Progress / SSE or polling integration + global error handling in frontend**
+   466→
+   467→**Description:** Add progress tracking component (progress bar + per-chunk table that updates live). Implement consistent error toast/banner using the API error shape. Add loading skeletons.
+   468→
+   469→**Acceptance criteria:**
+   470→- [ ] Long-running ingest/search shows live progress without full page reload
+   471→- [ ] Any API error surfaces user-friendly message (code + message) + "Retry" where appropriate
+   472→- [ ] No unhandled promise rejections in console during normal flows
+   473→
+   474→**Verification:**
+   475→- [ ] Simulate slow ingest → progress UI updates correctly
+   476→- [ ] Trigger validation error → toast shows exact message from backend
+   477→
+   478→**Dependencies:** Task 4.2  
+   479→**Files:** frontend/components/ingest-progress.tsx, frontend/lib/api-client.ts (error interceptor), frontend/components/error-boundary.tsx or toast system  
+   480→**Estimated scope:** Small-Medium
+   481→
+   482→### Checkpoint 4: Full v1 Platform Usable by Researcher
+   483→
+   484→- [ ] All 4 workflows functional with rich observability
+   485→- [ ] Memory curation works
+   486→- [ ] Experiments page enables systematic comparison and learning
+   487→- [ ] Researcher can tinker with every parameter and immediately see metadata impact
+   488→
+   489→---
+   490→
+   491→### Phase 5: Polish, Testing, Documentation & Hardening
+   492→
+   493→**Task 5.1: Comprehensive test suite (unit + integration + contract) + CI skeleton**
+   494→
+   495→**Description:** Expand tests to cover all modules, happy + error paths, Neo4j interactions (testcontainers or dedicated test DB), frontend component tests (Vitest + Testing Library or Playwright e2e). Add contract tests that assert API matches OpenAPI spec. Add basic GitHub Actions or equivalent CI (lint, test, build, docker build).
+   496→
+   497→**Acceptance criteria:**
+   498→- [ ] `pytest` full suite passes with good coverage on services/api
+   499→- [ ] Frontend tests pass
+   500→- [ ] Contract tests catch any drift between code and API_Interface_Design
+   501→- [ ] CI pipeline runs on push (or documented how to run locally)
+   502→
+   503→**Verification:**
+   504→- [ ] Coverage report generated
+   505→- [ ] Fresh clone + `make test` or `docker compose run backend pytest` succeeds
+   506→
+   507→**Dependencies:** All previous tasks  
+   508→**Files:** tests/**/*, frontend/__tests__ or e2e/, .github/workflows/ci.yml or equivalent, pyproject.toml (coverage config)  
+   509→**Estimated scope:** Medium
+   510→
+   511→**Task 5.2: Documentation, README, researcher quickstart, troubleshooting**
+   512→
+   513→**Description:** Write comprehensive README.md (setup, one-time commands, how to run experiments, how to interpret metadata, troubleshooting common issues like VRAM, model download). Add example experiment configs. Document known limitations (v1 standard paths only). Add ADR or decision log if needed.
+   514→
+   515→**Acceptance criteria:**
+   516→- [ ] New researcher can follow README and have first experiment running in <30 min
+   517→- [ ] Common errors (CUDA OOM, model not found, Neo4j connection) have clear fixes documented
+   518→- [ ] Tinkering guide: "how to compare Recursive vs Semantic on same corpus" with screenshots or steps
+   519→
+   520→**Verification:**
+   521→- [ ] Dry-run by someone unfamiliar with the codebase succeeds
+   522→- [ ] Docs link back to the design MD files for deeper reading
+   523→
+   524→**Dependencies:** All implementation done  
+   525→**Files:** backend/README.md, frontend/README.md, docs/ or root docs folder, perhaps a /experiments/examples/ folder  
+   526→**Estimated scope:** Small-Medium
+   527→
+   528→**Task 5.3: Performance baseline + simple hardening (rate limiting? basic input validation already done, logging levels, resource limits)**
+   529→
+   530→**Description:** Record baseline timings for ingest/search on sample corpus. Add basic resource guards (max upload size, timeout on embedding). Ensure retry policies only on transient errors. Final security sweep per security-and-hardening principles (least privilege in Docker, no secrets in images, input validation at boundaries).
+   531→
+   532→**Acceptance criteria:**
+   533→- [ ] Baseline numbers documented (e.g. "10k token doc LongText ingest: X ms on 3070 Ti")
+   534→- [ ] No obvious resource exhaustion paths left open
+   535→- [ ] Docker runs with reasonable memory/CPU limits
+   536→
+   537→**Verification:**
+   538→- [ ] Run sample workload and record metrics
+   539→- [ ] Security lint (bandit or equivalent) clean or documented exceptions
+   540→
+   541→**Dependencies:** Phase 4 complete  
+   542→**Files:** scripts/baseline.py or docs/performance.md, docker-compose overrides, core/config validation extensions  
+   543→**Estimated scope:** Small
+   544→
+   545→### Final Checkpoint: v1.1 Ready for Researcher Use
+   546→
+   547→- [ ] All acceptance criteria from design docs met
+   548→- [ ] Researcher can perform systematic RAG experimentation with full observability and comparison
+   549→- [ ] System is stable, documented, and ready for tinkering / extension (Late paths behind flags)
+   550→- [ ] Code review + manual end-to-end journey passes
+   551→- [ ] Ready to tag v1.1 and begin post-v1 planning
+   552→
+   553→---
+   554→
+   555→## Risks and Mitigations
+   556→
+   557→| Risk | Impact | Likelihood | Mitigation |
+   558→|------|--------|------------|------------|
+   559→| CUDA OOM on large documents or high batch | High (crashes ingest) | Medium | Enforce conservative chunk sizes in LongText path; batch size=1 for embedding; expose chunk size/overlap as config; monitor with nvidia-smi in docs |
+   560→| Embedding model load time or VRAM spikes | Medium (slow startup, instability) | Low | Preload in lifespan or worker; document exact VRAM usage of BGE-M3; offer smaller fallback model in config |
+   561→| Neo4j vector search perf degrades with many chunks | Medium (slow search) | Medium | Parent-level retrieval first (fewer vectors); HNSW params tuned in init script; index only on experiment subsets if needed; document corpus size limits for v1 |
+   562→| Inconsistent chunk counts / tokenization between methods | Low (confuses comparison) | Medium | Use same tokenizer everywhere; log exact token_count per chunk; add "tokenizer" field to metadata |
+   563→| Frontend state drift or TanStack Query cache issues after mutations | Medium (stale UI) | Low | Strict invalidation keys; optimistic updates only where safe; comprehensive e2e tests for workflows |
+   564→| Researcher misinterprets metadata (over-trusts numbers) | Low (bad science) | Medium | Clear labels + tooltips in UI; "what this number means" docs; emphasize that observability enables learning, not absolute truth |
+   565→| Scope creep into Late/Agentic features | High (delays v1, violates guardrail) | Medium | Strict adherence to "standard paths only"; any new branching behind feature flag + explicit ADR; plan review checkpoints |
+   566→
+   567→---
+   568→
+   569→## Open Questions (for human / researcher input before or during execution)
+   570→
+   571→- What is the exact target chunk size + overlap % for the LongText sliding-window path in Slice 1? (Current design says ~30k tokens / 10% — confirm or adjust for BGE-M3 context window comfort.)
+   572→- Default chunkMethod and embeddingApproach for new experiments? (Recommend "Recursive" + "ChildChunk" as sensible starting point, but expose prominently.)
+   573→- Preferred progress mechanism for long jobs: SSE (real-time, more complex) or simple polling every 2-3s? (Frontend mapping assumes either; SSE preferred for better UX if worker supports.)
+   574→- Max document size / token limit for v1 ingest? (Protect against OOM and runaway jobs.)
+   575→- Any specific sample documents or benchmark queries the researcher wants pre-loaded for initial testing/comparison?
+   576→- Should side-by-side experiment comparison on Experiments page be simple (two columns) or more advanced (diff view of parameters + metrics)?
+   577→
+   578→---
+   579→
+   580→## Parallelization Opportunities
+   581→
+   582→**Safe to parallelize (independent or after contract stable):**
+   583→- Frontend page implementation (Ingest page can start after Task 1.1 schemas + basic ingest API; other pages after their backend slices)
+   584→- Unit tests for already-implemented modules
+   585→- Documentation writing
+   586→- Performance baseline scripts
+   587→- Additional chunking strategy tests (once ChunkingModule interface stable)
+   588→
+   589→**Must be sequential:**
+   590→- Neo4j schema/index creation (before any persistence)
+   591→- Core orchestrator + metadata (foundation for all slices)
+   592→- Database writes that change shared state
+   593→
+   594→**Needs coordination:**
+   595→- API contract changes (define in schemas first, then both backend and frontend can implement)
+   596→- Model loading / GPU resource (coordinate backend + worker)
+   597→
+   598→---
+   599→
+   600→## Plan Verification (Before Starting Implementation)
+   601→
+   602→- [x] Every task has clear, testable acceptance criteria (3+ bullets where possible)
+   603→- [x] Every task has explicit verification steps (tests, manual checks, commands)
+   604→- [x] Dependencies are identified and ordered correctly (foundation → vertical slices → polish)
+   605→- [x] No task is XL-sized without further breakdown (most are S/M; large ones noted to split)
+   606→- [x] Checkpoints exist after every phase so researcher can validate and decide to continue
+   607→- [x] Risks and open questions surfaced for discussion
+   608→- [x] Tinkering / Antifragility principles embedded (parameters exposed, metadata rich, researcher learns by doing)
+   609→- [x] Via Negativa respected (no v2 features in v1 tasks, no over-abstraction)
+   610→
+   611→**Next step recommendation**: Review this plan with the researcher (or self-review), confirm Open Questions, then begin with Phase 0 (infrastructure is low-risk and unblocks everything). Execute one checkpoint at a time.
+   612→
+   613→---
+   614→
+   615→**End of Implementation Plan v1.1**
+   616→
