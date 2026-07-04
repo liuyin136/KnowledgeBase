@@ -24,9 +24,7 @@ FROM node:22-alpine AS builder
 
 # Bun is used purely for fast dependency install on the host. We install it
 # inside the builder stage only (the runner stage stays Node-only).
-RUN apk add --no-cache libc6-compat \
- && npm install -g bun@1.1.42
-
+RUN apk add --no-cache libc6-compat 
 WORKDIR /app
 
 # Next.js telemetry off — keeps build logs clean.
@@ -36,22 +34,19 @@ ENV NEXT_TELEMETRY_DISABLED=1 \
 # Copy lockfile + manifests first for layer caching. The project uses bun.lock
 # (verified at repo root); fall back to package-lock.json if a future migration
 # swaps it. Both are present-tolerant via wildcards.
-COPY package.json ./
-COPY bun.lock* package-lock.json* yarn.lock* pnpm-lock.yaml* ./
+COPY package.json package-lock.json* ./
 
 # Install deps. Prefer bun; fall back to npm ci if no bun.lock.
-RUN if [ -f bun.lock ]; then \
-        bun install --frozen-lockfile; \
-    elif [ -f package-lock.json ]; then \
-        npm ci; \
-    else \
-        echo "No lockfile found — running bun install without --frozen-lockfile"; \
-        bun install; \
-    fi
-
+RUN npm ci
+COPY . .
+# ===================== DEBUG =====================
+RUN echo "=== Checking if src exists ===" && ls -la /app/src || echo "src NOT FOUND"
+RUN echo "=== Checking rag folder ===" && ls -la /app/src/components/rag || echo "rag folder NOT FOUND"
+RUN echo "=== Checking providers.tsx ===" && ls -la /app/src/components/rag/providers.tsx || echo "providers.tsx NOT FOUND"
+# ================================================
 # Copy the rest of the source. The root .dockerignore excludes node_modules,
 # .next, .git, etc., so this is clean.
-COPY . .
+
 
 # Sanity-check that standalone output is enabled before building. If a future
 # edit removes it, fail the build loudly instead of producing a broken image.
@@ -59,7 +54,7 @@ RUN grep -q 'output.*standalone' next.config.ts next.config.js next.config.mjs 2
     || { echo "FATAL: next.config.* must set output: 'standalone'"; exit 1; }
 
 # Build. Standalone output lands in .next/standalone (server.js + minimal deps).
-RUN bun run build || npx next build
+RUN npm run build
 
 # -----------------------------------------------------------------------------
 # Stage 2 — runner
