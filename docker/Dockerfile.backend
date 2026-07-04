@@ -31,6 +31,7 @@ FROM python:3.12-slim AS model-downloader
 
 # Build-time args — allow opting into the reranker without rewriting the file.
 ARG DOWNLOAD_RERANKER=1
+ARG DOWNLOAD_JINA_V5=0
 ARG HF_HUB_DOWNLOAD_TIMEOUT=60
 ENV HF_HOME=/root/.cache/huggingface \
     HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT} \
@@ -64,9 +65,11 @@ cat > /app/download_models.py <<'PY'
 import os
 from huggingface_hub import snapshot_download
 
-MODELS = ["BAAI/bge-m3"]
+MODELS = ["jinaai/jina-embeddings-v5-text-small"]
 if os.environ.get("DOWNLOAD_RERANKER", "1") == "1":
     MODELS.append("BAAI/bge-reranker-base")
+if os.environ.get("DOWNLOAD_BGE", "0") == "1":
+    MODELS = ["BAAI/bge-m3"]
 
 target_root = "/app/models"
 os.makedirs(target_root, exist_ok=True)
@@ -94,7 +97,7 @@ EOF
 # -----------------------------------------------------------------------------
 # Stage 2 — runtime
 # -----------------------------------------------------------------------------
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+FROM nvidia/cuda:13.3.0-devel-ubuntu26.04 AS runtime
 
 # Python 3.12 from deadsnakes (Ubuntu 22.04 ships 3.10 by default).
 # Minimal system deps:

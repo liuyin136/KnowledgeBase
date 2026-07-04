@@ -47,22 +47,12 @@ class Settings(BaseSettings):
         description="Root directory containing BGE-M3 (and optional reranker) snapshots",
     )
     bge_m3_repo: str = Field(default="BAAI/bge-m3", description="HuggingFace repo id for the embedding model")
-    # 在 embedding model 區塊後面新增
-    embedding_repo: str = Field(
-        default="jinaai/jina-embeddings-v5-text-small",
-        description="HuggingFace repo id（可改成 jinaai/jina-embeddings-v5-text-small）"
+    bge_reranker_repo: str = Field(
+        default="BAAI/bge-reranker-base",
+        description="HuggingFace repo id for the optional cross-encoder reranker",
     )
-    embedding_trust_remote_code: bool = Field(
-        default=True,
-        description="使用 Jina v5 等需要自訂程式碼的模型時設為 True"
-    )
-    embedding_encode_task: str | None = Field(
-        default="retrieval",
-        description="傳給 model.encode() 的 task 參數（Jina v5 建議設 'retrieval'）"
-    )
-    reranker_model_repo: str = Field(default="jinaai/jina-reranker-v3")
-    embedding_model_name: str = Field(default="jina-embeddings-v5-text-small", description="Local subdir name under MODEL_PATH")
-    reranker_model_name: str = Field(default="jina-reranker-v3", description="Local subdir name under MODEL_PATH")
+    embedding_model_name: str = Field(default="bge-m3", description="Local subdir name under MODEL_PATH")
+    reranker_model_name: str = Field(default="bge-reranker-base", description="Local subdir name under MODEL_PATH")
     cuda_visible_devices: str = Field(default="0", description="Comma-separated GPU ids or -1 for CPU-only")
     embedding_dim: int = Field(default=1024, description="BGE-M3 output dimension (matches neo4j-schema §3)")
     embedding_max_retries: int = Field(default=3, description="Per error-handling spec §3")

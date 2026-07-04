@@ -84,7 +84,7 @@ class IngestStage(str, Enum):
 
 # ─── Embedding / models ───────────────────────────────────────────────────────
 
-EMBEDDING_MODEL = "jina-embeddings-v5-text-small"  # logical model name for observability
+EMBEDDING_MODEL = "BAAI/bge-m3"  # logical model name for observability
 EMBEDDING_DIM = 1024  # BGE-M3 output dim (matches neo4j-schema-v1.1.md §3)
 RERANKER_MODEL = "BAAI/bge-reranker-base"
 

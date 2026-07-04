@@ -83,8 +83,7 @@ class EmbeddingModule:
                 self._model = SentenceTransformer(
                     model_src,
                     device=device,
-                    # BGE-M3 is a transformer — let sentence-transformers pick its default
-                    # backend (PyTorch). Prompts aren't used in v1.
+                    trust_remote_code=settings.embedding_trust_remote_code,   # ← 新增這行
                 )
                 # Best-effort: also expose the underlying tokenizer for exact token counts.
                 try:
@@ -154,14 +153,17 @@ class EmbeddingModule:
                 # `convert_to_numpy=False` → we get a torch.Tensor back.
                 # `normalize_embeddings=True` so cosine similarity is a simple dot product
                 # (the HNSW cosine index expects normalized vectors for stable scores).
-                emb = self._model.encode(
-                    batch,
-                    batch_size=len(batch),
-                    convert_to_numpy=False,
-                    convert_to_tensor=True,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                )
+                encode_kwargs = {
+                    "batch_size": len(batch),
+                    "convert_to_numpy": False,
+                    "convert_to_tensor": True,
+                    "normalize_embeddings": True,
+                    "show_progress_bar": False,
+                }
+                if settings.embedding_encode_task:
+                    encode_kwargs["task"] = settings.embedding_encode_task   # ← Jina v5 推薦傳 "retrieval"
+
+                emb = self._model.encode(batch, **encode_kwargs)
                 # ─── Construction note #1 (MANDATORY) ──────────────────────────
                 # NumPy cannot handle bfloat16. Force the tensor to CPU + float32
                 # before converting to a Python list. This is the explicit user
