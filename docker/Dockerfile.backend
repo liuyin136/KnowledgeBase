@@ -1,27 +1,58 @@
 # syntax=docker/dockerfile:1.7
 # =============================================================================
-# Dockerfile.backend — Local-First RAG Experimentation Platform v1.2
-# Multi-stage build per infrastructure-environment-spec_v1.1.md §2
+# Dockerfile.backend — Local-First RAG Experimentation Platform v1.3
 #
-# Build context: ../backend   (set in docker/docker-compose.yml)
-#   → COPY paths inside this Dockerfile are relative to backend/ root.
+# ARCHITECTURAL DESIGN & TRADE-OFFS
+# =================================
 #
-#   Stage 1 (model-downloader)  : python:3.12-slim + huggingface_hub + git-lfs
-#                                 Downloads BAAI/bge-m3 (+ optional reranker)
-#                                 into /app/models. Uses BuildKit cache mount
-#                                 for HF cache to speed up rebuilds.
-#   Stage 2 (runtime)           : nvidia/cuda:12.4.1-runtime-ubuntu22.04 + Python 3.12
-#                                 Minimal inference image; copies models + backend code.
+# Goal
+#   Produce a single GPU-capable image that runs the FastAPI backend (uvicorn)
+#   AND the RQ api-worker (same image, different CMD). Target: Windows Docker
+#   Desktop + WSL2 + NVIDIA GPU passthrough (GTX 3070 Ti / 8 GB VRAM), also
+#   deployable on Linux with the NVIDIA Container Toolkit.
 #
-# Base-image choice note (deviation from spec wording, documented):
-#   The infra spec §1 mentions `nvidia/cuda:12.4.1-devel-ubuntu22.04`. We use
-#   the `-runtime-` flavor instead because:
-#     • The backend runs inference only (sentence-transformers + transformers).
-#     • PyTorch ships pre-built CUDA wheels (cu121) — no nvcc needed at runtime.
-#     • The `-devel-` image is ~6 GB larger and only required when compiling
-#       CUDA kernels from source, which v1 does not do.
-#   This keeps the runtime image small while still exposing `nvidia-smi` and
-#   the CUDA driver libs from the host via the NVIDIA Container Toolkit.
+# Why multi-stage (2 stages)?
+#   Stage 1 (model-downloader) — python:3.12-slim, installs huggingface_hub +
+#     git-lfs, downloads the embedding + reranker model weights into /app/models.
+#     Kept separate so weight-download (slow, ~2-5 GB, network-bound) is a
+#     distinct cached layer independent of backend code changes.
+#   Stage 2 (runtime) — nvidia/cuda:13.3.0-devel-ubuntu26.04 + Python 3.12,
+#     installs pip deps, copies models from stage 1 + backend code. The devel
+#     flavor is used (per v1.3 directive) so that any future source-built CUDA
+#     extension (flash-attention, custom kernels) compiles without a base-image
+#     swap. Trade-off: the image is ~2 GB larger than the -runtime- flavor; we
+#     accept this for forward compatibility and because Jina v5 / BGE-M3 may
+#     pull in wheels that expect a full CUDA toolchain at install time.
+#
+# Why BuildKit cache mounts?
+#   • `--mount=type=cache,target=/root/.cache/huggingface` — the HF hub cache is
+#     reused across builds so re-building the image after a code change does NOT
+#     re-download multi-GB model weights.
+#   • `--mount=type=cache,target=/root/.cache/pip` — pip wheel cache is reused
+#     across builds, speeding up the `pip install -r requirements.txt` layer.
+#   Both require BuildKit: `DOCKER_BUILDKIT=1 docker compose build` (enabled by
+#   default in Docker Desktop ≥ 4.34 and Docker Engine ≥ 23.0).
+#
+# Base image choice: nvidia/cuda:13.3.0-devel-ubuntu26.04 (v1.3 directive)
+#   • CUDA 13.3 is the latest stable as of the v1.3 spec. It is ABI-compatible
+#     with the PyTorch cu121/cu124 wheels via the driver-forward-compat model:
+#     the host NVIDIA driver must be ≥ the CUDA version the toolkit was built
+#     against. On Windows Docker Desktop + WSL2, the driver is shared between
+#     Windows and WSL2 — install the latest NVIDIA Windows driver.
+#   • Ubuntu 26.04 base ships Python 3.12 in apt (no deadsnakes PPA needed),
+#     which simplifies the runtime stage vs the v1.2 Ubuntu 22.04 path.
+#
+# Build context: ../backend  (set in docker/docker-compose.yml)
+#   → all COPY paths in this Dockerfile are relative to the backend/ root.
+#
+# PYTHONPATH=/app is set so developers can `docker compose exec backend python
+# scripts/init_neo4j.py` (or any .py under scripts/ or app/) without extra env.
+#
+# Model selection (v1.3): Jina v5 default + BGE-M3 optional.
+#   • Stage 1 downloads jinaai/jina-embeddings-v5-text-small + jinaai/jina-reranker-v3
+#     by default (DOWNLOAD_BGE=0).
+#   • Set build arg DOWNLOAD_BGE=1 to ALSO fetch BAAI/bge-m3 + BAAI/bge-reranker-base
+#     (enables the frontend Settings toggle to switch without re-pulling).
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -29,9 +60,9 @@
 # -----------------------------------------------------------------------------
 FROM python:3.12-slim AS model-downloader
 
-# Build-time args — allow opting into the reranker without rewriting the file.
-ARG DOWNLOAD_RERANKER=1
-ARG HF_HUB_DOWNLOAD_TIMEOUT=60
+# Build-time args.
+ARG DOWNLOAD_BGE=0
+ARG HF_HUB_DOWNLOAD_TIMEOUT=120
 ENV HF_HOME=/root/.cache/huggingface \
     HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT} \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -52,57 +83,53 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 WORKDIR /app
 
-# Inline download script — does NOT depend on backend/scripts existing yet.
-# Downloads BAAI/bge-m3 (primary embedding, 1024-dim) and, when
-# DOWNLOAD_RERANKER=1, BAAI/bge-reranker-base (cross-encoder for Slice 5).
-# To leverage BuildKit cache mounts, build with:
-#   DOCKER_BUILDKIT=1 docker compose build backend
+# Clean, single download script (v1.3 — Jina default + optional BGE).
+# Uses BuildKit cache mount on the HF cache dir so rebuilds skip re-downloading.
 RUN --mount=type=cache,target=/root/.cache/huggingface,sharing=locked \
-    <<'EOF'
-set -euo pipefail
-cat > /app/download_models.py <<'PY'
+    set -euo pipefail; \
+    cat > /app/download_models.py <<'PY'
 import os
 from huggingface_hub import snapshot_download
 
-MODELS = ["BAAI/bge-m3"]
-if os.environ.get("DOWNLOAD_RERANKER", "1") == "1":
-    MODELS.append("BAAI/bge-reranker-base")
+# v1.3 defaults: Jina v5 small (embedding) + Jina reranker v3.
+MODELS = [
+    "jinaai/jina-embeddings-v5-text-small",
+    "jinaai/jina-reranker-v3",
+]
+# Optional: also fetch BGE family so the Settings toggle can switch at runtime.
+if os.environ.get("DOWNLOAD_BGE", "0") == "1":
+    MODELS.extend(["BAAI/bge-m3", "BAAI/bge-reranker-base"])
 
 target_root = "/app/models"
 os.makedirs(target_root, exist_ok=True)
 
 for repo_id in MODELS:
-    # Use a per-repo subdir so MODEL_PATH can be a parent dir and code can
-    # resolve individual models by name (e.g. /app/models/bge-m3).
     local_name = repo_id.split("/")[-1]
     dest = os.path.join(target_root, local_name)
     print(f"[download] {repo_id} -> {dest}", flush=True)
     snapshot_download(
         repo_id=repo_id,
         local_dir=dest,
-        local_dir_use_symlinks=False,
-        # Skip *.msgpack / *.h5 optimizer states + ONNX variants to shave
-        # ~1.5 GB off bge-m3 (we only need the safetensors + tokenizer).
+        # Skip optimizer states + ONNX variants to shave ~1.5 GB per model.
         ignore_patterns=["*.msgpack", "*.h5", "rust_model.onnx", "onnx/*"],
         resume_download=True,
     )
 print("[download] done", flush=True)
 PY
-DOWNLOAD_RERANKER=${DOWNLOAD_RERANKER} python /app/download_models.py
-EOF
+    DOWNLOAD_BGE=${DOWNLOAD_BGE} python /app/download_models.py
 
 # -----------------------------------------------------------------------------
 # Stage 2 — runtime
 # -----------------------------------------------------------------------------
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+FROM nvidia/cuda:13.3.0-devel-ubuntu26.04 AS runtime
 
-# Python 3.12 from deadsnakes (Ubuntu 22.04 ships 3.10 by default).
+# Ubuntu 26.04 ships Python 3.12 in apt — no deadsnakes PPA needed.
 # Minimal system deps:
 #   • build-essential — any wheel compilation (rare; most wheels are prebuilt)
-#   • libgomp1       — OpenMP for onnxruntime / scikit-learn / torch CPU ops
+#   • libgomp1       — OpenMP for torch CPU ops
 #   • libgl1, libglib2.0-0 — runtime libs some tokenizers/image deps pull in
 #   • ca-certificates, curl — healthcheck + outbound HTTPS to HuggingFace
-#   • git            — pip -e git+... fallbacks if needed
+#   • git            — pip -e git+... fallbacks + HF hub clone fallbacks
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -110,12 +137,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     CUDA_VISIBLE_DEVICES=0 \
     MODEL_PATH=/app/models \
+    PYTHONPATH=/app \
     HF_HOME=/root/.cache/huggingface \
     TRANSFORMERS_CACHE=/root/.cache/huggingface/hub
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        software-properties-common \
         ca-certificates \
         curl \
         git \
@@ -123,9 +150,6 @@ RUN apt-get update \
         libgomp1 \
         libgl1 \
         libglib2.0-0 \
-    && add-apt-repository -y ppa:deadsnakes/ppa \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
         python3.12 \
         python3.12-venv \
         python3.12-dev \
@@ -140,46 +164,23 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# ---- Install Python deps ------------------------------------------------------
-# Copy requirements first for layer caching. Wildcard pattern tolerates the
-# case where the backend agent has not committed requirements.txt yet
-# (BuildKit treats a zero-match glob as a no-op). The RUN below writes a
-# minimal pin if the file is missing so the image still builds.
-COPY requirements.txt* ./
+# ---- Install Python deps (BuildKit pip cache mount) --------------------------
+COPY requirements.txt ./
 
-RUN if [ ! -s requirements.txt ]; then \
-        echo "WARN: backend/requirements.txt missing — using minimal pin"; \
-        printf '%s\n' \
-            'fastapi==0.115.5' \
-            'uvicorn[standard]==0.32.1' \
-            'pydantic==2.10.3' \
-            'pydantic-settings==2.6.1' \
-            'neo4j==5.26.0' \
-            'redis==5.2.0' \
-            'rq==1.16.2' \
-            'sentence-transformers==3.3.1' \
-            'transformers==4.46.3' \
-            'torch==2.5.1' \
-            'numpy==1.26.4' \
-            'python-multipart==0.0.17' \
-            'httpx==0.28.1' \
-            'tenacity==9.0.0' \
-            'structlog==24.4.0' \
-            > requirements.txt; \
-    fi \
- && pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install -r requirements.txt
 
-# ---- Copy models from stage 1 -------------------------------------------------
+# ---- Copy models from stage 1 ------------------------------------------------
 COPY --from=model-downloader /app/models /app/models
 
-# ---- Copy backend application code --------------------------------------------
+# ---- Copy backend application code -------------------------------------------
 # Build context is ../backend, so `COPY . ./` pulls in app/, scripts/,
 # pyproject.toml, etc. The backend/.dockerignore excludes __pycache__, .venv,
 # models/ (host-side dev downloads), tests, etc.
 COPY . ./
 
 # Ensure scripts are executable (download_models.py / init_neo4j.py are
-# invoked via `docker compose run --rm backend python scripts/...`).
+# invoked via `docker compose exec backend python scripts/...`).
 RUN if [ -d scripts ]; then chmod -R +x scripts || true; fi
 
 EXPOSE 8000
@@ -189,5 +190,5 @@ EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 # Healthcheck: FastAPI exposes GET /health (per Backend Design Scope v1.1).
-HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
+HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=5 \
     CMD curl -fsS http://localhost:8000/health || exit 1

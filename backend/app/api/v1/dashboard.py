@@ -6,6 +6,10 @@ api/v1/dashboard.py — Dashboard endpoint.
 The Next.js proxy at /api/v1/dashboard calls this AND adds Neo4j + backend
 health checks (so the Dashboard shows connection status). Here we return
 stats + recent lists + a `system` info card; the proxy layers `health` on top.
+
+v1.3: the `system` card now reports the ACTIVE embedding + reranker model
+(repo id + logical id + native dim) so the frontend Settings view can show
+which model is currently loaded and how to switch.
 """
 
 from __future__ import annotations
@@ -14,7 +18,8 @@ from fastapi import APIRouter, Depends
 
 from app.api.dependencies import get_db
 from app.api.v1.experiments import _exp_to_response
-from app.core.constants import EMBEDDING_DIM, EMBEDDING_MODEL
+from app.core.config import settings
+from app.core.constants import EMBEDDING_DIM
 from app.db.neo4j_client import Neo4jClient
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
@@ -32,9 +37,14 @@ def get_dashboard(
         "recentExperiments": [_exp_to_response(e).model_dump(mode="json") for e in recent_experiments],
         "recentSearches": [_exp_to_response(e).model_dump(mode="json") for e in recent_searches],
         "system": {
-            "embeddingModel": f"{EMBEDDING_MODEL} (FastAPI backend, GPU)",
-            "embeddingDim": EMBEDDING_DIM,
-            "stack": "FastAPI + Neo4j 5.x + Redis + Next.js 16 (v1.2 — real directive stack)",
+            "embeddingModel": settings.embedding_repo,
+            "embeddingModelLogical": settings.embedding_model,
+            "embeddingDim": EMBEDDING_DIM,  # actual dim written to Neo4j (1024 for both)
+            "embeddingNativeDim": settings.model_dim,  # native dim (Jina v5 small = 1536, BGE-M3 = 1024)
+            "rerankerModel": settings.reranker_repo,
+            "rerankerModelLogical": settings.reranker_model,
+            "rerankerMaxLength": settings.reranker_max_length,
+            "stack": "FastAPI + Neo4j 5.x + Redis + Next.js 16 (v1.3 — Jina v5 default + BGE-M3 toggle)",
             "v1Scope": (
                 "Standard paths only — no Late/Agentic Chunking, no Structured Chat, "
                 "no GraphRAG, no multi-user"

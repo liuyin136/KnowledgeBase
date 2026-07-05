@@ -1,12 +1,14 @@
 """
-core/constants.py — Enums + immutable constants for the RAG platform v1.2.
+core/constants.py — Enums + immutable constants for the RAG platform v1.3.
 
 Mirrors `src/lib/rag/constants.ts` (the JS-side single source of truth) so the
 FastAPI backend emits identical contract values.
 
 Includes:
   • ChunkMethod, EmbeddingApproach, AdvOption, ExperimentStatus, JobType, JobStatus enums
-  • EMBEDDING_DIM (1024 — BGE-M3, per neo4j-schema-v1.1.md §3)
+  • EMBEDDING_MODEL / RERANKER_MODEL (v1.3 — Jina v5 small + Jina Reranker v3 default)
+  • EMBEDDING_DIM (1024 — kept STABLE for both Jina + BGE-M3; Jina uses Matryoshka truncation)
+  • Jina task-conditioning constants (retrieval.query / retrieval.passages)
   • ADAPTIVE_ALPHA_GRID (construction note #2: 0.1..0.9)
   • Error codes (mirror ERROR_CODES in constants.ts)
   • Retry config (embedding max 3 attempts, exp backoff 1s/2s/4s)
@@ -82,11 +84,36 @@ class IngestStage(str, Enum):
     ERROR = "error"
 
 
-# ─── Embedding / models ───────────────────────────────────────────────────────
+# ─── Embedding / models (v1.3 — Jina default + BGE-M3 toggle) ─────────────────
+# v1.3 migration: default is Jina v5 (small) + Jina Reranker v3. BGE-M3 and
+# BGE-reranker-base remain available as toggleable alternatives via
+# EMBEDDING_MODEL / RERANKER_MODEL env vars (see core/config.py).
+#
+# The Neo4j vector indexes stay 1024-dim for BOTH models — Jina v5 small natively
+# outputs 1536 dims but is invoked with Matryoshka truncation (`dimensions=1024`).
+# BGE-M3 is natively 1024-dim. The two model families therefore write into the
+# SAME vector indexes without re-creation (caveat: vectors are still
+# model-specific, so switching models requires re-ingesting documents).
+EMBEDDING_MODEL = "jinaai/jina-embeddings-v5-text-small"  # active repo id (v1.3 default)
+EMBEDDING_MODEL_LOGICAL = "jina-v5-small"  # logical id used in EMBEDDING_MODEL env var
+EMBEDDING_DIM = 1024  # Neo4j vector index dim — kept STABLE for both models
+RERANKER_MODEL = "jinaai/jina-reranker-v3"  # active repo id (v1.3 default)
+RERANKER_MODEL_LOGICAL = "jina-v3"  # logical id used in RERANKER_MODEL env var
 
-EMBEDDING_MODEL = "BAAI/bge-m3"  # logical model name for observability
-EMBEDDING_DIM = 1024  # BGE-M3 output dim (matches neo4j-schema-v1.1.md §3)
-RERANKER_MODEL = "BAAI/bge-reranker-base"
+# Alternative (BGE-M3) constants — kept for reference + downstream tooling.
+BGE_M3_REPO = "BAAI/bge-m3"
+BGE_RERANKER_REPO = "BAAI/bge-reranker-base"
+
+# Jina Embeddings v5 is task-conditioned. The orchestrator passes `is_query=True`
+# for queries and `is_query=False` (default) for passages/documents; the embedder
+# maps that to the corresponding Jina task string. BGE-M3 ignores the task param.
+JINA_TASK_QUERY = "retrieval.query"
+JINA_TASK_PASSAGE = "retrieval.passages"
+
+# Native output dims (per model). Used only for observability — the ACTUAL dim
+# written to Neo4j is EMBEDDING_DIM (1024) via Matryoshka truncation for Jina.
+JINA_V5_SMALL_NATIVE_DIM = 1536
+BGE_M3_NATIVE_DIM = 1024
 
 # ─── Chunking targets (mirror src/lib/rag/constants.ts) ───────────────────────
 

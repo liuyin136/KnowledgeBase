@@ -1,0 +1,842 @@
+     1→"use client";
+     2→
+     3→/**
+     4→ * DashboardView — system health + quick-start cards + recent activity.
+     5→ * Frontend_Workflow_Mapping v1.1 §3 (Dashboard).
+     6→ *
+     7→ * Server state: TanStack Query ("dashboard").
+     8→ * Local state: none beyond the seed mutation.
+     9→ */
+    10→
+    11→import * as React from "react";
+    12→import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+    13→import {
+    14→  LayoutDashboard,
+    15→  FlaskConical,
+    16→  FileText,
+    17→  Boxes,
+    18→  Search as SearchIcon,
+    19→  Brain,
+    20→  ShoppingCart,
+    21→  Upload,
+    22→  ArrowRight,
+    23→  Sparkles,
+    24→  Clock,
+    25→  CheckCircle2,
+    26→  XCircle,
+    27→  Activity,
+    28→  Cpu,
+    29→  Layers,
+    30→  Server,
+    31→  Database,
+    32→  ServerOff,
+    33→  RefreshCw,
+    34→  Terminal,
+    35→  AlertTriangle,
+    36→  Zap,
+    37→} from "lucide-react";
+    38→
+    39→import { api, APIError } from "@/lib/api-client";
+    40→import { useUIStore } from "@/store/use-ui-store";
+    41→import { ViewHeader, ViewBody } from "@/components/rag/shared/view-header";
+    42→import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+    43→import { Button } from "@/components/ui/button";
+    44→import { Badge } from "@/components/ui/badge";
+    45→import { Skeleton } from "@/components/ui/skeleton";
+    46→import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+    47→import { cn } from "@/lib/utils";
+    48→import { toast } from "sonner";
+    49→
+    50→// ─── Types (typed inline since dashboard returns a loose shape) ─────────────
+    51→
+    52→interface DashboardStats {
+    53→  experiments: { total: number; completed: number; failed: number };
+    54→  documents: number;
+    55→  chunks: number;
+    56→  searches: number;
+    57→  memories: number;
+    58→  carts: number;
+    59→}
+    60→
+    61→interface RecentExperiment {
+    62→  id: string;
+    63→  description: string;
+    64→  embeddingApproach: string;
+    65→  chunkMethod: string;
+    66→  status: string;
+    67→  totalChunks: number;
+    68→  totalTimeMs: number;
+    69→  sourceFile: string | null;
+    70→  createdAt: string;
+    71→}
+    72→
+    73→interface RecentSearch {
+    74→  id: string;
+    75→  rawQuery: string;
+    76→  hybridAlpha: number;
+    77→  autoTuneWeights: boolean;
+    78→  bestAlpha: number | null;
+    79→  resultCount: number;
+    80→  searchTimeMs: number;
+    81→  createdAt: string;
+    82→}
+    83→
+    84→interface DashboardData {
+    85→  stats: DashboardStats;
+    86→  recentExperiments: RecentExperiment[];
+    87→  recentSearches: RecentSearch[];
+    88→  system: {
+    89→    embeddingModel: string;
+    90→    embeddingDim: number;
+    91→    stack: string;
+    92→    v1Scope: string;
+    93→  };
+    94→  health: {
+    95→    backend: {
+    96→      status: "online" | "offline";
+    97→      configured: boolean;
+    98→      detail?: string | null;
+    99→    };
+   100→    neo4j: {
+   101→      status: "online" | "offline";
+   102→      uri: string;
+   103→      user: string;
+   104→      error?: string;
+   105→    };
+   106→  };
+   107→}
+   108→
+   109→// ─── Helpers ────────────────────────────────────────────────────────────────
+   110→
+   111→function timeAgo(iso: string): string {
+   112→  const then = new Date(iso).getTime();
+   113→  const now = Date.now();
+   114→  const diffSec = Math.max(1, Math.floor((now - then) / 1000));
+   115→  if (diffSec < 60) return `${diffSec}s ago`;
+   116→  const diffMin = Math.floor(diffSec / 60);
+   117→  if (diffMin < 60) return `${diffMin}m ago`;
+   118→  const diffHr = Math.floor(diffMin / 60);
+   119→  if (diffHr < 24) return `${diffHr}h ago`;
+   120→  const diffDay = Math.floor(diffHr / 24);
+   121→  if (diffDay < 7) return `${diffDay}d ago`;
+   122→  const diffWk = Math.floor(diffDay / 7);
+   123→  if (diffWk < 5) return `${diffWk}w ago`;
+   124→  return new Date(iso).toLocaleDateString();
+   125→}
+   126→
+   127→function formatMs(ms: number): string {
+   128→  if (!ms || ms <= 0) return "—";
+   129→  if (ms < 1000) return `${Math.round(ms)}ms`;
+   130→  return `${(ms / 1000).toFixed(2)}s`;
+   131→}
+   132→
+   133→function statusTone(status: string): { className: string; label: string } {
+   134→  switch (status) {
+   135→    case "completed":
+   136→      return { label: "completed", className: "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400" };
+   137→    case "failed":
+   138→      return { label: "failed", className: "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-400" };
+   139→    case "running":
+   140→      return { label: "running", className: "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400" };
+   141→    case "pending":
+   142→    default:
+   143→      return { label: status || "pending", className: "border-slate-500/30 bg-slate-500/10 text-slate-700 dark:text-slate-400" };
+   144→  }
+   145→}
+   146→
+   147→function truncate(text: string, n: number): string {
+   148→  if (!text) return "";
+   149→  return text.length > n ? text.slice(0, n) + "…" : text;
+   150→}
+   151→
+   152→// ─── Stat card meta ─────────────────────────────────────────────────────────
+   153→
+   154→interface StatMeta {
+   155→  key: keyof Omit<DashboardStats, "experiments"> | "experimentsTotal" | "experimentsCompleted" | "experimentsFailed";
+   156→  label: string;
+   157→  icon: React.ComponentType<{ className?: string }>;
+   158→  subLabel: (s: DashboardStats) => string;
+   159→  value: (s: DashboardStats) => number;
+   160→}
+   161→
+   162→const STAT_META: StatMeta[] = [
+   163→  { key: "experimentsTotal", label: "Experiments", icon: FlaskConical, value: (s) => s.experiments.total, subLabel: (s) => `${s.experiments.completed} done · ${s.experiments.failed} failed` },
+   164→  { key: "documents", label: "Documents", icon: FileText, value: (s) => s.documents, subLabel: () => "uploaded source files" },
+   165→  { key: "chunks", label: "Chunks", icon: Boxes, value: (s) => s.chunks, subLabel: () => "embedded children" },
+   166→  { key: "searches", label: "Searches", icon: SearchIcon, value: (s) => s.searches, subLabel: () => "hybrid runs" },
+   167→  { key: "memories", label: "Memories", icon: Brain, value: (s) => s.memories, subLabel: () => "curated hits" },
+   168→  { key: "carts", label: "Memory Carts", icon: ShoppingCart, value: (s) => s.carts, subLabel: () => "collections" },
+   169→];
+   170→
+   171→const QUICK_START = [
+   172→  { key: "ingest", title: "Ingest", desc: "Upload a document, pick a chunking + embedding config, and watch per-chunk metadata stream in.", icon: Upload },
+   173→  { key: "search", title: "Hybrid Search", desc: "Run vector + BM25 retrieval with manual or adaptive alpha fusion and optional reranker.", icon: SearchIcon },
+   174→  { key: "memory", title: "Memory Cart", desc: "Curate search hits into named carts for evaluation across experiments.", icon: ShoppingCart },
+   175→  { key: "experiments", title: "Experiments", desc: "Inspect every ingest / search run with full observability metadata.", icon: FlaskConical },
+   176→] as const;
+   177→
+   178→// ─── Component ──────────────────────────────────────────────────────────────
+   179→
+   180→export function DashboardView() {
+   181→  const setView = useUIStore((s) => s.setView);
+   182→  const setActiveExperiment = useUIStore((s) => s.setActiveExperiment);
+   183→  const qc = useQueryClient();
+   184→
+   185→  const { data, isLoading, isError, error, refetch } = useQuery<DashboardData>({
+   186→    queryKey: ["dashboard"],
+   187→    queryFn: api.dashboard,
+   188→  });
+   189→
+   190→  const seedMutation = useMutation({
+   191→    mutationFn: api.seed,
+   192→    onSuccess: (res) => {
+   193→      toast.success(`Seeded ${res.created} sample document${res.created === 1 ? "" : "s"}${res.skipped.length ? ` · ${res.skipped.length} already existed` : ""}`);
+   194→      qc.invalidateQueries({ queryKey: ["dashboard"] });
+   195→      qc.invalidateQueries({ queryKey: ["documents"] });
+   196→    },
+   197→    onError: (err) => {
+   198→      const msg = err instanceof APIError ? err.message : "Failed to seed sample documents";
+   199→      toast.error(msg);
+   200→    },
+   201→  });
+   202→
+   203→  // POST /api/v1/neo4j/init — initialize the Neo4j schema (constraints +
+   204→  // vector + fulltext indexes). Idempotent. Only meaningful once Neo4j is up.
+   205→  const neo4jInitMutation = useMutation({
+   206→    mutationFn: async () => {
+   207→      const res = await fetch("/api/v1/neo4j/init", { method: "POST" });
+   208→      const text = await res.text();
+   209→      const body = text ? JSON.parse(text) : null;
+   210→      if (!res.ok) {
+   211→        throw new APIError(body, res.status);
+   212→      }
+   213→      return body as {
+   214→        applied: string[];
+   215→        errors: { step: string; error: string }[];
+   216→        embeddingDim: number;
+   217→        indexes: { name: string; type: string }[];
+   218→      };
+   219→    },
+   220→    onSuccess: (res) => {
+   221→      const errCount = res.errors?.length ?? 0;
+   222→      if (errCount === 0) {
+   223→        toast.success(
+   224→          `Neo4j schema initialized — ${res.indexes?.length ?? 0} indexes present`,
+   225→        );
+   226→      } else {
+   227→        toast.warning(`Neo4j init: ${res.errors.length} step(s) failed`, {
+   228→          description: res.errors.map((e) => `${e.step}: ${e.error}`).join(" · "),
+   229→        });
+   230→      }
+   231→      qc.invalidateQueries({ queryKey: ["dashboard"] });
+   232→    },
+   233→    onError: (err) => {
+   234→      const msg = err instanceof APIError ? err.message : "Failed to init Neo4j schema";
+   235→      toast.error("Neo4j init failed", { description: msg });
+   236→    },
+   237→  });
+   238→
+   239→  const stats = data?.stats;
+   240→  const health = data?.health;
+   241→  const backendOffline = health?.backend.status === "offline";
+   242→  const neo4jOffline = health?.neo4j.status === "offline";
+   243→  const anyOffline = backendOffline || neo4jOffline;
+   244→  const isEmpty =
+   245→    !!stats &&
+   246→    stats.experiments.total === 0 &&
+   247→    stats.documents === 0 &&
+   248→    stats.chunks === 0 &&
+   249→    stats.searches === 0 &&
+   250→    stats.memories === 0 &&
+   251→    stats.carts === 0 &&
+   252→    (data?.recentExperiments.length ?? 0) === 0 &&
+   253→    (data?.recentSearches.length ?? 0) === 0;
+   254→
+   255→  return (
+   256→    <>
+   257→      <ViewHeader
+   258→        title="Dashboard"
+   259→        description="System health & quick stats"
+   260→        icon={LayoutDashboard}
+   261→        actions={
+   262→          <div className="flex items-center gap-2">
+   263→            <Button
+   264→              variant="outline"
+   265→              size="sm"
+   266→              onClick={() => refetch()}
+   267→              aria-label="Refresh dashboard"
+   268→            >
+   269→              <RefreshCw className="h-3.5 w-3.5" />
+   270→              <span className="hidden sm:inline">Refresh</span>
+   271→            </Button>
+   272→            <Button
+   273→              variant="outline"
+   274→              size="sm"
+   275→              onClick={() => seedMutation.mutate()}
+   276→              disabled={seedMutation.isPending || anyOffline}
+   277→              title={anyOffline ? "Backend offline — seeding unavailable" : "Seed sample documents"}
+   278→            >
+   279→              <Sparkles className="h-4 w-4" />
+   280→              {seedMutation.isPending ? "Seeding…" : "Seed sample docs"}
+   281→            </Button>
+   282→          </div>
+   283→        }
+   284→      />
+   285→      <ViewBody className="space-y-8">
+   286→        {/* Offline banner */}
+   287→        {anyOffline && !isLoading && (
+   288→          <Alert className="border-amber-500/40 bg-amber-500/5">
+   289→            <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+   290→            <AlertTitle className="text-amber-900 dark:text-amber-100">
+   291→              Backend services offline
+   292→            </AlertTitle>
+   293→            <AlertDescription className="text-amber-900/80 dark:text-amber-200/80">
+   294→              <p className="leading-relaxed">
+   295→                Start the Docker stack (
+   296→                <code className="font-mono text-xs">docker compose up -d</code>
+   297→                ) to enable data operations. The UI is viewable but ingest /
+   298→                search / experiments will return errors until both the FastAPI
+   299→                backend and Neo4j are healthy.
+   300→              </p>
+   301→              <div className="mt-3 flex flex-wrap gap-2">
+   302→                <Button
+   303→                  size="sm"
+   304→                  variant="outline"
+   305→                  onClick={() => refetch()}
+   306→                  className="gap-1.5 border-amber-500/40 text-amber-900 hover:bg-amber-500/10 dark:text-amber-100"
+   307→                >
+   308→                  <RefreshCw className="h-3.5 w-3.5" />
+   309→                  Re-check health
+   310→                </Button>
+   311→                <Button
+   312→                  size="sm"
+   313→                  variant="outline"
+   314→                  disabled={neo4jOffline || neo4jInitMutation.isPending}
+   315→                  onClick={() => neo4jInitMutation.mutate()}
+   316→                  className="gap-1.5 border-amber-500/40 text-amber-900 hover:bg-amber-500/10 dark:text-amber-100"
+   317→                  title={
+   318→                    neo4jOffline
+   319→                      ? "Neo4j must be online before initializing the schema."
+   320→                      : "Initialize Neo4j schema (constraints + vector + fulltext indexes)"
+   321→                  }
+   322→                >
+   323→                  <Zap className="h-3.5 w-3.5" />
+   324→                  {neo4jInitMutation.isPending ? "Initializing…" : "Init Neo4j schema"}
+   325→                </Button>
+   326→                <a
+   327→                  href="/api/v1/neo4j/init"
+   328→                  target="_blank"
+   329→                  rel="noopener noreferrer"
+   330→                  className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/40 px-3 py-1.5 text-xs font-medium text-amber-900 hover:bg-amber-500/10 dark:text-amber-100"
+   331→                >
+   332→                  <Terminal className="h-3 w-3" />
+   333→                  /api/v1/neo4j/init
+   334→                </a>
+   335→              </div>
+   336→            </AlertDescription>
+   337→          </Alert>
+   338→        )}
+   339→
+   340→        {isError && (
+   341→          <Card className="border-red-500/30 bg-red-500/5">
+   342→            <CardContent className="py-4 text-sm text-red-700 dark:text-red-400 flex items-center justify-between gap-3">
+   343→              <span>Failed to load dashboard: {error instanceof APIError ? error.message : "Unknown error"}</span>
+   344→              <Button variant="outline" size="sm" onClick={() => refetch()}>
+   345→                Retry
+   346→              </Button>
+   347→            </CardContent>
+   348→          </Card>
+   349→        )}
+   350→
+   351→        {/* System Connections — health cards (top, prominent) */}
+   352→        <section aria-label="System connections">
+   353→          <h2 className="text-sm font-medium text-muted-foreground mb-3 flex items-center gap-2">
+   354→            <Server className="h-4 w-4" /> System Connections
+   355→          </h2>
+   356→          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+   357→            <BackendHealthCard
+   358→              loading={isLoading}
+   359→              status={health?.backend.status}
+   360→              configured={health?.backend.configured}
+   361→              detail={health?.backend.detail ?? null}
+   362→            />
+   363→            <Neo4jHealthCard
+   364→              loading={isLoading}
+   365→              status={health?.neo4j.status}
+   366→              uri={health?.neo4j.uri}
+   367→              user={health?.neo4j.user}
+   368→              error={health?.neo4j.error}
+   369→              onInit={() => neo4jInitMutation.mutate()}
+   370→              initPending={neo4jInitMutation.isPending}
+   371→              initDisabled={neo4jOffline}
+   372→            />
+   373→          </div>
+   374→        </section>
+   375→
+   376→        {/* Empty state */}
+   377→        {isEmpty && !isLoading && !anyOffline && (
+   378→          <Card className="border-dashed">
+   379→            <CardContent className="py-12 flex flex-col items-center text-center gap-4">
+   380→              <div className="flex h-14 w-14 items-center justify-center rounded-full bg-primary/10 text-primary">
+   381→                <Sparkles className="h-7 w-7" />
+   382→              </div>
+   383→              <div className="space-y-1">
+   384→                <h2 className="text-lg font-semibold">Welcome to RAG Lab v1</h2>
+   385→                <p className="text-sm text-muted-foreground max-w-md">
+   386→                  Your local-first RAG experimentation platform is empty. Seed a few sample documents to explore ingest,
+   387→                  hybrid search, and per-chunk observability in seconds.
+   388→                </p>
+   389→              </div>
+   390→              <Button onClick={() => seedMutation.mutate()} disabled={seedMutation.isPending}>
+   391→                <Sparkles className="h-4 w-4" />
+   392→                {seedMutation.isPending ? "Seeding…" : "Seed sample documents"}
+   393→              </Button>
+   394→            </CardContent>
+   395→          </Card>
+   396→        )}
+   397→
+   398→        {/* Stat cards */}
+   399→        <section aria-label="System stats">
+   400→          <h2 className="text-sm font-medium text-muted-foreground mb-3 flex items-center gap-2">
+   401→            <Activity className="h-4 w-4" /> System Stats
+   402→          </h2>
+   403→          <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
+   404→            {isLoading || !stats
+   405→              ? Array.from({ length: 6 }).map((_, i) => (
+   406→                  <Card key={i} className="py-4">
+   407→                    <CardContent className="space-y-2">
+   408→                      <Skeleton className="h-8 w-8 rounded-md" />
+   409→                      <Skeleton className="h-3 w-16" />
+   410→                      <Skeleton className="h-7 w-12" />
+   411→                      <Skeleton className="h-3 w-24" />
+   412→                    </CardContent>
+   413→                  </Card>
+   414→                ))
+   415→              : STAT_META.map((m) => {
+   416→                  const Icon = m.icon;
+   417→                  return (
+   418→                    <Card key={m.key} className="py-4 hover:shadow-md transition-shadow">
+   419→                      <CardContent className="space-y-2">
+   420→                        <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary/10 text-primary">
+   421→                          <Icon className="h-4 w-4" />
+   422→                        </div>
+   423→                        <div className="text-xs text-muted-foreground">{m.label}</div>
+   424→                        <div className="text-2xl font-semibold tracking-tight tabular-nums">
+   425→                          {m.value(stats)}
+   426→                        </div>
+   427→                        <div className="text-[11px] text-muted-foreground">{m.subLabel(stats)}</div>
+   428→                      </CardContent>
+   429→                    </Card>
+   430→                  );
+   431→                })}
+   432→          </div>
+   433→        </section>
+   434→
+   435→        {/* Quick Start */}
+   436→        <section aria-label="Quick start">
+   437→          <h2 className="text-sm font-medium text-muted-foreground mb-3">Quick Start</h2>
+   438→          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+   439→            {QUICK_START.map((q) => {
+   440→              const Icon = q.icon;
+   441→              return (
+   442→                <button
+   443→                  key={q.key}
+   444→                  type="button"
+   445→                  onClick={() => setView(q.key)}
+   446→                  className="text-left"
+   447→                  aria-label={`Open ${q.title}`}
+   448→                >
+   449→                  <Card className="py-4 h-full hover:shadow-md hover:border-primary/40 transition-all group cursor-pointer">
+   450→                    <CardContent className="space-y-3">
+   451→                      <div className="flex items-start justify-between">
+   452→                        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+   453→                          <Icon className="h-5 w-5" />
+   454→                        </div>
+   455→                        <ArrowRight className="h-4 w-4 text-muted-foreground group-hover:text-primary group-hover:translate-x-0.5 transition-all" />
+   456→                      </div>
+   457→                      <div>
+   458→                        <div className="text-sm font-semibold">{q.title}</div>
+   459→                        <p className="text-xs text-muted-foreground mt-1 leading-relaxed">{q.desc}</p>
+   460→                      </div>
+   461→                    </CardContent>
+   462→                  </Card>
+   463→                </button>
+   464→              );
+   465→            })}
+   466→          </div>
+   467→        </section>
+   468→
+   469→        {/* Recent activity grid */}
+   470→        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+   471→          {/* Recent Experiments */}
+   472→          <section aria-label="Recent experiments">
+   473→            <div className="flex items-center justify-between mb-3">
+   474→              <h2 className="text-sm font-medium text-muted-foreground flex items-center gap-2">
+   475→                <FlaskConical className="h-4 w-4" /> Recent Experiments
+   476→              </h2>
+   477→              <Button variant="ghost" size="sm" onClick={() => setView("experiments")}>
+   478→                View all <ArrowRight className="h-3.5 w-3.5" />
+   479→              </Button>
+   480→            </div>
+   481→            <Card className="py-0">
+   482→              <CardContent className="p-0">
+   483→                {isLoading ? (
+   484→                  <div className="p-4 space-y-2">
+   485→                    {Array.from({ length: 3 }).map((_, i) => (
+   486→                      <Skeleton key={i} className="h-12 w-full" />
+   487→                    ))}
+   488→                  </div>
+   489→                ) : (data?.recentExperiments.length ?? 0) === 0 ? (
+   490→                  <div className="p-6 text-center text-sm text-muted-foreground">
+   491→                    No experiments yet. Start by <button className="text-primary hover:underline" onClick={() => setView("ingest")}>ingesting a document</button>.
+   492→                  </div>
+   493→                ) : (
+   494→                  <ul className="divide-y max-h-80 overflow-y-auto thin-scroll">
+   495→                    {data!.recentExperiments.slice(0, 5).map((exp) => {
+   496→                      const tone = statusTone(exp.status);
+   497→                      return (
+   498→                        <li key={exp.id}>
+   499→                          <button
+   500→                            type="button"
+   501→                            onClick={() => {
+   502→                              setActiveExperiment(exp.id);
+   503→                              setView("experiments");
+   504→                            }}
+   505→                            className="w-full text-left px-4 py-3 hover:bg-accent/50 transition-colors flex items-center gap-3"
+   506→                          >
+   507→                            <div className="min-w-0 flex-1">
+   508→                              <div className="text-sm font-medium truncate">{truncate(exp.description, 60)}</div>
+   509→                              <div className="text-[11px] text-muted-foreground mt-0.5 flex items-center gap-2 flex-wrap">
+   510→                                <span className="font-mono">{exp.embeddingApproach}</span>
+   511→                                <span>·</span>
+   512→                                <span>{exp.chunkMethod}</span>
+   513→                                <span>·</span>
+   514→                                <span>{exp.totalChunks} chunks</span>
+   515→                                {exp.sourceFile && (
+   516→                                  <>
+   517→                                    <span>·</span>
+   518→                                    <span className="truncate">{exp.sourceFile}</span>
+   519→                                  </>
+   520→                                )}
+   521→                              </div>
+   522→                            </div>
+   523→                            <div className="flex flex-col items-end gap-1 shrink-0">
+   524→                              <Badge variant="outline" className={tone.className}>
+   525→                                {exp.status === "completed" && <CheckCircle2 className="h-3 w-3" />}
+   526→                                {exp.status === "failed" && <XCircle className="h-3 w-3" />}
+   527→                                {tone.label}
+   528→                              </Badge>
+   529→                              <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+   530→                                <Clock className="h-2.5 w-2.5" />
+   531→                                {timeAgo(exp.createdAt)}
+   532→                              </span>
+   533→                            </div>
+   534→                          </button>
+   535→                        </li>
+   536→                      );
+   537→                    })}
+   538→                  </ul>
+   539→                )}
+   540→              </CardContent>
+   541→            </Card>
+   542→          </section>
+   543→
+   544→          {/* Recent Searches */}
+   545→          <section aria-label="Recent searches">
+   546→            <div className="flex items-center justify-between mb-3">
+   547→              <h2 className="text-sm font-medium text-muted-foreground flex items-center gap-2">
+   548→                <SearchIcon className="h-4 w-4" /> Recent Searches
+   549→              </h2>
+   550→              <Button variant="ghost" size="sm" onClick={() => setView("search")}>
+   551→                New search <ArrowRight className="h-3.5 w-3.5" />
+   552→              </Button>
+   553→            </div>
+   554→            <Card className="py-0">
+   555→              <CardContent className="p-0">
+   556→                {isLoading ? (
+   557→                  <div className="p-4 space-y-2">
+   558→                    {Array.from({ length: 3 }).map((_, i) => (
+   559→                      <Skeleton key={i} className="h-12 w-full" />
+   560→                    ))}
+   561→                  </div>
+   562→                ) : (data?.recentSearches.length ?? 0) === 0 ? (
+   563→                  <div className="p-6 text-center text-sm text-muted-foreground">
+   564→                    No searches yet. <button className="text-primary hover:underline" onClick={() => setView("search")}>Run your first hybrid search</button>.
+   565→                  </div>
+   566→                ) : (
+   567→                  <ul className="divide-y max-h-80 overflow-y-auto thin-scroll">
+   568→                    {data!.recentSearches.slice(0, 5).map((s) => (
+   569→                      <li key={s.id} className="px-4 py-3 hover:bg-accent/50 transition-colors">
+   570→                        <div className="flex items-start justify-between gap-3">
+   571→                          <div className="min-w-0 flex-1">
+   572→                            <div className="text-sm font-medium truncate">{truncate(s.rawQuery, 64)}</div>
+   573→                            <div className="text-[11px] text-muted-foreground mt-0.5 flex items-center gap-2 flex-wrap">
+   574→                              <span className="font-mono">α={s.hybridAlpha.toFixed(1)}</span>
+   575→                              {s.autoTuneWeights && s.bestAlpha !== null && (
+   576→                                <>
+   577→                                  <span>·</span>
+   578→                                  <span className="text-primary font-mono">best α={s.bestAlpha.toFixed(1)}</span>
+   579→                                </>
+   580→                              )}
+   581→                              <span>·</span>
+   582→                              <span>{s.resultCount} results</span>
+   583→                              <span>·</span>
+   584→                              <span className="font-mono">{formatMs(s.searchTimeMs)}</span>
+   585→                            </div>
+   586→                          </div>
+   587→                          <span className="text-[10px] text-muted-foreground flex items-center gap-1 shrink-0">
+   588→                            <Clock className="h-2.5 w-2.5" />
+   589→                            {timeAgo(s.createdAt)}
+   590→                          </span>
+   591→                        </div>
+   592→                      </li>
+   593→                    ))}
+   594→                  </ul>
+   595→                )}
+   596→              </CardContent>
+   597→            </Card>
+   598→          </section>
+   599→        </div>
+   600→
+   601→        {/* System info */}
+   602→        <section aria-label="System info">
+   603→          <h2 className="text-sm font-medium text-muted-foreground mb-3">System</h2>
+   604→          <Card>
+   605→            <CardContent className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+   606→              <SystemRow icon={Cpu} label="Embedding Model" value={data?.system.embeddingModel ?? "—"} />
+   607→              <SystemRow icon={Layers} label="Embedding Dim" value={data ? String(data.system.embeddingDim) : "—"} />
+   608→              <SystemRow icon={Activity} label="Stack" value={data?.system.stack ?? "—"} />
+   609→              <div className="sm:col-span-2 lg:col-span-3 text-[11px] text-muted-foreground italic border-t pt-3 mt-1">
+   610→                v1 scope: {data?.system.v1Scope ?? "—"}
+   611→              </div>
+   612→            </CardContent>
+   613→          </Card>
+   614→        </section>
+   615→      </ViewBody>
+   616→    </>
+   617→  );
+   618→}
+   619→
+   620→function SystemRow({
+   621→  icon: Icon,
+   622→  label,
+   623→  value,
+   624→}: {
+   625→  icon: React.ComponentType<{ className?: string }>;
+   626→  label: string;
+   627→  value: string;
+   628→}) {
+   629→  return (
+   630→    <div className="flex items-start gap-3">
+   631→      <div className="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-muted-foreground shrink-0">
+   632→        <Icon className="h-4 w-4" />
+   633→      </div>
+   634→      <div className="min-w-0">
+   635→        <div className="text-[11px] text-muted-foreground uppercase tracking-wide">{label}</div>
+   636→        <div className="text-sm font-medium mt-0.5 break-words">{value}</div>
+   637→      </div>
+   638→    </div>
+   639→  );
+   640→}
+   641→
+   642→// ─── Health cards (v1.2 system connections) ──────────────────────────────────
+   643→
+   644→function StatusBadge({ status }: { status: "online" | "offline" | undefined }) {
+   645→  if (!status) {
+   646→    return (
+   647→      <Badge variant="outline" className="text-[10px] gap-1">
+   648→        <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground" />
+   649→        unknown
+   650→      </Badge>
+   651→    );
+   652→  }
+   653→  if (status === "online") {
+   654→    return (
+   655→      <Badge variant="outline" className="text-[10px] gap-1 border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400">
+   656→        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+   657→        online
+   658→      </Badge>
+   659→    );
+   660→  }
+   661→  return (
+   662→    <Badge variant="outline" className="text-[10px] gap-1 border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-400">
+   663→      <span className="h-1.5 w-1.5 rounded-full bg-red-500" />
+   664→      offline
+   665→    </Badge>
+   666→  );
+   667→}
+   668→
+   669→function BackendHealthCard({
+   670→  loading,
+   671→  status,
+   672→  configured,
+   673→  detail,
+   674→}: {
+   675→  loading: boolean;
+   676→  status: "online" | "offline" | undefined;
+   677→  configured: boolean | undefined;
+   678→  detail: string | null;
+   679→}) {
+   680→  const offline = status === "offline";
+   681→  return (
+   682→    <Card className={cn(offline ? "border-red-500/30 bg-red-500/5" : "border-emerald-500/20")}>
+   683→      <CardContent className="p-4">
+   684→        <div className="flex items-start justify-between gap-2 mb-3">
+   685→          <div className="flex items-center gap-2">
+   686→            <div
+   687→              className={cn(
+   688→                "flex h-9 w-9 items-center justify-center rounded-lg shrink-0",
+   689→                offline
+   690→                  ? "bg-red-500/10 text-red-600 dark:text-red-400"
+   691→                  : "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+   692→              )}
+   693→            >
+   694→              {offline ? <ServerOff className="h-5 w-5" /> : <Server className="h-5 w-5" />}
+   695→            </div>
+   696→            <div>
+   697→              <div className="text-sm font-semibold">FastAPI Backend</div>
+   698→              <div className="text-[10px] text-muted-foreground">
+   699→                BGE-M3 embeddings · hybrid retrieval · reranker
+   700→              </div>
+   701→            </div>
+   702→          </div>
+   703→          {loading ? (
+   704→            <Skeleton className="h-5 w-16 rounded-full" />
+   705→          ) : (
+   706→            <StatusBadge status={status} />
+   707→          )}
+   708→        </div>
+   709→        {loading ? (
+   710→          <div className="space-y-1.5">
+   711→            <Skeleton className="h-3 w-1/2" />
+   712→            <Skeleton className="h-3 w-2/3" />
+   713→          </div>
+   714→        ) : (
+   715→          <dl className="space-y-1 text-xs">
+   716→            <div className="flex items-baseline justify-between gap-2">
+   717→              <dt className="text-muted-foreground">Configured</dt>
+   718→              <dd className="font-mono">
+   719→                {configured ? "yes (BACKEND_URL set)" : "no (BACKEND_URL missing)"}
+   720→              </dd>
+   721→            </div>
+   722→            {detail && (
+   723→              <div className="flex items-baseline justify-between gap-2 min-w-0">
+   724→                <dt className="text-muted-foreground shrink-0">Detail</dt>
+   725→                <dd className="font-mono text-right truncate" title={detail}>
+   726→                  {detail}
+   727→                </dd>
+   728→              </div>
+   729→            )}
+   730→            {offline && (
+   731→              <div className="text-[11px] text-red-700/80 dark:text-red-300/80 mt-2 pt-2 border-t border-red-500/20">
+   732→                Start the backend: <code className="font-mono">docker compose up -d backend</code>
+   733→              </div>
+   734→            )}
+   735→          </dl>
+   736→        )}
+   737→      </CardContent>
+   738→    </Card>
+   739→  );
+   740→}
+   741→
+   742→function Neo4jHealthCard({
+   743→  loading,
+   744→  status,
+   745→  uri,
+   746→  user,
+   747→  error,
+   748→  onInit,
+   749→  initPending,
+   750→  initDisabled,
+   751→}: {
+   752→  loading: boolean;
+   753→  status: "online" | "offline" | undefined;
+   754→  uri: string | undefined;
+   755→  user: string | undefined;
+   756→  error?: string;
+   757→  onInit: () => void;
+   758→  initPending: boolean;
+   759→  initDisabled: boolean;
+   760→}) {
+   761→  const offline = status === "offline";
+   762→  return (
+   763→    <Card className={cn(offline ? "border-red-500/30 bg-red-500/5" : "border-emerald-500/20")}>
+   764→      <CardContent className="p-4">
+   765→        <div className="flex items-start justify-between gap-2 mb-3">
+   766→          <div className="flex items-center gap-2">
+   767→            <div
+   768→              className={cn(
+   769→                "flex h-9 w-9 items-center justify-center rounded-lg shrink-0",
+   770→                offline
+   771→                  ? "bg-red-500/10 text-red-600 dark:text-red-400"
+   772→                  : "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+   773→              )}
+   774→            >
+   775→              <Database className="h-5 w-5" />
+   776→            </div>
+   777→            <div>
+   778→              <div className="text-sm font-semibold">Neo4j Database</div>
+   779→              <div className="text-[10px] text-muted-foreground">
+   780→                Knowledge graph · vector index · BM25 fulltext
+   781→              </div>
+   782→            </div>
+   783→          </div>
+   784→          {loading ? (
+   785→            <Skeleton className="h-5 w-16 rounded-full" />
+   786→          ) : (
+   787→            <StatusBadge status={status} />
+   788→          )}
+   789→        </div>
+   790→        {loading ? (
+   791→          <div className="space-y-1.5">
+   792→            <Skeleton className="h-3 w-1/2" />
+   793→            <Skeleton className="h-3 w-2/3" />
+   794→          </div>
+   795→        ) : (
+   796→          <dl className="space-y-1 text-xs">
+   797→            <div className="flex items-baseline justify-between gap-2 min-w-0">
+   798→              <dt className="text-muted-foreground shrink-0">URI</dt>
+   799→              <dd className="font-mono text-right truncate" title={uri ?? ""}>
+   800→                {uri ?? "—"}
+   801→              </dd>
+   802→            </div>
+   803→            <div className="flex items-baseline justify-between gap-2">
+   804→              <dt className="text-muted-foreground">User</dt>
+   805→              <dd className="font-mono">{user ?? "—"}</dd>
+   806→            </div>
+   807→            {error && (
+   808→              <div className="text-[11px] text-red-700/80 dark:text-red-300/80 mt-2 pt-2 border-t border-red-500/20 break-words">
+   809→                <span className="font-medium">Error: </span>
+   810→                <span className="font-mono">{error}</span>
+   811→              </div>
+   812→            )}
+   813→            {!offline && (
+   814→              <div className="flex justify-end mt-2 pt-2 border-t">
+   815→                <Button
+   816→                  size="sm"
+   817→                  variant="outline"
+   818→                  onClick={onInit}
+   819→                  disabled={initPending || initDisabled}
+   820→                  className="gap-1.5 h-7 text-xs"
+   821→                >
+   822→                  {initPending ? (
+   823→                    <RefreshCw className="h-3 w-3 animate-spin" />
+   824→                  ) : (
+   825→                    <Zap className="h-3 w-3" />
+   826→                  )}
+   827→                  {initPending ? "Initializing…" : "Init schema"}
+   828→                </Button>
+   829→              </div>
+   830→            )}
+   831→            {offline && (
+   832→              <div className="text-[11px] text-red-700/80 dark:text-red-300/80 mt-2 pt-2 border-t border-red-500/20">
+   833→                Start Neo4j: <code className="font-mono">docker compose up -d neo4j</code>
+   834→              </div>
+   835→            )}
+   836→          </dl>
+   837→        )}
+   838→      </CardContent>
+   839→    </Card>
+   840→  );
+   841→}
+   842→

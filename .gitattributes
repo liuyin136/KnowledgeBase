@@ -1,0 +1,40 @@
+# .gitattributes — enforce LF line endings on all text files.
+# Prevents CRLF issues when the repo is cloned/edited on Windows
+# (Windows Docker Desktop + WSL2). Python scripts especially break with
+# CRLF inside heredocs + shebangs.
+
+* text=auto eol=lf
+
+# Explicit LF for code that runs in Linux containers
+*.py text eol=lf
+*.sh text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+Dockerfile* text eol=lf
+*.env* text eol=lf
+
+# Binary files — never normalize
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.db binary
+*.safetensors binary
+*.bin binary
+*.pt binary
+*.onnx binary

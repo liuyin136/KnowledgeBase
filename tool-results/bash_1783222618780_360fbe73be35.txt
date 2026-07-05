@@ -1,0 +1,200 @@
+  • backend: build context ../backend + dockerfile ../docker/Dockerfile.backend, port 8000, full env (NEO4J_URI=bolt://neo4j:7687, NEO4J_USER, NEO4J_PASSWORD, REDIS_URL=redis://redis:6379/0, MODEL_PATH=/app/models, CUDA_VISIBLE_DEVICES=0, LOG_LEVEL, FRONTEND_ORIGIN=*, EMBEDDING_DIM=1024, EMBEDDING_MODEL=BAAI/bge-m3), depends_on neo4j+redis with condition: service_healthy, deploy.resources.reservations.devices nvidia GPU, healthcheck on /health.
+  • api-worker: same build as backend, command python -m app.workers.worker, same env + GPU + RQ_QUEUE_NAME=default + WORKER_CONCURRENCY=1 (BGE-M3 + 8 GB VRAM), depends_on redis+backend (healthy).
+  • frontend: build context .. + dockerfile docker/Dockerfile.frontend, port 3000, env BACKEND_URL=http://backend:8000 + NEXT_PUBLIC_BACKEND_URL=, depends_on backend (healthy).
+  • Named volumes: neo4j_data, redis_data. Network: default (bridge).
+- Created `docker/.env.example` — all 11 env vars per infra spec §5 (NEO4J_URI/USER/PASSWORD, REDIS_URL, MODEL_PATH, LOG_LEVEL, FRONTEND_ORIGIN, CUDA_VISIBLE_DEVICES, EXPERIMENT_STORAGE_PATH, BACKEND_URL, NEXT_PUBLIC_BACKEND_URL, EMBEDDING_DIM, EMBEDDING_MODEL) + DOWNLOAD_RERANKER build-time toggle.
+- Created `docker/README.md` — file map, host prerequisites (Linux + Windows Server paths table comparing Docker Desktop+WSL2 vs Docker EE), one-command setup (build → optional download_models.py → init_neo4j.py → up -d → verify with curl /health + /api/v1/neo4j/health), service overview table, env var reference, multi-stage rationale, 7 troubleshooting sections (CUDA not visible, Neo4j auth, model download failures, port conflicts, hung `run --rm`, 502 proxy, standalone-output sanity check), model update + backup/restore recipes, tear-down. Explicitly documents the Windows Server GPU caveat: Docker EE on Windows Server does NOT support `--gpus all` natively — recommend WSL2 Ubuntu distro or Hyper-V Linux VM with PCI passthrough.
+- Created root `docker-compose.yml` — thin `include: [docker/docker-compose.yml]` wrapper so `docker compose <cmd>` works from project root without `-f`.
+- Created root `.dockerignore` — excludes node_modules, .next, .git, tool-results, agent-ctx, download, examples, docker (build artifacts), backend (built separately), .env, .db, etc.
+- Created `backend/.dockerignore` — excludes __pycache__, .pytest_cache, .venv, models/ (host dev downloads that would bloat image by ~2.4 GB), *.safetensors / *.bin / *.onnx, tests, experiments, IDE noise, .env.
+- Wrote agent-ctx record at `/agent-ctx/3-full-stack-developer-docker.md` with notes for downstream agents (backend requirements.txt fallback pin, scripts expected, api-worker entry point, frontend same-origin proxy pattern, Windows Server + GPU caveats).
+- Did NOT run `docker build` (no Docker daemon in sandbox, per task constraint). Verified file tree + next.config.ts standalone setting.
+
+Stage Summary:
+- Docker infrastructure COMPLETE per infrastructure-environment-spec_v1.1.md. Files created:
+  • docker/Dockerfile.backend (multi-stage: model-downloader → runtime, BGE-M3 + bge-reranker baked in, runtime base nvidia/cuda:12.4.1-runtime-ubuntu22.04)
+  • docker/Dockerfile.frontend (multi-stage: builder → runner, standalone Next.js, ~150 MB runtime)
+  • docker/docker-compose.yml (5 services: neo4j + redis + backend + api-worker + frontend, GPU on backend+worker, healthchecks, named volumes, bridge network)
+  • docker/.env.example (11 vars per spec §5 + DOWNLOAD_RERANKER toggle)
+  • docker/README.md (one-command setup + Windows Server notes + 7 troubleshooting sections)
+  • docker-compose.yml (root thin wrapper via `include:`)
+  • .dockerignore (root)
+  • backend/.dockerignore
+- GPU passthrough: declared via `deploy.resources.reservations.devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]` on backend + api-worker. Requires NVIDIA Container Toolkit on the host (documented in README §2.1 + §2.2). Windows Server caveat: Docker EE does NOT support `--gpus all` natively — use WSL2 Ubuntu or Hyper-V Linux VM with PCI passthrough.
+- Multi-stage confirmed: backend 2-stage (model-downloader → runtime) with BuildKit cache mount for HF cache; frontend 2-stage (builder → runner) with standalone Next.js output and non-root user.
+- One-command setup confirmed: `docker compose build` → (optional) `docker compose run --rm backend python scripts/download_models.py` → `docker compose run --rm backend python scripts/init_neo4j.py` → `docker compose up -d` → verify with `curl http://localhost:8000/health` + `curl http://localhost:3000/api/v1/neo4j/health`. Works from project root via the thin `include:` wrapper.
+- Windows Server caveats documented: (1) prefer WSL2 Ubuntu distro over Docker EE for GPU passthrough; (2) NVIDIA driver >= 551.61 (Windows) / 550.54.14 (Linux) for CUDA 12.4; (3) Docker EE LCOW does NOT support `--gpus all` — use Hyper-V Linux VM with PCI passthrough if EE is mandatory.
+- Notes for downstream agents (full detail in /agent-ctx/3-full-stack-developer-docker.md): backend Dockerfile tolerates missing requirements.txt with a minimal pin fallback; scripts/download_models.py + scripts/init_neo4j.py expected by README setup commands; api-worker entry point python -m app.workers.worker with RQ_QUEUE_NAME + WORKER_CONCURRENCY env vars wired; frontend must keep NEXT_PUBLIC_BACKEND_URL empty (same-origin /api/v1/* proxy pattern).
+
+---
+Task ID: 7+8
+Agent: full-stack-developer (frontend v1.2 refinements)
+Task: Refine the v1.2 frontend for the Local-First RAG Platform: (1) Experiments view — add an MDXEditor-based markdown editor with a raw/rendered toggle for the reconstructed source document (requirement #6); (2) Memory Cart view — redesign for a much larger inspection area with a resizable chunk-text / scores split + keyboard navigation (requirement #7); (3) Dashboard — add System Connections health cards (FastAPI + Neo4j) + offline banner + Init Neo4j schema action (v1.2 pivot support); (4) shared BackendOffline component for the 503 BACKEND_UNAVAILABLE / BACKEND_UNREACHABLE state; (5) api-client helper isBackendOffline.
+
+Work Log:
+- Read /home/z/my-project/worklog.md (full project context + stable contracts), upload/Frontend_Workflow_Mapping_v1.1.md, and the existing view files (experiments-view.tsx, memory-view.tsx, dashboard-view.tsx) + src/lib/api-client.ts to understand the v1.2 pivot (Prisma/SQLite removed; Next.js API routes proxy to FastAPI backend; Neo4j is the real DB).
+- Confirmed the dashboard API route returns `health: { backend: {status,configured,detail}, neo4j: {status,uri,user,error?} }` and that the v1.2 backend is offline in this sandbox — every API call now returns 503 BACKEND_UNAVAILABLE / BACKEND_UNREACHABLE.
+- Confirmed installed packages: @mdxeditor/editor@3.39.1, react-markdown@10.1.0, react-resizable-panels@3.0.3 — all available for the new UI.
+
+CHANGE 5 — api-client helper (`src/lib/api-client.ts`):
+- Added `export function isBackendOffline(err: unknown): boolean` that returns true when `err instanceof APIError && (err.code === "BACKEND_UNAVAILABLE" || err.code === "BACKEND_UNREACHABLE")`. Consumed by all views to swap in the shared BackendOffline component on 503s.
+
+CHANGE 4 — shared BackendOffline component (`src/components/rag/shared/backend-offline.tsx`, NEW):
+- `<BackendOffline title? message? onRetry? showHint? compact?>` — amber-bordered Alert with a ServerOff icon, "HTTP 503" mono tag, the docker-compose quick-start hint (`docker compose up -d`), a Retry button (calls `onRetry`), and a "Check Neo4j health" external link to /api/v1/neo4j/health.
+- Default message: "The FastAPI backend is not reachable. Start the Docker stack (`docker compose up -d`) and ensure Neo4j + Redis + the backend service are healthy."
+- Also exports a `QueryErrorBanner` helper that picks between BackendOffline (503) and a generic destructive Alert for other errors (duck-typed via `error.code` to avoid a circular import).
+- Compact variant for inline use inside Tables/dialogs; default for full-pane states.
+
+Shared MarkdownEditor (`src/components/rag/shared/markdown-editor.tsx`, NEW):
+- `<MarkdownEditor value onChange? readOnly? placeholder? className? headingLevels? hideToolbar?>` — forwardRef wrapper around @mdxeditor/editor with `@mdxeditor/editor/style.css` imported at module load.
+- Plugins: headingsPlugin (1–6 by default), listsPlugin, linkPlugin, quotePlugin, markdownShortcutPlugin, linkDialogPlugin, toolbarPlugin.
+- Toolbar contents: UndoRedo · Separator · BoldItalicUnderlineToggles · Separator · BlockTypeSelect · ListsToggle · Separator · CreateLink. (Confirmed exports exist via grep of node_modules/@mdxeditor/editor/dist/index.d.ts — LinkToggle is NOT exported, CreateLink is.)
+- `<MarkdownRender value className?>` — lazy-loaded react-markdown with explicit per-element Tailwind classes (h1/h2/h3/h4/h5/h6/p/ul/ol/li/blockquote/a/strong/em/code/pre/hr/table/th/td). No @tailwindcss/typography dependency.
+- Added a `.md-prose` CSS block to globals.css for the MDXEditor's contentEditable (headings/lists/blockquote/code/pre/table) since `prose` classes require the typography plugin that isn't installed.
+
+CHANGE 1 — Experiments view MD editor (`src/components/rag/views/experiments-view.tsx`):
+- Added imports: useMutation, useQueryClient, toast, isBackendOffline, BackendOffline, MarkdownEditor, MarkdownRender, Tabs/TabsList/TabsTrigger/TabsContent, plus icons (Save, FileCode2, Info, Loader2).
+- New `SourceDocumentSection({experimentId, sourceFile})` component (placed in DetailMode, after ChunkBrowser, only for ingest experiments):
+  • Fetches `api.experiments.chunks(experimentId)`, sorts by chunkIndex, concatenates chunk texts (`c.text ?? c.textPreview`) with blank-line separators → reconstructed source.
+  • Header has a Tabs toggle ("Rendered" | "Raw") in the CardAction; description shows "Reconstructed from N chunks · X chars · original: <sourceFile>".
+  • Rendered mode: react-markdown preview in a `max-h-[55vh]` scrollable bordered box.
+  • Raw mode: an info Alert explaining the non-destructive edit flow, the MDXEditor (controlled, with toolbar), and a footer row showing "● Unsaved changes" / char count + Reset + "Save as new document" buttons.
+  • Save: `api.documents.create({ filename: `${sourceFile} (edited)`, text: editedText, contentType: "text/markdown" })` — creates a NEW Knowledge node (non-destructive). Toast on success; invalidates ["documents"] + ["dashboard"]. Reset clears edits.
+  • Save disabled when unchanged (`hasEdits` flag, set by comparing edited vs reconstructed) or while pending.
+  • Loading skeletons; empty state ("No chunks recorded"); BackendOffline component on 503; generic destructive Alert on other errors.
+- DetailMode's error state now branches on isBackendOffline(error) — shows BackendOffline instead of the generic "Failed to load experiment" message.
+- ExperimentTable's error row branches similarly — BackendOffline (compact) inside the table cell on 503.
+
+CHANGE 2 — Memory Cart redesign (`src/components/rag/views/memory-view.tsx`, full rewrite):
+- New layout: `lg:grid-cols-[260px_minmax(0,1fr)]` — left = CreateCart + CartsList (~260px), right = CartDetail (dominant). Mobile: carts collapse to a top Sheet trigger (MobileCartsSheet) that opens a side drawer with the create form + carts list (compact variant).
+- `CartsList` gains a `compact` prop (used inside the mobile Sheet) and branches on isBackendOffline(error) → compact BackendOffline.
+- `MemoryNavList` (NEW): keyboard-navigable vertical list of memories in the active cart. Container has `role="listbox"`, `aria-activedescendant` points to the active item, each item is `role="option" aria-selected`. onKeyDown handles ArrowUp/ArrowDown/Home/End — moves the active memory, scrolls the new item into view. Each item shows rank #, score, query (line-clamp-2), chunk text preview.
+- `MemoryInspectionPane` (NEW, the dominant inspection area): query as a prominent blockquote at the top (teal-bordered card, "Query that produced this memory" label, italic blockquote, meta row with memory ID + relative time + userQuery ID), then a `ResizablePanelGroup direction="vertical"` with explicit `h-[55vh] min-h-[400px]`:
+  • Top panel (62%, min 30%): "Chunk text" header with char count + a big ScrollArea showing the full chunkText in `text-base leading-relaxed whitespace-pre-wrap` — no truncation.
+  • Bottom panel (38%, min 15%): "Scores & metadata" header + a ScrollArea with a 2×3 grid of score cells (Final/Vector/BM25/Fused/Reranker/Success — Final highlighted teal), a separator, and a meta-rows grid (Memory ID / User query ID / Chunk ID / Experiment ID / Selected / Created), plus an optional Notes block.
+  • Both panels have a colored header strip with PanelTop / PanelBottom icons; the ResizableHandle uses `withHandle` for a visible grip.
+- `MemoryScoresTable` (extracted) shared between the inspection pane and the All-Memories sheet.
+- `ManageSelectionTable` (NEW): the checkbox table moved BELOW the inspection area, wrapped in a Collapsible card ("Manage selection" with a count Badge). Optimistic toggle via api.memoryCarts.patch({memoryIds}). Row click selects the memory in the inspection pane (calls onSelect → updates activeMemoryId).
+- `CartDetail`: manages `activeMemoryId` local state. Effect keeps it valid when memories change (defaults to first memory, clears when cart is empty). Loading skeleton + error states (BackendOffline on 503, generic on others). Header has Edit + Refresh + Add memories actions.
+- `AllMemoriesSection` (kept, updated): the global memory browser now opens a Sheet with the MemoryInspectionPane on row click (instead of the old MemoryDetailSheet). Branches on isBackendOffline for its error state.
+- `MobileCartsSheet` (NEW): Sheet trigger visible only on `lg:hidden`, opens a 280px left drawer with CreateCart + CartsList (compact).
+- BackendOffline is shown in the CartDetail error state, in CartsList (compact) on 503, in AddMemoriesDialog on 503, and in AllMemoriesSection on 503.
+
+CHANGE 3 — Dashboard health cards (`src/components/rag/views/dashboard-view.tsx`):
+- Extended `DashboardData` type with `health: { backend: {status, configured, detail?}, neo4j: {status, uri, user, error?} }`.
+- Added a `neo4jInitMutation` that POSTs to /api/v1/neo4j/init (parses JSON, throws APIError on non-2xx). On success: toast "Neo4j schema initialized — N indexes present"; on partial errors: toast.warning with step details. Invalidates ["dashboard"].
+- Added imports: Server, Database, ServerOff, RefreshCw, Terminal, AlertTriangle, Zap, Alert/AlertTitle/AlertDescription, cn.
+- New "System Connections" section at the top of the dashboard (above stats), with a 2-column grid of health cards:
+  • `BackendHealthCard`: icon (Server/ServerOff), title "FastAPI Backend", subtitle "BGE-M3 embeddings · hybrid retrieval · reranker", StatusBadge (online=emerald pulsing dot, offline=red dot, unknown=muted), Configured (yes/no with BACKEND_URL note), Detail line, and a "Start the backend: docker compose up -d backend" hint when offline. Border color reflects status (emerald/red).
+  • `Neo4jHealthCard`: icon (Database), title "Neo4j Database", subtitle "Knowledge graph · vector index · BM25 fulltext", StatusBadge, URI (mono truncate), User, optional Error block, and when online an "Init schema" button (calls neo4jInitMutation). When offline: "Start Neo4j: docker compose up -d neo4j" hint.
+- New `StatusBadge` helper shared by both cards (online=emerald+pulse, offline=red, unknown=muted).
+- Prominent offline banner Alert (amber, AlertTriangle icon) at the very top of ViewBody when `anyOffline && !isLoading`: "Backend services offline — start the Docker stack (`docker compose up -d`)…" with three actions: Re-check health (refetch), Init Neo4j schema (disabled when Neo4j is offline), and an external link to /api/v1/neo4j/init.
+- Seed button in the ViewHeader is disabled when `anyOffline` (with a tooltip).
+- Empty-state ("Welcome to RAG Lab v1") is now suppressed when `anyOffline` (so the user sees the offline banner + zeroed stats instead of the welcome card).
+- Added a Refresh button to the ViewHeader actions for quick re-checks.
+
+CHANGE 4 (cross-cutting) — BackendOffline wired into Search + Ingest views:
+- `src/components/rag/views/search-view.tsx`: imported isBackendOffline + BackendOffline. Three error branches updated:
+  • experimentsQuery error (inside the experiment Select card) → compact BackendOffline on 503.
+  • historyQuery error (inside the collapsible past-searches panel) → compact BackendOffline on 503.
+  • cartsQuery error (inside the Add-to-cart dialog) → compact BackendOffline on 503.
+- `src/components/rag/views/ingest-view.tsx`: imported isBackendOffline + BackendOffline. DocumentsListCard's error state now branches on isBackendOffline(error) → compact BackendOffline with retry; falls back to the original "Failed to load documents" + Retry link for other errors.
+
+Quality:
+- `bun run lint` → 0 errors, 0 warnings.
+- `bunx tsc --noEmit` → 0 errors in the RAG platform code (only pre-existing scaffolding errors in examples/websocket + skills/* which are out of scope).
+- All new components are `'use client'` and TypeScript-strict.
+- Responsive: Memory view uses lg: breakpoints for the 3-pane desktop layout and a Sheet for mobile carts; dashboard health cards stack on md and below; experiments source-document card is full-width.
+- Accessibility: MemoryNavList has role=listbox + role=option + aria-activedescendant + keyboard nav; BackendOffline uses role=alert; all interactive elements have aria-labels; the MDXEditor has aria-label.
+- TanStack Query for all server state; useMutation for save/init/seed/toggle; optimistic updates preserved for the memory-selection toggle.
+- Single-route constraint respected: no new routes; everything renders inside page.tsx's view switcher.
+- Stable contracts respected: api-client, rag/types, use-ui-store, ViewHeader/ViewBody, shadcn/ui, sonner toast all consumed unchanged.
+
+Stage Summary:
+- 6 files modified/created for v1.2 frontend refinements:
+  1. `src/lib/api-client.ts` — added `isBackendOffline(err)` helper.
+  2. `src/components/rag/shared/backend-offline.tsx` (NEW) — reusable BackendOffline + QueryErrorBanner.
+  3. `src/components/rag/shared/markdown-editor.tsx` (NEW) — MDXEditor wrapper + MarkdownRender.
+  4. `src/components/rag/views/experiments-view.tsx` — SourceDocumentSection with raw/rendered Tabs + MDXEditor + Save-as-new-document; BackendOffline on 503 in detail + list.
+  5. `src/components/rag/views/memory-view.tsx` — full rewrite: 260px carts sidebar + dominant inspection pane (query blockquote + resizable chunk-text/scores split) + keyboard-navigable memory list + collapsible manage-selection table + mobile Sheet; BackendOffline throughout.
+  6. `src/components/rag/views/dashboard-view.tsx` — System Connections section (FastAPI + Neo4j health cards), offline banner with Init Neo4j schema action, seed disabled when offline.
+  7. `src/components/rag/views/search-view.tsx` — BackendOffline wired into 3 error branches (experiments/history/carts queries).
+  8. `src/components/rag/views/ingest-view.tsx` — BackendOffline wired into documents-list error branch.
+  9. `src/app/globals.css` — added `.md-prose` styles for the MDXEditor contentEditable (no @tailwindcss/typography dependency).
+- Decisions:
+  • MDXEditor toolbar uses `CreateLink` (not `LinkToggle`) because `LinkToggle` is not exported by @mdxeditor/editor@3.39.1.
+  • Source document is reconstructed by concatenating chunk texts (sorted by chunkIndex) because the Experiment node only stores `sourceFile` (filename), not the full text. The UI labels this honestly as "Reconstructed from N chunks". Save is non-destructive: creates a NEW document with the edited text via api.documents.create (no PUT/PATCH document endpoint exists in the contract).
+  • Memory inspection pane uses an explicit `h-[55vh] min-h-[400px]` for the resizable panel group container (instead of an `h-full` chain) so the panels always have a bounded height to fill regardless of the surrounding grid cell's height.
+  • Dashboard's Neo4j init mutation hits /api/v1/neo4j/init directly via fetch (no api-client method, since the api-client doesn't yet expose neo4j endpoints — left for a future contract update).
+- The v1.2 "backend offline" state is now handled gracefully across all 5 views: clear amber-banner UI with retry + docker-compose hint + Neo4j init action, instead of red "Failed to load" errors. The UI is fully viewable while the FastAPI/Neo4j stack is down.
+
+---
+Task ID: 2
+Agent: full-stack-developer (FastAPI backend)
+Task: Build the canonical FastAPI backend (Python 3.12) under `/home/z/my-project/backend/` — Neo4j + Redis + BGE-M3 on GPU. This is the real RAG engine per the v1.2 directive; the Next.js app proxies to it via `BACKEND_URL`. Implements the stable contracts (api-client, types.ts) identically so the Next.js proxy + frontend work unchanged.
+
+Work Log:
+- Read worklog.md (Tasks 1, 5-a/b/c, 6, 7) + all 6 v1.1 design docs + src/lib/rag/types.ts + src/lib/api-client.ts + src/lib/rag/backend-client.ts + src/lib/rag/{constants,chunking,metadata,utils,neo4j}.ts + src/app/api/v1/{dashboard,seed,experiments,experiments/[id]/chunks}/route.ts + the pre-existing docker/Dockerfile.backend.
+- Created the full backend/ tree per backend-directory-structure_v1.1.md EXACTLY: app/{__init__.py, main.py, core/, api/{dependencies.py, v1/}, schemas/, services/, models/, db/, workers/, utils/} + scripts/ + tests/ + requirements.txt + pyproject.toml + README.md (50 files total).
+- core/ (4 files): config.py (Pydantic Settings — NEO4J_*, REDIS_URL, MODEL_PATH, CUDA_VISIBLE_DEVICES, EMBEDDING_DIM=1024, LOG_LEVEL, FRONTEND_ORIGIN, ENABLE_RERANKER, ADAPTIVE_ALPHA_GRID, chunking defaults, device auto-detect); logging.py (JSON logging + contextvars for experiment_id/correlation_id + log_pipeline_error per spec §4); exceptions.py (RAGBaseException + 8 subclasses with code/status_code/details/stage/experiment_id/retry_count); constants.py (Enums + EMBEDDING_DIM=1024 + ADAPTIVE_ALPHA_GRID=[0.1..0.9] + retry config + Neo4j label/rel constants).
+- utils/ (2 files): timing.py (now_ms/timed/timed_sync) + tokenization.py (CJK-aware approx_token_count + preview + optional exact tokenizer count).
+- models/neo4j_models.py: Pydantic v2 for Knowledge (vector Optional — None for upload-time placeholders so HNSW skips them), KnowledgeChunk, UserQuery, UserQueryChunk, Memory, MemoryCart, Experiment. v1.2 extensions documented inline.
+- schemas/ (6 files): Pydantic v2 mirroring src/lib/rag/types.ts EXACTLY (camelCase keys, optional fields, score types). Cross-module forward ref (JobStatusResponse.result: Optional[SearchResponse]) resolved via model_rebuild(_types_namespace={"SearchResponse": SearchResponse}) at the bottom of search.py.
+- db/ (2 files): neo4j_client.py (Neo4jClient — driver singleton, transient retry max 2, parameterized Cypher throughout, typed CRUD for every node label + relationship, vector_search_chunks via HNSW cosine, bm25_search_chunks via fulltext, dashboard_stats counts DISTINCT source_files); vector_index.py (ensure_vector_indexes runs ALL 7 constraints + 3 vector indexes 1024-dim cosine + 3 fulltext indexes from neo4j-schema-v1.1.md, idempotent IF NOT EXISTS, v1.2 extension: knowledge_text covers source_file AND text).
+- services/ (5 files — STRICT MODULE BOUNDARIES): chunking.py (PURE boundaries — LongText sliding window + Recursive + Semantic + Structure-Aware; never embeds/persists); embedding.py (EmbeddingModule — BGE-M3 via sentence-transformers, singleton + thread-safe, **CONSTRUCTION NOTE #1**: `emb.detach().cpu().to(torch.float32).tolist()` on every encode path with clear comment re numpy bfloat16, embed_with_retry max 3 exp backoff 1s/2s/4s, embed_batch_with_retry halves batch on CUDA OOM); retrieval.py (RetrievalModule — ONLY scores, hybrid_search = vector + optional BM25 + manual/adaptive fusion + optional reranker, **CONSTRUCTION NOTE #2**: _apply_fusion alpha*vector+beta*bm25 (beta=1-alpha) + _adaptive_fuse sweeps alpha 0.1-0.9 picks best top-1, returns bestAlpha, RRF as documented alternative); metadata.py (PURE factories — create_chunk_metadata, create_experiment_run, aggregate_chunk_stats); orchestrator.py (PipelineOrchestrator — owns coordination+metadata+transactions+lifecycle, ingest_long_text + **ingest_child_chunk (USER REQUIREMENT #5: FIRST embed full doc with LongText → parent :Knowledge context vector; THEN chunk; THEN embed each child chunk; persist BOTH parent + child vectors via HAS_CHUNK; ExperimentRun.embedding_approach="ChildChunk" but parent LongText embedding always present)** + run_search).
+- workers/ (2 files): progress.py (ProgressTracker — Redis-backed job state + events with in-memory fallback for dev, create_job/mark_running/mark_completed/mark_failed/append_event/get_status returns JobStatusResponse); tasks.py (run_ingest_task + run_search_task sync entry points for FastAPI BackgroundTasks, runs orchestrator's async pipeline via asyncio.run()).
+- api/ (dependencies.py + v1/router.py + 8 endpoint modules): experiments (POST/GET, GET /[id], GET /[id]/chunks); documents (POST JSON or multipart, GET paginated distinct source_files, DELETE cascades); ingest (POST → 202 {jobId,experimentId,status}, GET /[jobId]/status); search (POST /search → 202 {jobId,searchId,status}, GET /searches/history); memory (GET/POST /memories, POST/GET /memory-carts, GET/PATCH /memory-carts/[id] with memoryIds REPLACE or addMemoryIds ADD); jobs (GET /[jobId]); dashboard (GET → {stats,recentExperiments,recentSearches,system}); seed (POST → {created,skipped,createdIds} — 4 sample markdown docs about RAG/hybrid-search/embeddings/experiment-design).
+- main.py: FastAPI factory + lifespan (configure logging → init Neo4j + verify → ensure_vector_indexes → init ProgressTracker → preload BGE-M3 best-effort). CORS middleware (allow_origins from settings.cors_origins, default ["*"]). Global exception handlers: RAGBaseException → standardized body; RequestValidationError → 422 VALIDATION_ERROR with details.errors; HTTPException → wrapped; Exception → 500 INTERNAL_ERROR (traceback logged server-side, NEVER leaked). Per-request correlation-id middleware.
+- scripts/ (2 files): download_models.py (BAAI/bge-m3 + optional BAAI/bge-reranker-base via huggingface_hub snapshot_download, idempotent); init_neo4j.py (runs all schema Cypher, prints per-statement status table, idempotent).
+- requirements.txt (fastapi, uvicorn[standard], pydantic, pydantic-settings, neo4j>=5.20, redis, rq, sentence-transformers, transformers, torch, numpy, python-multipart, httpx, tenacity, structlog, huggingface-hub — pinned to versions matching Dockerfile.backend fallback). pyproject.toml (project name rag-lab-backend, python >=3.12, ruff config). README.md (full runbook + module-boundaries table + construction notes #1/#2/#5 with code excerpts + REST contract table + env vars + pipeline diagrams).
+- tests/__init__.py only (no test code per project rules).
+
+Validation (sandbox — no GPU/Neo4j/Redis, but Python 3.12 available):
+- `python3 -m compileall app scripts` → all files compile clean.
+- Imported schemas.ingest then schemas.search — cross-module forward ref Optional[SearchResponse] resolves correctly after model_rebuild(_types_namespace={"SearchResponse": SearchResponse}).
+- Built a SearchResponse nested in JobStatusResponse, round-tripped via model_dump_json() + json.loads() — confirmed result.searchId + result.metadata.bestAlpha deserialize correctly.
+- Ran chunking module on sample markdown — Recursive/Semantic/Structure-Aware produce correct boundaries; Structure-Aware tracks heading paths ("Section 2 > Subsection 2.1"); empty/whitespace inputs return 0 chunks.
+- Ran retrieval fusion helpers directly (bypassed Neo4j): _min_max_normalize handles edge cases; _apply_fusion(alpha=0.7) picks high-vector candidate as top-1; _apply_fusion(alpha=0.2) picks high-bm25 candidate as top-1; _adaptive_fuse returns best alpha; _rrf_fuse returns valid scores.
+- Tested ProgressTracker in-memory fallback: create_job → mark_running → append_event (with ChunkMetadata) → mark_completed → mark_failed all work; JobNotFoundError raised for unknown job ids (code=JOB_NOT_FOUND, status=404).
+- create_app() → 21 routes match spec EXACTLY (20 under /api/v1 + /health).
+- FastAPI TestClient smoke test: GET /health → 200 {"status":"ok"} ✓; GET /api/v1/experiments/{nonexistent} → 500 NEO4J_ERROR (Neo4j not running — expected; error contract {error:{code,message,details}} correct) ✓; POST /api/v1/experiments (empty body) → 422 VALIDATION_ERROR with details.errors ✓; POST /api/v1/experiments (invalid enum) → 422 VALIDATION_ERROR with enum constraint ✓; GET /api/v1/jobs/{nonexistent} → 404 JOB_NOT_FOUND (in-memory fallback tracker works) ✓; POST /api/v1/search (hybridAlpha=1.5) → 422 VALIDATION_ERROR with le=1.0 ✓.
+- Verified all response shapes match src/lib/api-client.ts exactly (DocumentCreatedResponse={id}, StartIngestResponse={jobId,experimentId,status}, StartSearchResponse={jobId,searchId,status}, memories.create={id}, memory-carts.create={id}, documents.delete={deleted,count}, experiments/[id]/chunks={items,total}, seed={created,skipped,createdIds}, memory-carts.list={items,total}).
+
+Stage Summary:
+- Complete FastAPI backend delivered — 50 files matching backend-directory-structure_v1.1.md EXACTLY. Directory tree verified via `find`.
+- Construction note #1 (float32 cast): implemented in services/embedding.py embed_batch() with clear comment. Applied on every encode path (GPU and CPU).
+- Construction note #2 (adaptive α/β sweep): implemented in services/retrieval.py — _apply_fusion (manual alpha*vector+beta*bm25, beta=1-alpha) + _adaptive_fuse (sweeps alpha 0.1-0.9, picks alpha whose TOP-1 fused score is highest, returns bestAlpha). RRF as documented alternative.
+- User requirement #5 (ChildChunk ingest refinement): implemented in services/orchestrator.py ingest_child_chunk() — FIRST embeds full doc with LongText (parent :Knowledge context vector, embedding_method="LongText"), THEN chunks, THEN embeds each child chunk (embedding_method="ChildChunk"), persists BOTH parent + child vectors via (:Knowledge)-[:HAS_CHUNK]->(:KnowledgeChunk). ExperimentRun.embedding_approach="ChildChunk" but parent long-text embedding always present. Explicit comments + docstring.
+- Strict module boundaries (Backend §2) preserved: ChunkingModule (pure boundaries), EmbeddingModule (vectors only), RetrievalModule (scores only), PipelineOrchestrator (coordination+metadata+transactions+lifecycle), MetadataService (pure factories), Neo4jClient (typed CRUD only). Verified by reading each module's imports.
+- REST contract mirrors src/lib/rag/types.ts + src/lib/api-client.ts EXACTLY — Next.js proxy + frontend work unchanged. All 20 endpoints under /api/v1 + /health. Error contract {error:{code,message,details?}} enforced by global handler.
+- Neo4j schema per neo4j-schema-v1.1.md (+ v1.2 extensions documented inline). 7 uniqueness constraints + 3 vector indexes (1024-dim cosine) + 3 fulltext indexes. Idempotent (IF NOT EXISTS).
+- Error handling per error-handling-retry-strategy_v1.1.md — exception hierarchy + global handler + structured logging with experiment_id/stage/error_code/retry_count. Stack traces NEVER leaked.
+- Decisions: (1) Upload-time documents stored as :Knowledge with embedding_method="Upload" + vector=None (HNSW skips null-vector nodes) — avoids introducing a :Document label not in spec. (2) dashboard_stats.documents counts DISTINCT source_files. (3) ProgressTracker has in-memory fallback for dev without Redis. (4) Cross-module Pydantic forward ref resolved via explicit _types_namespace. (5) CORS allows all origins by default for dev. (6) BGE-M3 preloaded at startup (best-effort).
+- Backend will NOT run in sandbox (no Python FastAPI runtime / Neo4j / Redis / GPU) — expected per user's "even the sandbox cannot simulate" note. Code is production-ready Python that runs in Docker on Windows Server per directive. Next.js BACKEND_URL env (when set) proxies all /api/v1/* to this backend; when unset, proxy returns 503 BACKEND_UNAVAILABLE.
+
+---
+Task ID: 9+10
+Agent: CTO (main)
+Task: v1.2 pivot — remove sandbox stack, build FastAPI+Neo4j+Docker, refactor frontend, write z.ai-changes-v1.2.md, verify
+
+Work Log:
+- Removed Prisma/SQLite/z-ai-web-dev-sdk: deleted db/, prisma/, src/lib/db.ts, src/lib/rag/{store,orchestrator,retrieval,jobs,embedding,bm25}.ts; updated package.json (removed @prisma/client, prisma, z-ai-web-dev-sdk; added neo4j-driver); bun install clean.
+- Refactored ALL Next.js /api/v1/* routes → thin proxies to BACKEND_URL (FastAPI) via new src/lib/rag/backend-client.ts (proxyToBackend + backendHealth + isBackendConfigured). Graceful 503 BACKEND_UNAVAILABLE/BACKEND_UNREACHABLE when backend down.
+- Added src/lib/rag/neo4j.ts (neo4j-driver singleton + verifyConnectivity + readQuery/writeQuery).
+- Added new routes: GET /api/v1/neo4j/health, POST /api/v1/neo4j/init (runs all constraints + vector indexes 1024-dim cosine + fulltext per neo4j-schema-v1.1.md).
+- Refactored /api/v1/dashboard to report backend + Neo4j health (health field) + proxy stats when backend online.
+- Delegated (3 parallel subagents):
+  • Task 2: FastAPI backend (/backend, Python 3.12) — full implementation: core/config/exceptions/logging/constants, api/v1 (all 10 routers), schemas (Pydantic v2 mirroring TS types), services (orchestrator/chunking/embedding-BGE-M3/retrieval/metadata with STRICT module boundaries), db/neo4j_client + vector_index, workers/tasks+progress, scripts/download_models + init_neo4j, requirements.txt, pyproject.toml, README. Construction note #1 (.cpu().to(float32).numpy()) + #2 (adaptive alpha/beta sweep 0.1-0.9) + ChildChunk=LongText parent + child chunks all verified. python3 -m compileall clean. 21 routes match spec.
+  • Task 3: Docker setup (/docker) — multi-stage Dockerfile.backend (model-downloader → nvidia/cuda:12.4.1-runtime + Python 3.12) + Dockerfile.frontend (builder → runner standalone), docker-compose.yml (neo4j 5.20 + redis 7 + backend + api-worker + frontend, GPU passthrough, healthchecks), .env.example, README with Windows Server notes + one-command setup. Root docker-compose.yml thin include wrapper. .dockerignore (root + backend).
+  • Task 7+8: Frontend refinements — Experiments view MD editor (@mdxeditor/editor with raw/rendered toggle + save-as-new-doc), Memory Cart larger inspection area (260px sidebar + dominant pane + resizable split + keyboard nav), Dashboard backend+Neo4j health cards + offline banner + Init Neo4j button, shared BackendOffline component across all 5 views, api-client isBackendOffline helper, markdown-editor shared component, .md-prose CSS.
+- Verified: bun run lint 0 errors; bunx tsc --noEmit 0 errors (RAG code); python3 -m compileall backend clean; dev server GET / 200; agent-browser confirms Dashboard renders offline banner + health cards, all views show BackendOffline gracefully, no console errors, no crashes.
+- Wrote /upload/z.ai-changes-v1.2.md documenting all 9 changes + architecture + file structure + Docker setup + offline behavior + scope guardrail.
+
+Stage Summary:
+- v1.2 PIVOT COMPLETE. Real directive stack (FastAPI + Neo4j + Redis + Docker + BGE-M3) implemented. Sandbox-adapted stack (Prisma/SQLite/z-ai-sdk) fully removed.
+- The Next.js app is now a thin proxy + frontend; all RAG logic lives in the FastAPI backend (Python). Docker stack enables one-command Windows Server deployment.
+- The sandbox cannot run Neo4j/FastAPI/GPU (accepted) — the frontend renders gracefully with clear offline states + health cards. The code is correct for the real stack.
+- Construction notes #1 (float32 cast) + #2 (adaptive alpha/beta sweep) implemented in the FastAPI backend. ChildChunk = LongText parent + child chunks (user requirement #5) explicit.
+- MD editor (requirement #6) + larger Memory Cart (requirement #7) delivered. Sandbox cache (requirement #8) removed.
+- z.ai-changes-v1.2.md written to /upload (requirement: "update the /upload to add z.ai-changes-v1.2.md").
+- v1 Scope Guardrail preserved: NO Late/Agentic Chunking, NO Structured Chat, NO GraphRAG, NO multi-user.

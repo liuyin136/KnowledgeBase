@@ -1,13 +1,15 @@
 # =============================================================================
-# Root docker-compose.yml — Local-First RAG Experimentation Platform v1.2
+# Root docker-compose.yml — Local-First RAG Experimentation Platform v1.3
 #
 # Thin wrapper so `docker compose <cmd>` (run from the project root) works
 # without having to pass `-f docker/docker-compose.yml` every time.
 #
-# The real stack lives at docker/docker-compose.yml (per task spec — preferred
-# layout). This file just includes it via Compose v2's `include:` directive.
+# The real stack lives at docker/docker-compose.yml. This file includes it via
+# Compose v2's `include:` directive. Relative paths inside the included file
+# (build contexts, dockerfile paths) resolve relative to docker/ — so
+# `context: ../backend` → <root>/backend and `context: ..` → <root>.
 #
-# Usage:
+# Usage (from project root):
 #   docker compose build
 #   docker compose run --rm backend python scripts/download_models.py
 #   docker compose run --rm backend python scripts/init_neo4j.py

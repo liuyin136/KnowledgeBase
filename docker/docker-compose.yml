@@ -1,14 +1,8 @@
 # =============================================================================
-# docker-compose.yml — Local-First RAG Experimentation Platform v1.2
-# Per infrastructure-environment-spec_v1.1.md §3
+# docker-compose.yml — Local-First RAG Experimentation Platform v1.3
+# Per infrastructure-environment-spec_v1.1.md §3 (updated for v1.3 Jina models)
 #
-# Usage (from project root):
-#   docker compose -f docker/docker-compose.yml build
-#   docker compose -f docker/docker-compose.yml run --rm backend python scripts/download_models.py
-#   docker compose -f docker/docker-compose.yml run --rm backend python scripts/init_neo4j.py
-#   docker compose -f docker/docker-compose.yml up -d
-#
-# Or, via the thin root docker-compose.yml that includes this file:
+# Usage (from project root, via the thin root docker-compose.yml include):
 #   docker compose build
 #   docker compose run --rm backend python scripts/download_models.py
 #   docker compose run --rm backend python scripts/init_neo4j.py
@@ -73,7 +67,8 @@ services:
       context: ../backend
       dockerfile: ../docker/Dockerfile.backend
       args:
-        DOWNLOAD_RERANKER: ${DOWNLOAD_RERANKER:-1}
+        # v1.3: download Jina (default) + optionally BGE for the Settings toggle.
+        DOWNLOAD_BGE: ${DOWNLOAD_BGE:-0}
     container_name: raglab-backend
     ports:
       - "8000:8000"
@@ -87,8 +82,15 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       FRONTEND_ORIGIN: "*"
       EMBEDDING_DIM: "1024"
-      EMBEDDING_MODEL: BAAI/bge-m3
+      # v1.3: default embedding is Jina v5 small (BGE-M3 remains available as a toggle).
+      # To switch: set EMBEDDING_MODEL=bge-m3 + RERANKER_MODEL=bge-reranker-base,
+      # then `docker compose up -d --force-recreate backend api-worker`, then re-ingest.
+      EMBEDDING_MODEL: jina-v5-small
+      RERANKER_MODEL: jina-v3
       PYTHONUNBUFFERED: "1"
+      # v1.3: PYTHONPATH=/app so `docker compose exec backend python scripts/...`
+      # works without extra env (scripts/ imports from app.*).
+      PYTHONPATH: /app
     depends_on:
       neo4j:
         condition: service_healthy
@@ -119,7 +121,7 @@ services:
       context: ../backend
       dockerfile: ../docker/Dockerfile.backend
       args:
-        DOWNLOAD_RERANKER: ${DOWNLOAD_RERANKER:-1}
+        DOWNLOAD_BGE: ${DOWNLOAD_BGE:-0}
     container_name: raglab-api-worker
     command: ["python", "-m", "app.workers.worker"]
     environment:
@@ -132,8 +134,11 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       FRONTEND_ORIGIN: "*"
       EMBEDDING_DIM: "1024"
-      EMBEDDING_MODEL: BAAI/bge-m3
+      # v1.3: must mirror the backend service so the worker uses the same model.
+      EMBEDDING_MODEL: jina-v5-small
+      RERANKER_MODEL: jina-v3
       PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /app
       # Worker-specific tuning
       RQ_QUEUE_NAME: default
       WORKER_CONCURRENCY: "1"   # BGE-M3 + 8 GB VRAM = 1 concurrent job

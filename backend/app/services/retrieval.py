@@ -336,10 +336,17 @@ class RetrievalModule:
             scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
         return scores
 
-    # ─── Cross-encoder reranker (optional) ──────────────────────────────────
+    # ─── Cross-encoder reranker (optional — Jina v3 default + BGE-reranker-base toggle) ──
 
     def _ensure_reranker(self) -> bool:
-        """Lazy-load BGE-reranker-base. Returns True if available."""
+        """Lazy-load the configured cross-encoder reranker. Returns True if available.
+
+        v1.3 model migration: the reranker is selected via `settings.reranker_model`
+        ("jina-v3" default | "bge-reranker-base"). Both work with the sentence-
+        transformers `CrossEncoder` API; the only differences are the model
+        repo + `max_length` (Jina v3 supports 8192, BGE-reranker-base supports 512).
+        `CrossEncoder.predict()` is identical for both, so `_rerank` is unchanged.
+        """
         from app.core.config import settings
 
         if not settings.enable_reranker:
@@ -354,18 +361,37 @@ class RetrievalModule:
                 from sentence_transformers import CrossEncoder  # local import
 
                 local_path = os.path.join(settings.model_path, settings.reranker_model_name)
-                model_src = local_path if os.path.isdir(local_path) else settings.bge_reranker_repo
-                self._reranker = CrossEncoder(model_src, device=settings.device, max_length=512)
+                model_src = local_path if os.path.isdir(local_path) else settings.reranker_repo
+                # Jina Reranker v3 ships a custom modeling file → trust_remote_code.
+                # max_length differs per model: 8192 for Jina v3 (long context),
+                # 512 for BGE-reranker-base. Both come from settings.reranker_max_length.
+                trust_remote = settings.reranker_model == "jina-v3"
+                self._reranker = CrossEncoder(
+                    model_src,
+                    device=settings.device,
+                    max_length=settings.reranker_max_length,
+                    trust_remote_code=trust_remote,
+                )
                 logger.info(
                     "reranker.load.ok",
-                    extra={"event": "reranker.load.ok", "model_src": model_src, "device": settings.device},
+                    extra={
+                        "event": "reranker.load.ok",
+                        "model_id": settings.reranker_model,
+                        "model_src": model_src,
+                        "device": settings.device,
+                        "max_length": settings.reranker_max_length,
+                    },
                 )
                 return True
             except Exception as exc:
                 self._reranker_load_error = str(exc)
                 logger.warning(
                     "reranker.load.failed",
-                    extra={"event": "reranker.load.failed", "error": str(exc)},
+                    extra={
+                        "event": "reranker.load.failed",
+                        "model_id": settings.reranker_model,
+                        "error": str(exc),
+                    },
                 )
                 return False
 

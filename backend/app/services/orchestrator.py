@@ -167,9 +167,12 @@ class PipelineOrchestrator:
                             message=f"Embedding window {i + 1}/{total}",
                         )
                     )
-                # Embed (with retry)
+                # Embed (with retry). Documents/passages → is_query=False (Jina
+                # v5 task="retrieval.passages"; BGE-M3 ignores the flag).
                 vector, embed_ms = timed_sync(
-                    lambda b=b: self._embedder.embed_with_retry(b.text, experiment_id=experiment_id)
+                    lambda b=b: self._embedder.embed_with_retry(
+                        b.text, experiment_id=experiment_id, is_query=False
+                    )
                 )
                 # Persist
                 if progress:
@@ -352,6 +355,8 @@ class PipelineOrchestrator:
 
         try:
             # ─── STEP 1: LongText parent embedding (the context vector) ──────
+            # The parent is the FULL document treated as a PASSAGE → is_query=False
+            # (Jina v5 task="retrieval.passages"; BGE-M3 ignores the flag).
             if progress:
                 progress(
                     IngestProgressEvent(
@@ -364,7 +369,9 @@ class PipelineOrchestrator:
                     )
                 )
             parent_vector, parent_embed_ms = timed_sync(
-                lambda: self._embedder.embed_with_retry(text, experiment_id=experiment_id)
+                lambda: self._embedder.embed_with_retry(
+                    text, experiment_id=experiment_id, is_query=False
+                )
             )
             parent_id = str(uuid.uuid4())
             parent = Knowledge(
@@ -428,8 +435,12 @@ class PipelineOrchestrator:
                             message=f"Embedding child chunk {i + 1}/{total}",
                         )
                     )
+                # Embed each child chunk as a PASSAGE → is_query=False (Jina v5
+                # task="retrieval.passages"; BGE-M3 ignores the flag).
                 child_vector, child_embed_ms = timed_sync(
-                    lambda b=b: self._embedder.embed_with_retry(b.text, experiment_id=experiment_id)
+                    lambda b=b: self._embedder.embed_with_retry(
+                        b.text, experiment_id=experiment_id, is_query=False
+                    )
                 )
                 if progress:
                     progress(
@@ -611,7 +622,8 @@ class PipelineOrchestrator:
         )
 
         try:
-            # 1. Embed the query (LongText)
+            # 1. Embed the query as a SEARCH QUERY → is_query=True (Jina v5
+            #    task="retrieval.query"; BGE-M3 ignores the flag).
             if progress:
                 progress(
                     IngestProgressEvent(
@@ -620,7 +632,9 @@ class PipelineOrchestrator:
                     )
                 )
             query_vector, query_embed_ms = timed_sync(
-                lambda: self._embedder.embed_with_retry(raw_query, experiment_id=experiment_id)
+                lambda: self._embedder.embed_with_retry(
+                    raw_query, experiment_id=experiment_id, is_query=True
+                )
             )
             user_query_id = str(uuid.uuid4())
             user_query = UserQuery(

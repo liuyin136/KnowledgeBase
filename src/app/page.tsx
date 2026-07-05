@@ -7,6 +7,7 @@ import { IngestView } from "@/components/rag/views/ingest-view";
 import { SearchView } from "@/components/rag/views/search-view";
 import { MemoryView } from "@/components/rag/views/memory-view";
 import { ExperimentsView } from "@/components/rag/views/experiments-view";
+import { SettingsView } from "@/components/rag/views/settings-view";
 import { Suspense } from "react";
 
 export default function Home() {
@@ -25,14 +26,14 @@ export default function Home() {
               {view === "search" && <SearchView />}
               {view === "memory" && <MemoryView />}
               {view === "experiments" && <ExperimentsView />}
+              {view === "settings" && <SettingsView />}
             </Suspense>
           </main>
         </div>
       </div>
       <footer className="border-t bg-background px-4 py-2.5 text-[11px] text-muted-foreground flex items-center justify-between gap-4 mt-auto">
         <span>
-          RAG Lab v1 · Local-First · Embedding: <span className="font-mono">LocalHash-1024</span> (BGE-M3 drop-in
-          target) · Stack adapted from FastAPI/Neo4j/Redis spec → Next.js/Prisma/SQLite
+          RAG Lab v1.3 · Local-First · Embedding: <span className="font-mono">Jina v5 small</span> (default) · BGE-M3 toggle · Jina task-conditioned + Matryoshka 1024
         </span>
         <span className="hidden sm:inline">Standard paths only · 6-slice roadmap · Observability-first</span>
       </footer>

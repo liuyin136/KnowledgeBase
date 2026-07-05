@@ -1,0 +1,762 @@
+     1→"""
+     2→services/orchestrator.py — PipelineOrchestrator.
+     3→
+     4→STRICT MODULE BOUNDARY (Backend §2):
+     5→  • The orchestrator is the ONLY module that:
+     6→      - coordinates the pipeline (ChunkingModule → EmbeddingModule → Neo4jClient)
+     7→      - emits metadata (via MetadataService)
+     8→      - owns transactions + lifecycle (experiment status, progress events)
+     9→      - persists results (:Knowledge, :KnowledgeChunk, :UserQuery, :Memory)
+    10→  • It calls the three pure modules + MetadataService + Neo4jClient.
+    11→  • It NEVER scores (RetrievalModule does that) — but it DOES own the lifecycle
+    12→    of a search run (creates :UserQuery, calls RetrievalModule.hybrid_search,
+    13→    persists :Memory nodes, updates the :Experiment record).
+    14→
+    15→Two ingest pipelines:
+    16→  • ingest_long_text  — LongText embedding approach. The document is split into
+    17→    sliding-window chunks (LONGTEXT_WINDOW_TOKENS); each window is embedded with
+    18→    the LongText embedding and persisted as a :Knowledge node (no child chunks).
+    19→    All windows carry embedding_method="LongText".
+    20→  • ingest_child_chunk — ChildChunk embedding approach (USER REQUIREMENT #5):
+    21→      1. FIRST embed the FULL document with the LongText embedding → creates ONE
+    22→         :Knowledge parent node carrying the long-text vector (the CONTEXT vector).
+    23→         Parent's embedding_method="LongText".
+    24→      2. THEN chunk the document with the chosen ChildChunk method
+    25→         (Recursive / Semantic / Structure-Aware).
+    26→      3. THEN embed each child chunk with the ChildChunk embedding method.
+    27→      4. Persist BOTH the parent LongText vector AND the child chunk vectors
+    28→         (parent-child hierarchy via (:Knowledge)-[:HAS_CHUNK]->(:KnowledgeChunk)).
+    29→         Children's embedding_method="ChildChunk".
+    30→      5. The ExperimentRun records embedding_approach="ChildChunk" but the
+    31→         parent's long-text embedding is ALWAYS present (it's the context).
+    32→
+    33→One search pipeline:
+    34→  • run_search — creates :UserQuery (LongText embedding), runs RetrievalModule
+    35→    .hybrid_search, persists one :Memory per result, updates the :Experiment
+    36→    with search-specific observability fields (hybrid_alpha, use_bm25,
+    37→    use_reranker, top_k_vector, top_n_rerank, parent_context_levels,
+    38→    auto_tune_weights, best_alpha, raw_query).
+    39→"""
+    40→
+    41→from __future__ import annotations
+    42→
+    43→import time
+    44→import uuid
+    45→from datetime import datetime
+    46→from typing import Callable, List, Optional
+    47→
+    48→from app.core.constants import (
+    49→    EMBEDDING_METHOD_CHILDCHUNK,
+    50→    EMBEDDING_METHOD_LONGTEXT,
+    51→    ExperimentStatus,
+    52→)
+    53→from app.core.exceptions import IngestError, SearchError
+    54→from app.core.logging import get_logger, log_pipeline_event
+    55→from app.db.neo4j_client import Neo4jClient
+    56→from app.models.neo4j_models import (
+    57→    Experiment,
+    58→    Knowledge,
+    59→    KnowledgeChunk,
+    60→    Memory,
+    61→    UserQuery,
+    62→)
+    63→from app.schemas.experiment import ExperimentRunMetadata
+    64→from app.schemas.ingest import ChunkMetadata, IngestProgressEvent
+    65→from app.schemas.search import SearchConfig, SearchMetadata, SearchResponse, SearchResult
+    66→from app.services.chunking import ChunkBoundary, chunk_long_text, determine_boundaries
+    67→from app.services.embedding import EmbeddingModule
+    68→from app.services.metadata import (
+    69→    CreateChunkMetadataInput,
+    70→    CreateExperimentRunInput,
+    71→    aggregate_chunk_stats,
+    72→    create_chunk_metadata,
+    73→    create_experiment_run,
+    74→)
+    75→from app.services.retrieval import RetrievalModule
+    76→from app.utils.timing import now_ms, timed_sync
+    77→
+    78→logger = get_logger("rag.orchestrator")
+    79→
+    80→# Type alias for the progress callback the workers pass in.
+    81→ProgressCallback = Callable[[IngestProgressEvent], None]
+    82→
+    83→
+    84→class PipelineOrchestrator:
+    85→    """Owns pipeline coordination, transactions, and lifecycle."""
+    86→
+    87→    def __init__(
+    88→        self,
+    89→        neo4j: Neo4jClient,
+    90→        embedder: EmbeddingModule,
+    91→        retrieval: RetrievalModule,
+    92→    ) -> None:
+    93→        self._neo4j = neo4j
+    94→        self._embedder = embedder
+    95→        self._retrieval = retrieval
+    96→
+    97→    # ─── INGEST: LongText ───────────────────────────────────────────────────
+    98→
+    99→    async def ingest_long_text(
+   100→        self,
+   101→        *,
+   102→        experiment_id: str,
+   103→        source_file: str,
+   104→        text: str,
+   105→        description: str,
+   106→        progress: Optional[ProgressCallback] = None,
+   107→    ) -> ExperimentRunMetadata:
+   108→        """LongText ingest pipeline.
+   109→
+   110→        1. Split document into sliding windows (LONGTEXT_WINDOW_TOKENS, 10% overlap).
+   111→        2. For each window: embed (LongText) + persist as :Knowledge node.
+   112→        3. Emit per-window ChunkMetadata via the progress callback.
+   113→        4. Update the :Experiment record (total_chunks, avg_tokens, total_time, status).
+   114→        """
+   115→        t0 = now_ms()
+   116→        total_tokens = self._embedder.token_count(text)
+   117→
+   118→        # Create the experiment node (status=running).
+   119→        self._neo4j.create_experiment(
+   120→            Experiment(
+   121→                id=experiment_id,
+   122→                description=description,
+   123→                embedding_approach=EMBEDDING_METHOD_LONGTEXT,
+   124→                chunk_method=EMBEDDING_METHOD_LONGTEXT,  # LongText uses its own sliding window
+   125→                total_chunks=0,
+   126→                avg_tokens_per_chunk=0.0,
+   127→                total_time_ms=0.0,
+   128→                source_file=source_file,
+   129→                created_at=datetime.utcnow(),
+   130→                status=ExperimentStatus.RUNNING.value,
+   131→                kind="ingest",
+   132→            )
+   133→        )
+   134→        log_pipeline_event(
+   135→            logger,
+   136→            "ingest.long_text.start",
+   137→            f"LongText ingest started: {source_file} ({total_tokens} tokens)",
+   138→            experiment_id=experiment_id,
+   139→            source_file=source_file,
+   140→        )
+   141→
+   142→        try:
+   143→            # 1. Chunking (pure boundary detection — no embedding here)
+   144→            if progress:
+   145→                progress(IngestProgressEvent(index=0, total=0, progress=0.0, chunk=None, stage="chunking"))
+   146→            chunk_boundaries, chunking_ms = timed_sync(lambda: chunk_long_text(text))
+   147→            total = len(chunk_boundaries)
+   148→            if total == 0:
+   149→                raise IngestError(
+   150→                    "Document produced no chunks (empty text?)",
+   151→                    details={"source_file": source_file},
+   152→                    stage="chunking",
+   153→                    experiment_id=experiment_id,
+   154→                )
+   155→
+   156→            # 2. Embed each window (LongText) + persist as :Knowledge
+   157→            chunk_metas: List[ChunkMetadata] = []
+   158→            for i, b in enumerate(chunk_boundaries):
+   159→                if progress:
+   160→                    progress(
+   161→                        IngestProgressEvent(
+   162→                            index=i,
+   163→                            total=total,
+   164→                            progress=(i / total) * 100.0,
+   165→                            chunk=None,
+   166→                            stage="embedding",
+   167→                            message=f"Embedding window {i + 1}/{total}",
+   168→                        )
+   169→                    )
+   170→                # Embed (with retry). Documents/passages → is_query=False (Jina
+   171→                # v5 task="retrieval.passages"; BGE-M3 ignores the flag).
+   172→                vector, embed_ms = timed_sync(
+   173→                    lambda b=b: self._embedder.embed_with_retry(
+   174→                        b.text, experiment_id=experiment_id, is_query=False
+   175→                    )
+   176→                )
+   177→                # Persist
+   178→                if progress:
+   179→                    progress(
+   180→                        IngestProgressEvent(
+   181→                            index=i,
+   182→                            total=total,
+   183→                            progress=(i / total) * 100.0,
+   184→                            chunk=None,
+   185→                            stage="persisting",
+   186→                            message=f"Persisting window {i + 1}/{total}",
+   187→                        )
+   188→                    )
+   189→                knowledge_id = str(uuid.uuid4())
+   190→                knowledge = Knowledge(
+   191→                    id=knowledge_id,
+   192→                    source_file=source_file,
+   193→                    total_tokens=b.token_count,
+   194→                    embedding_method=EMBEDDING_METHOD_LONGTEXT,
+   195→                    created_at=datetime.utcnow(),
+   196→                    experiment_id=experiment_id,
+   197→                    vector=vector,
+   198→                    text=b.text,
+   199→                    chunk_index=b.index,
+   200→                    char_start=b.char_start,
+   201→                    char_end=b.char_end,
+   202→                )
+   203→                self._neo4j.create_knowledge(knowledge)
+   204→
+   205→                cm = create_chunk_metadata(
+   206→                    CreateChunkMetadataInput(
+   207→                        chunk_id=knowledge_id,
+   208→                        parent_doc_id=knowledge_id,  # LongText: window IS its own parent
+   209→                        experiment_id=experiment_id,
+   210→                        chunk_index=b.index,
+   211→                        chunk_method=EMBEDDING_METHOD_LONGTEXT,
+   212→                        embedding_method=EMBEDDING_METHOD_LONGTEXT,
+   213→                        token_count=b.token_count,
+   214→                        chunking_time_ms=chunking_ms / max(total, 1),  # amortized
+   215→                        embedding_time_ms=embed_ms,
+   216→                        char_start=b.char_start,
+   217→                        char_end=b.char_end,
+   218→                        text=b.text,
+   219→                    )
+   220→                )
+   221→                chunk_metas.append(cm)
+   222→                if progress:
+   223→                    progress(
+   224→                        IngestProgressEvent(
+   225→                            index=i + 1,
+   226→                            total=total,
+   227→                            progress=((i + 1) / total) * 100.0,
+   228→                            chunk=cm,
+   229→                            stage="embedding",
+   230→                            message=f"Window {i + 1}/{total} embedded",
+   231→                        )
+   232→                    )
+   233→
+   234→            # 3. Aggregate + update experiment
+   235→            stats = aggregate_chunk_stats(chunk_metas)
+   236→            total_ms = now_ms() - t0
+   237→            run = create_experiment_run(
+   238→                CreateExperimentRunInput(
+   239→                    experiment_id=experiment_id,
+   240→                    description=description,
+   241→                    embedding_approach=EMBEDDING_METHOD_LONGTEXT,
+   242→                    chunk_method=EMBEDDING_METHOD_LONGTEXT,
+   243→                    total_chunks=stats["totalChunks"],
+   244→                    avg_tokens_per_chunk=stats["avgTokens"],
+   245→                    total_time_ms=total_ms,
+   246→                    source_file=source_file,
+   247→                    status=ExperimentStatus.COMPLETED.value,
+   248→                )
+   249→            )
+   250→            self._neo4j.update_experiment_status(
+   251→                experiment_id,
+   252→                status=ExperimentStatus.COMPLETED.value,
+   253→                total_chunks=stats["totalChunks"],
+   254→                avg_tokens_per_chunk=stats["avgTokens"],
+   255→                total_time_ms=total_ms,
+   256→            )
+   257→            if progress:
+   258→                progress(
+   259→                    IngestProgressEvent(
+   260→                        index=total,
+   261→                        total=total,
+   262→                        progress=100.0,
+   263→                        chunk=None,
+   264→                        stage="done",
+   265→                        message=f"Ingested {total} windows",
+   266→                    )
+   267→                )
+   268→            log_pipeline_event(
+   269→                logger,
+   270→                "ingest.long_text.done",
+   271→                f"LongText ingest completed: {total} windows in {total_ms:.1f}ms",
+   272→                experiment_id=experiment_id,
+   273→                total_chunks=total,
+   274→                total_ms=total_ms,
+   275→            )
+   276→            return run
+   277→        except Exception as exc:
+   278→            # Mark experiment as failed + re-raise
+   279→            self._mark_experiment_failed(experiment_id, exc, t0)
+   280→            if progress:
+   281→                progress(
+   282→                    IngestProgressEvent(
+   283→                        index=0,
+   284→                        total=0,
+   285→                        progress=0.0,
+   286→                        chunk=None,
+   287→                        stage="error",
+   288→                        message=str(exc),
+   289→                    )
+   290→                )
+   291→            if isinstance(exc, (IngestError,)):
+   292→                raise
+   293→            raise IngestError(
+   294→                f"LongText ingest failed: {exc}",
+   295→                stage="ingest_long_text",
+   296→                experiment_id=experiment_id,
+   297→            ) from exc
+   298→
+   299→    # ─── INGEST: ChildChunk (USER REQUIREMENT #5) ───────────────────────────
+   300→
+   301→    async def ingest_child_chunk(
+   302→        self,
+   303→        *,
+   304→        experiment_id: str,
+   305→        source_file: str,
+   306→        text: str,
+   307→        chunk_method: str,
+   308→        description: str,
+   309→        progress: Optional[ProgressCallback] = None,
+   310→    ) -> ExperimentRunMetadata:
+   311→        """ChildChunk ingest pipeline (USER REQUIREMENT #5).
+   312→
+   313→        ChildChunk = LongText parent embedding + N child chunk embeddings.
+   314→
+   315→        Step 1: Embed the FULL document with the LongText embedding → create
+   316→                ONE :Knowledge parent node carrying the long-text vector (the
+   317→                CONTEXT vector). Parent's embedding_method="LongText".
+   318→        Step 2: Chunk the document (Recursive / Semantic / Structure-Aware).
+   319→        Step 3: Embed each child chunk with the ChildChunk embedding method.
+   320→        Step 4: Persist BOTH the parent LongText vector AND the child chunk
+   321→                vectors. Children's embedding_method="ChildChunk".
+   322→        Step 5: The ExperimentRun records embedding_approach="ChildChunk" but
+   323→                the parent's long-text embedding is ALWAYS present.
+   324→
+   325→        The parent LongText vector is the context; child vectors are the
+   326→        retrieval targets (the HNSW index on :KnowledgeChunk serves them).
+   327→        """
+   328→        t0 = now_ms()
+   329→        total_tokens = self._embedder.token_count(text)
+   330→
+   331→        # Create the experiment node (status=running, embedding_approach=ChildChunk).
+   332→        self._neo4j.create_experiment(
+   333→            Experiment(
+   334→                id=experiment_id,
+   335→                description=description,
+   336→                embedding_approach=EMBEDDING_METHOD_CHILDCHUNK,
+   337→                chunk_method=chunk_method,
+   338→                total_chunks=0,
+   339→                avg_tokens_per_chunk=0.0,
+   340→                total_time_ms=0.0,
+   341→                source_file=source_file,
+   342→                created_at=datetime.utcnow(),
+   343→                status=ExperimentStatus.RUNNING.value,
+   344→                kind="ingest",
+   345→            )
+   346→        )
+   347→        log_pipeline_event(
+   348→            logger,
+   349→            "ingest.child_chunk.start",
+   350→            f"ChildChunk ingest started: {source_file} ({total_tokens} tokens, method={chunk_method})",
+   351→            experiment_id=experiment_id,
+   352→            source_file=source_file,
+   353→            chunk_method=chunk_method,
+   354→        )
+   355→
+   356→        try:
+   357→            # ─── STEP 1: LongText parent embedding (the context vector) ──────
+   358→            # The parent is the FULL document treated as a PASSAGE → is_query=False
+   359→            # (Jina v5 task="retrieval.passages"; BGE-M3 ignores the flag).
+   360→            if progress:
+   361→                progress(
+   362→                    IngestProgressEvent(
+   363→                        index=0,
+   364→                        total=0,
+   365→                        progress=0.0,
+   366→                        chunk=None,
+   367→                        stage="embedding",
+   368→                        message="Embedding full document with LongText (parent context vector)",
+   369→                    )
+   370→                )
+   371→            parent_vector, parent_embed_ms = timed_sync(
+   372→                lambda: self._embedder.embed_with_retry(
+   373→                    text, experiment_id=experiment_id, is_query=False
+   374→                )
+   375→            )
+   376→            parent_id = str(uuid.uuid4())
+   377→            parent = Knowledge(
+   378→                id=parent_id,
+   379→                source_file=source_file,
+   380→                total_tokens=total_tokens,
+   381→                embedding_method=EMBEDDING_METHOD_LONGTEXT,  # ← parent ALWAYS LongText
+   382→                created_at=datetime.utcnow(),
+   383→                experiment_id=experiment_id,
+   384→                vector=parent_vector,
+   385→                text=text,  # ← full document text (context for retrieval)
+   386→                chunk_index=0,
+   387→                char_start=0,
+   388→                char_end=len(text),
+   389→            )
+   390→            self._neo4j.create_knowledge(parent)
+   391→            log_pipeline_event(
+   392→                logger,
+   393→                "ingest.child_chunk.parent_embedded",
+   394→                f"Parent LongText vector created (dim={len(parent_vector)})",
+   395→                experiment_id=experiment_id,
+   396→                parent_id=parent_id,
+   397→                embed_ms=parent_embed_ms,
+   398→            )
+   399→
+   400→            # ─── STEP 2: Chunk the document (Recursive / Semantic / Structure-Aware) ──
+   401→            if progress:
+   402→                progress(
+   403→                    IngestProgressEvent(
+   404→                        index=0,
+   405→                        total=0,
+   406→                        progress=0.0,
+   407→                        chunk=None,
+   408→                        stage="chunking",
+   409→                        message=f"Chunking with {chunk_method}",
+   410→                    )
+   411→                )
+   412→            chunk_boundaries, chunking_ms = timed_sync(
+   413→                lambda: determine_boundaries(text, chunk_method)
+   414→            )
+   415→            total = len(chunk_boundaries)
+   416→            if total == 0:
+   417→                raise IngestError(
+   418→                    "Document produced no child chunks (empty text?)",
+   419→                    details={"source_file": source_file, "chunk_method": chunk_method},
+   420→                    stage="chunking",
+   421→                    experiment_id=experiment_id,
+   422→                )
+   423→
+   424→            # ─── STEP 3 + 4: Embed each child chunk + persist with HAS_CHUNK edge ──
+   425→            chunk_metas: List[ChunkMetadata] = []
+   426→            for i, b in enumerate(chunk_boundaries):
+   427→                if progress:
+   428→                    progress(
+   429→                        IngestProgressEvent(
+   430→                            index=i,
+   431→                            total=total,
+   432→                            progress=(i / total) * 100.0,
+   433→                            chunk=None,
+   434→                            stage="embedding",
+   435→                            message=f"Embedding child chunk {i + 1}/{total}",
+   436→                        )
+   437→                    )
+   438→                # Embed each child chunk as a PASSAGE → is_query=False (Jina v5
+   439→                # task="retrieval.passages"; BGE-M3 ignores the flag).
+   440→                child_vector, child_embed_ms = timed_sync(
+   441→                    lambda b=b: self._embedder.embed_with_retry(
+   442→                        b.text, experiment_id=experiment_id, is_query=False
+   443→                    )
+   444→                )
+   445→                if progress:
+   446→                    progress(
+   447→                        IngestProgressEvent(
+   448→                            index=i,
+   449→                            total=total,
+   450→                            progress=(i / total) * 100.0,
+   451→                            chunk=None,
+   452→                            stage="persisting",
+   453→                            message=f"Persisting child chunk {i + 1}/{total}",
+   454→                        )
+   455→                    )
+   456→                chunk_id = str(uuid.uuid4())
+   457→                knowledge_chunk = KnowledgeChunk(
+   458→                    id=chunk_id,
+   459→                    parent_doc_id=parent_id,
+   460→                    chunk_index=b.index,
+   461→                    text=b.text,
+   462→                    token_count=b.token_count,
+   463→                    chunk_method=chunk_method,
+   464→                    chunking_time_ms=chunking_ms / max(total, 1),  # amortized across chunks
+   465→                    embedding_time_ms=child_embed_ms,
+   466→                    embedding_method=EMBEDDING_METHOD_CHILDCHUNK,  # ← children ALWAYS ChildChunk
+   467→                    vector=child_vector,
+   468→                    char_start=b.char_start,
+   469→                    char_end=b.char_end,
+   470→                    section=b.section,
+   471→                    experiment_id=experiment_id,
+   472→                )
+   473→                self._neo4j.create_chunk(knowledge_chunk, parent_knowledge_id=parent_id)
+   474→
+   475→                cm = create_chunk_metadata(
+   476→                    CreateChunkMetadataInput(
+   477→                        chunk_id=chunk_id,
+   478→                        parent_doc_id=parent_id,
+   479→                        experiment_id=experiment_id,
+   480→                        chunk_index=b.index,
+   481→                        chunk_method=chunk_method,
+   482→                        embedding_method=EMBEDDING_METHOD_CHILDCHUNK,
+   483→                        token_count=b.token_count,
+   484→                        chunking_time_ms=chunking_ms / max(total, 1),
+   485→                        embedding_time_ms=child_embed_ms,
+   486→                        char_start=b.char_start,
+   487→                        char_end=b.char_end,
+   488→                        section=b.section,
+   489→                        text=b.text,
+   490→                    )
+   491→                )
+   492→                chunk_metas.append(cm)
+   493→                if progress:
+   494→                    progress(
+   495→                        IngestProgressEvent(
+   496→                            index=i + 1,
+   497→                            total=total,
+   498→                            progress=((i + 1) / total) * 100.0,
+   499→                            chunk=cm,
+   500→                            stage="embedding",
+   501→                            message=f"Child chunk {i + 1}/{total} embedded",
+   502→                        )
+   503→                    )
+   504→
+   505→            # ─── STEP 5: Aggregate + update experiment ──────────────────────
+   506→            stats = aggregate_chunk_stats(chunk_metas)
+   507→            total_ms = now_ms() - t0
+   508→            run = create_experiment_run(
+   509→                CreateExperimentRunInput(
+   510→                    experiment_id=experiment_id,
+   511→                    description=description,
+   512→                    embedding_approach=EMBEDDING_METHOD_CHILDCHUNK,
+   513→                    chunk_method=chunk_method,
+   514→                    total_chunks=stats["totalChunks"],
+   515→                    avg_tokens_per_chunk=stats["avgTokens"],
+   516→                    total_time_ms=total_ms,
+   517→                    source_file=source_file,
+   518→                    status=ExperimentStatus.COMPLETED.value,
+   519→                )
+   520→            )
+   521→            self._neo4j.update_experiment_status(
+   522→                experiment_id,
+   523→                status=ExperimentStatus.COMPLETED.value,
+   524→                total_chunks=stats["totalChunks"],
+   525→                avg_tokens_per_chunk=stats["avgTokens"],
+   526→                total_time_ms=total_ms,
+   527→            )
+   528→            if progress:
+   529→                progress(
+   530→                    IngestProgressEvent(
+   531→                        index=total,
+   532→                        total=total,
+   533→                        progress=100.0,
+   534→                        chunk=None,
+   535→                        stage="done",
+   536→                        message=f"Ingested 1 parent + {total} child chunks",
+   537→                    )
+   538→                )
+   539→            log_pipeline_event(
+   540→                logger,
+   541→                "ingest.child_chunk.done",
+   542→                f"ChildChunk ingest completed: 1 parent (LongText) + {total} children in {total_ms:.1f}ms",
+   543→                experiment_id=experiment_id,
+   544→                total_chunks=total,
+   545→                parent_id=parent_id,
+   546→                total_ms=total_ms,
+   547→            )
+   548→            return run
+   549→        except Exception as exc:
+   550→            self._mark_experiment_failed(experiment_id, exc, t0)
+   551→            if progress:
+   552→                progress(
+   553→                    IngestProgressEvent(
+   554→                        index=0,
+   555→                        total=0,
+   556→                        progress=0.0,
+   557→                        chunk=None,
+   558→                        stage="error",
+   559→                        message=str(exc),
+   560→                    )
+   561→                )
+   562→            if isinstance(exc, (IngestError,)):
+   563→                raise
+   564→            raise IngestError(
+   565→                f"ChildChunk ingest failed: {exc}",
+   566→                stage="ingest_child_chunk",
+   567→                experiment_id=experiment_id,
+   568→            ) from exc
+   569→
+   570→    # ─── SEARCH ─────────────────────────────────────────────────────────────
+   571→
+   572→    async def run_search(
+   573→        self,
+   574→        *,
+   575→        search_id: str,
+   576→        experiment_id: str,
+   577→        raw_query: str,
+   578→        config: SearchConfig,
+   579→        progress: Optional[ProgressCallback] = None,
+   580→    ) -> SearchResponse:
+   581→        """Search pipeline.
+   582→
+   583→        1. Embed the query with LongText embedding → :UserQuery node.
+   584→        2. Call RetrievalModule.hybrid_search (vector + optional BM25 +
+   585→           manual/adaptive fusion + optional reranker) — scoring only.
+   586→        3. Persist one :Memory per result (links :UserQuery → :Memory → :KnowledgeChunk).
+   587→        4. Update the :Experiment record with search-specific observability fields.
+   588→        """
+   589→        t0 = now_ms()
+   590→
+   591→        # Create the experiment node (kind=search, status=running).
+   592→        self._neo4j.create_experiment(
+   593→            Experiment(
+   594→                id=experiment_id,
+   595→                description=f"Search: {raw_query[:120]}",
+   596→                embedding_approach="Search",
+   597→                chunk_method="N/A",
+   598→                total_chunks=0,
+   599→                avg_tokens_per_chunk=0.0,
+   600→                total_time_ms=0.0,
+   601→                source_file="",
+   602→                created_at=datetime.utcnow(),
+   603→                status=ExperimentStatus.RUNNING.value,
+   604→                kind="search",
+   605→                hybrid_alpha=config.hybridAlpha,
+   606→                use_bm25=config.useBm25,
+   607→                use_reranker=config.useReranker,
+   608→                top_k_vector=config.topKVector,
+   609→                top_n_rerank=config.topNRerank,
+   610→                parent_context_levels=config.parentContextLevels,
+   611→                auto_tune_weights=config.autoTuneWeights,
+   612→                raw_query=raw_query,
+   613→            )
+   614→        )
+   615→        log_pipeline_event(
+   616→            logger,
+   617→            "search.start",
+   618→            f"Search started: {raw_query[:80]}",
+   619→            experiment_id=experiment_id,
+   620→            search_id=search_id,
+   621→            config=config.model_dump(),
+   622→        )
+   623→
+   624→        try:
+   625→            # 1. Embed the query as a SEARCH QUERY → is_query=True (Jina v5
+   626→            #    task="retrieval.query"; BGE-M3 ignores the flag).
+   627→            if progress:
+   628→                progress(
+   629→                    IngestProgressEvent(
+   630→                        index=0, total=1, progress=0.0, chunk=None, stage="embedding",
+   631→                        message="Embedding query",
+   632→                    )
+   633→                )
+   634→            query_vector, query_embed_ms = timed_sync(
+   635→                lambda: self._embedder.embed_with_retry(
+   636→                    raw_query, experiment_id=experiment_id, is_query=True
+   637→                )
+   638→            )
+   639→            user_query_id = str(uuid.uuid4())
+   640→            user_query = UserQuery(
+   641→                id=user_query_id,
+   642→                text=raw_query,
+   643→                total_tokens=self._embedder.token_count(raw_query),
+   644→                embedding_method=EMBEDDING_METHOD_LONGTEXT,
+   645→                created_at=datetime.utcnow(),
+   646→                experiment_id=experiment_id,
+   647→                vector=query_vector,
+   648→            )
+   649→            self._neo4j.create_user_query(user_query)
+   650→
+   651→            # 2. Hybrid search (scoring only — RetrievalModule NEVER persists)
+   652→            results, metadata = self._retrieval.hybrid_search(
+   653→                query_text=raw_query,
+   654→                query_vector=query_vector,
+   655→                config=config,
+   656→                experiment_id=None,  # search across ALL experiments by default
+   657→            )
+   658→            # Fill in the orchestrator-owned fields:
+   659→            metadata.searchId = search_id
+   660→            metadata.experimentId = experiment_id
+   661→            metadata.queryEmbeddingTimeMs = round(query_embed_ms, 3)
+   662→            # Recompute total to include query embed time
+   663→            metadata.totalSearchTimeMs = round(now_ms() - t0, 3)
+   664→
+   665→            # 3. Persist :Memory for each result (orchestrator owns transactions)
+   666→            for r in results:
+   667→                memory = Memory(
+   668→                    id=str(uuid.uuid4()),
+   669→                    user_query_id=user_query_id,
+   670→                    timestamp=datetime.utcnow(),
+   671→                    success_score=None,
+   672→                    notes=None,
+   673→                    query_text=raw_query,
+   674→                    chunk_id=r.chunkId,
+   675→                    chunk_text=r.text,
+   676→                    score=r.finalScore,
+   677→                    vector_score=r.vectorScore,
+   678→                    bm25_score=r.bm25Score,
+   679→                    fused_score=r.fusedScore,
+   680→                    reranker_score=r.rerankerScore,
+   681→                    experiment_id=experiment_id,
+   682→                )
+   683→                self._neo4j.create_memory(memory)
+   684→
+   685→            # 4. Update experiment with search observability + status=completed
+   686→            total_ms = now_ms() - t0
+   687→            self._neo4j.update_experiment_status(
+   688→                experiment_id,
+   689→                status=ExperimentStatus.COMPLETED.value,
+   690→                total_chunks=len(results),
+   691→                avg_tokens_per_chunk=0.0,
+   692→                total_time_ms=total_ms,
+   693→                best_alpha=metadata.bestAlpha,
+   694→            )
+   695→
+   696→            if progress:
+   697→                progress(
+   698→                    IngestProgressEvent(
+   699→                        index=1,
+   700→                        total=1,
+   701→                        progress=100.0,
+   702→                        chunk=None,
+   703→                        stage="done",
+   704→                        message=f"Search completed: {len(results)} results",
+   705→                    )
+   706→                )
+   707→            log_pipeline_event(
+   708→                logger,
+   709→                "search.done",
+   710→                f"Search completed: {len(results)} results in {total_ms:.1f}ms",
+   711→                experiment_id=experiment_id,
+   712→                search_id=search_id,
+   713→                result_count=len(results),
+   714→                best_alpha=metadata.bestAlpha,
+   715→                total_ms=total_ms,
+   716→            )
+   717→            return SearchResponse(searchId=search_id, results=results, metadata=metadata)
+   718→        except Exception as exc:
+   719→            self._mark_experiment_failed(experiment_id, exc, t0)
+   720→            if progress:
+   721→                progress(
+   722→                    IngestProgressEvent(
+   723→                        index=0, total=0, progress=0.0, chunk=None, stage="error",
+   724→                        message=str(exc),
+   725→                    )
+   726→                )
+   727→            if isinstance(exc, (SearchError,)):
+   728→                raise
+   729→            raise SearchError(
+   730→                f"Search failed: {exc}",
+   731→                stage="search",
+   732→                experiment_id=experiment_id,
+   733→            ) from exc
+   734→
+   735→    # ─── internal ───────────────────────────────────────────────────────────
+   736→
+   737→    def _mark_experiment_failed(self, experiment_id: str, exc: Exception, t0: float) -> None:
+   738→        """Mark an experiment as failed + log the structured error event."""
+   739→        from app.core.exceptions import RAGBaseException
+   740→        from app.core.logging import log_pipeline_error
+   741→
+   742→        err_code = exc.code if isinstance(exc, RAGBaseException) else "INTERNAL_ERROR"
+   743→        err_msg = str(exc)[:2000]
+   744→        try:
+   745→            self._neo4j.update_experiment_status(
+   746→                experiment_id,
+   747→                status=ExperimentStatus.FAILED.value,
+   748→                total_time_ms=now_ms() - t0,
+   749→                error_code=err_code,
+   750→                error_message=err_msg,
+   751→            )
+   752→        except Exception:
+   753→            pass  # never mask the original error
+   754→        log_pipeline_error(
+   755→            logger,
+   756→            stage=getattr(exc, "stage", "unknown") or "unknown",
+   757→            error_code=err_code,
+   758→            error_message=err_msg,
+   759→            experiment_id=experiment_id,
+   760→            retry_count=getattr(exc, "retry_count", None),
+   761→        )
+   762→

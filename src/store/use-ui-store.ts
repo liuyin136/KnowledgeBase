@@ -5,7 +5,7 @@
  */
 import { create } from "zustand";
 
-export type ViewKey = "dashboard" | "ingest" | "search" | "memory" | "experiments";
+export type ViewKey = "dashboard" | "ingest" | "search" | "memory" | "experiments" | "settings";
 
 interface UIState {
   view: ViewKey;

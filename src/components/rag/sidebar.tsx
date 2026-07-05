@@ -11,6 +11,7 @@ import {
   Moon,
   Sun,
   Database,
+  Settings,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useEffect } from "react";
@@ -21,6 +22,7 @@ const NAV: { key: ViewKey; label: string; icon: React.ComponentType<{ className?
   { key: "search", label: "Hybrid Search", icon: Search, desc: "Tunable retrieval" },
   { key: "memory", label: "Memory Cart", icon: ShoppingCart, desc: "Curate retrieval results" },
   { key: "experiments", label: "Experiments", icon: FlaskConical, desc: "History & comparison" },
+  { key: "settings", label: "Settings", icon: Settings, desc: "Active models & how to switch" },
 ];
 
 export function Sidebar() {
@@ -77,7 +79,7 @@ export function Sidebar() {
           {theme === "dark" ? "Light mode" : "Dark mode"}
         </Button>
         <div className="px-3 py-1.5 text-[10px] text-muted-foreground/70 leading-relaxed">
-          Scope: standard paths only. No Late/Agentic chunking, no Structured Chat, no GraphRAG.
+          v1.3 · Jina v5 default + BGE-M3 toggle · Standard paths only. No Late/Agentic chunking, no Structured Chat, no GraphRAG.
         </div>
       </div>
     </aside>
