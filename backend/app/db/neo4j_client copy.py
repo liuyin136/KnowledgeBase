@@ -836,39 +836,33 @@ class Neo4jClient:
     # ─── Dashboard stats ────────────────────────────────────────────────────
 
     def dashboard_stats(self) -> Dict[str, Any]:
+        """Counts for the dashboard stat cards.
+
+        `documents` = count of DISTINCT source_files (matches the v1 sandbox
+        semantics where documents = unique uploaded files, not the number of
+        :Knowledge nodes which can be >1 per file for LongText multi-window).
+        """
         cypher = """
         MATCH (e:Experiment)
-        WITH 
-            count(e) AS total,
-            sum(CASE WHEN e.status = 'completed' THEN 1 ELSE 0 END) AS completed,
-            sum(CASE WHEN e.status = 'failed' THEN 1 ELSE 0 END) AS failed
-
-        OPTIONAL MATCH (k:Knowledge)
+        WITH count(e) AS total,
+             sum(CASE WHEN e.status = 'completed' THEN 1 ELSE 0 END) AS completed,
+             sum(CASE WHEN e.status = 'failed' THEN 1 ELSE 0 END) AS failed
+        MATCH (k:Knowledge)
         WITH total, completed, failed, count(DISTINCT k.source_file) AS documents
-
         OPTIONAL MATCH (c:KnowledgeChunk)
         WITH total, completed, failed, documents, count(c) AS chunks
-
         OPTIONAL MATCH (s:Experiment {kind: 'search'})
         WITH total, completed, failed, documents, chunks, count(s) AS searches
-
         OPTIONAL MATCH (m:Memory)
         WITH total, completed, failed, documents, chunks, searches, count(m) AS memories
-
         OPTIONAL MATCH (mc:MemoryCart)
-        WITH total, completed, failed, documents, chunks, searches, memories, count(mc) AS carts
-
         RETURN {
-            experiments: {
-                total: total,
-                completed: completed,
-                failed: failed
-            },
-            documents: documents,
-            chunks: chunks,
-            searches: searches,
-            memories: memories,
-            carts: carts
+          experiments: {total: total, completed: completed, failed: failed},
+          documents: documents,
+          chunks: chunks,
+          searches: searches,
+          memories: memories,
+          carts: count(mc)
         } AS stats
         """
         rows = self._run_read_with_retry(cypher, {})

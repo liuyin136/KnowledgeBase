@@ -58,7 +58,7 @@
 # -----------------------------------------------------------------------------
 # Stage 1 — model-downloader
 # -----------------------------------------------------------------------------
-FROM python:3.12-slim AS model-downloader
+FROM python:3.13-slim AS model-downloader
 
 # Build-time args.
 ARG DOWNLOAD_BGE=0
@@ -85,38 +85,14 @@ WORKDIR /app
 
 # Clean, single download script (v1.3 — Jina default + optional BGE).
 # Uses BuildKit cache mount on the HF cache dir so rebuilds skip re-downloading.
+COPY /scripts/download_models2.py ./
+RUN echo "=== Checking download_models.py ===" && \
+    ls -la /app/download_models2.py && \
+    echo "=== File content preview ===" && \
+    head -n 20 /app/download_models2.py
+
 RUN --mount=type=cache,target=/root/.cache/huggingface,sharing=locked \
-    set -euo pipefail; \
-    cat > /app/download_models.py <<'PY'
-import os
-from huggingface_hub import snapshot_download
-
-# v1.3 defaults: Jina v5 small (embedding) + Jina reranker v3.
-MODELS = [
-    "jinaai/jina-embeddings-v5-text-small",
-    "jinaai/jina-reranker-v3",
-]
-# Optional: also fetch BGE family so the Settings toggle can switch at runtime.
-if os.environ.get("DOWNLOAD_BGE", "0") == "1":
-    MODELS.extend(["BAAI/bge-m3", "BAAI/bge-reranker-base"])
-
-target_root = "/app/models"
-os.makedirs(target_root, exist_ok=True)
-
-for repo_id in MODELS:
-    local_name = repo_id.split("/")[-1]
-    dest = os.path.join(target_root, local_name)
-    print(f"[download] {repo_id} -> {dest}", flush=True)
-    snapshot_download(
-        repo_id=repo_id,
-        local_dir=dest,
-        # Skip optimizer states + ONNX variants to shave ~1.5 GB per model.
-        ignore_patterns=["*.msgpack", "*.h5", "rust_model.onnx", "onnx/*"],
-        resume_download=True,
-    )
-print("[download] done", flush=True)
-PY
-    DOWNLOAD_BGE=${DOWNLOAD_BGE} python /app/download_models.py
+    DOWNLOAD_BGE=${DOWNLOAD_BGE} python /app/download_models2.py
 
 # -----------------------------------------------------------------------------
 # Stage 2 — runtime
@@ -135,6 +111,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     CUDA_VISIBLE_DEVICES=0 \
     MODEL_PATH=/app/models \
     PYTHONPATH=/app \
@@ -150,26 +127,27 @@ RUN apt-get update \
         libgomp1 \
         libgl1 \
         libglib2.0-0 \
-        python3.12 \
-        python3.12-venv \
-        python3.12-dev \
-        python3.12-distutils \
-    && rm -rf /var/lib/apt/lists/* \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
-    && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 \
-    && curl -fsSLo /tmp/get-pip.py https://bootstrap.pypa.io/get-pip.py \
-    && python3 /tmp/get-pip.py \
-    && rm /tmp/get-pip.py \
-    && pip install --upgrade pip setuptools wheel
+        python3 \
+        python3-venv \
+        python3-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && update-alternatives --install /usr/bin/python python /usr/bin/python3 1 \
+ && curl -fsSLo /tmp/get-pip.py https://bootstrap.pypa.io/get-pip.py \
+ && python3 /tmp/get-pip.py \
+ && rm /tmp/get-pip.py \
+ && pip install --upgrade pip setuptools wheel
 
 WORKDIR /app
 
 # ---- Install Python deps (BuildKit pip cache mount) --------------------------
+# ---- 安裝 Python 依賴（使用清華鏡像加速） -----------------------------
 COPY requirements.txt ./
 
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    pip install -r requirements.txt
-
+    pip install -r requirements.txt \
+        --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+        --extra-index-url https://download.pytorch.org/whl/cu124
+        
 # ---- Copy models from stage 1 ------------------------------------------------
 COPY --from=model-downloader /app/models /app/models
 

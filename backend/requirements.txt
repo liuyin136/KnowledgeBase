@@ -10,20 +10,26 @@
 #  • neo4j>=5.20 is required for `CREATE VECTOR INDEX ... OPTIONS` + fulltext
 #    indexes (Neo4j 5.x vector support).
 
-fastapi==0.115.5
-uvicorn[standard]==0.32.1
-pydantic==2.10.3
-pydantic-settings==2.6.1
-neo4j==5.26.0
-redis==5.2.0
-rq==1.16.2
-sentence-transformers==3.3.1
-transformers==4.46.3
-torch==2.5.1
-numpy==1.26.4
-einops==0.8.0  # v1.3: required by some Jina model implementations (loading Jina v5 may fail without it)
-python-multipart==0.0.17
-httpx==0.28.1
-tenacity==9.0.0
-structlog==24.4.0
-huggingface-hub==0.26.5
+# Local-First RAG Experimentation Platform v1.3
+# Python 3.12 + CUDA 13.3 相容版本
+
+# backend/requirements.txt
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+neo4j
+redis
+rq
+sentence-transformers
+transformers
+torch
+torchvision
+torchaudio
+numpy
+einops
+python-multipart
+httpx
+tenacity
+structlog
+huggingface-hub
