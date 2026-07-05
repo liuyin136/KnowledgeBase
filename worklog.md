@@ -537,3 +537,26 @@ Stage Summary:
 - Docs: root README.md + docker/README.md (build/exec only, GPU+WSL2), upload/v1.3-powershell-commands.md, upload/v1.3-embedding-migration.md (4 code locations), upload/v1.3-docker-design-decision.md (ADR).
 - v1 Scope Guardrail preserved. Construction notes #1 (float32 cast) + #2 (adaptive alpha/beta sweep) preserved in backend.
 - Next: update cron job for v1.3.
+
+---
+
+## 2026-07-06: Context Optimization + Document-patch_v1.352 Focus (spec-driven)
+
+**Current active patch doc (Level-2 context — load this when working the 6 items):**
+`upload/Document-patch_v1.352.md`
+
+**Optimized context loading recipe (per context-engineering skill):**
+- Always: this worklog tail + upload/Document-patch_v1.352.md (full for overview; single item sections for task)
+- Per task:
+  - Fixes 4/5/6 (delete, dashboard/docs :Knowledge, ingest-docs flow): `backend/app/db/neo4j_client.py` (delete_document, list_documents, dashboard_stats, list_chunks_for_source_file), `backend/app/api/v1/documents.py` (delete + get_text + list), `src/components/rag/views/{ingest-view.tsx,documents-view.tsx,dashboard-view.tsx}` (queries + deleteMutation + invalidates)
+  - Items 1/2 (auto-instr + context prop): `backend/app/core/logging.py`, `backend/app/main.py`, `backend/app/workers/tasks.py`, `backend/app/api/v1/ingest.py`, `src/lib/api-client.ts`
+  - Item 3 (Log page + :Log): above + new `backend/app/api/v1/logs.py` (plan), models, frontend view + sidebar
+- Relevant historical: `upload/experiment-remove_v1.35.md` (source of current :Knowledge + no-Experiment model)
+- Key patterns: source_file as document key; embedding_method filter for Upload vs LongText; contextvars bind+reset; log_pipeline_event; TanStack invalidate(["documents","dashboard"])
+- Trust: source in backend/ + src/ ; verify Cypher + query responses manually.
+- Anti-flood: Never load entire orchestrator or all views unless changing cross-cutting.
+
+**Action taken:** Created the v1.352 patch spec in AI-easy format (spec + ADR + review draft + skills map) per invoked commands.
+
+**Next for implementer:** `/planning-and-task-breakdown` on the 6 items (or directly incremental slices after human review of this patch doc).
+
