@@ -20,6 +20,12 @@ export function isBackendConfigured(): boolean {
  * Proxy a request to the FastAPI backend, forwarding method/body/query.
  * Returns the backend's JSON response + status. If the backend is unreachable
  * or unconfigured, returns a standardized 503 error body.
+ *
+ * Multipart handling rule (critical for ingest page uploads):
+ *   - Detect content-type FIRST.
+ *   - Read via formData() for multipart (never call req.text() first on the same request).
+ *   - This fixes the body-already-consumed bug that caused 503 / validation errors
+ *     when the UI sent real FormData for .md files.
  */
 export async function proxyToBackend(
   req: NextRequest,
@@ -43,25 +49,32 @@ export async function proxyToBackend(
   const qs = opts?.forwardQuery === false ? "" : url.search;
   const target = `${BACKEND_URL}${path}${qs}`;
   try {
+    const ct = req.headers.get("content-type") || "";
+    const isMultipart = req.method === "POST" && ct.includes("multipart/form-data");
+
     const init: RequestInit = {
       method: opts?.method || req.method,
       headers: { "Content-Type": "application/json" },
     };
+
     if (opts?.body !== undefined) {
-      init.body = JSON.stringify(opts.body);
+      // Support explicitly passed FormData (defensive) or plain objects (JSON)
+      if (opts.body instanceof FormData) {
+        init.headers = {};
+        init.body = opts.body;
+      } else {
+        init.body = JSON.stringify(opts.body);
+      }
+    } else if (isMultipart) {
+      // IMPORTANT: detect + read multipart via formData BEFORE any text() consumption.
+      // req.text() would consume the stream and make formData() fail (or return empty).
+      const form = await req.formData();
+      init.headers = {}; // let fetch set the correct multipart boundary
+      init.body = form;
     } else if (req.method !== "GET" && req.method !== "DELETE") {
-      // Forward the incoming body for POST/PATCH/PUT
+      // Forward the incoming body for other POST/PATCH/PUT (JSON etc.)
       const text = await req.text();
       if (text) init.body = text;
-    }
-    // Forward multipart untouched
-    if (req.method === "POST") {
-      const ct = req.headers.get("content-type") || "";
-      if (ct.includes("multipart/form-data")) {
-        const form = await req.formData();
-        init.headers = {}; // let fetch set the multipart boundary
-        init.body = form;
-      }
     }
     const upstream = await fetch(target, init);
     const text = await upstream.text();

@@ -572,7 +572,7 @@ function ResultCard({
 
 export function SearchView() {
   const queryClient = useQueryClient();
-  const { activeExperimentId, setActiveExperiment } = useUIStore();
+  const { activeDocumentId, setActiveDocument } = useUIStore(); // repurposed for document-scoped search (ex-experiment)
 
   // ── Local state ──────────────────────────────────────────────────────────
   const [rawQuery, setRawQuery] = useState("");
@@ -589,10 +589,9 @@ export function SearchView() {
   const [historyOpen, setHistoryOpen] = useState(false);
 
   // ── Queries ──────────────────────────────────────────────────────────────
-  const experimentsQuery = useQuery({
-    queryKey: ["experiments", "ingest"],
-    queryFn: () =>
-      api.experiments.list({ page: 1, pageSize: 50, kind: "ingest" }),
+  const documentsQuery = useQuery({
+    queryKey: ["documents", "ingest-scope"],
+    queryFn: () => api.documents.list({ page: 1, pageSize: 50 }),
   });
 
   const historyQuery = useQuery({
@@ -641,7 +640,6 @@ export function SearchView() {
     mutationFn: (vars: {
       rawQuery: string;
       config: SearchConfig;
-      experimentId?: string;
     }) => api.search.start(vars),
     onSuccess: (data) => {
       setJobId(data.jobId);
@@ -662,7 +660,7 @@ export function SearchView() {
     startMutation.mutate({
       rawQuery: rawQuery.trim(),
       config,
-      experimentId: activeExperimentId ?? undefined,
+      // experimentId removed per redesign; scope now document-based in UI
     });
   };
 
@@ -682,11 +680,10 @@ export function SearchView() {
     };
     setRawQuery(run.rawQuery);
     setConfig(nextConfig);
-    setActiveExperiment(run.experimentId ?? null);
+    // experimentId (run tag) not used for scope; document scope is via activeDocumentId elsewhere
     startMutation.mutate({
       rawQuery: run.rawQuery,
       config: nextConfig,
-      experimentId: run.experimentId ?? undefined,
     });
   };
 
@@ -706,7 +703,6 @@ export function SearchView() {
       newCartName: string;
       existingCartId: string | null;
       selectedChunkIds: Set<string>;
-      experimentId?: string;
     }) => {
       // 1. Resolve cart id (create if "new")
       let cartId: string;
@@ -720,11 +716,10 @@ export function SearchView() {
         }
         cartId = vars.existingCartId;
       }
-      // 2. Fetch memories filtered by experimentId; match by chunkId
+      // 2. Fetch memories (no experimentId filter post-redesign); match by chunkId
       const memRes = await api.memories.list({
         page: 1,
         pageSize: 200,
-        experimentId: vars.experimentId,
       });
       const matched: string[] = [];
       for (const m of memRes.items as Memory[]) {
@@ -773,7 +768,6 @@ export function SearchView() {
       newCartName,
       existingCartId,
       selectedChunkIds,
-      experimentId: activeExperimentId ?? undefined,
     });
   };
 
@@ -891,42 +885,41 @@ export function SearchView() {
               />
               <div className="space-y-1.5">
                 <Label htmlFor="exp-select" className="text-xs text-muted-foreground">
-                  Experiment scope
+                  Document scope (source_file)
                 </Label>
                 <Select
-                  value={activeExperimentId ?? "__all__"}
+                  value={activeDocumentId ?? "__all__"}
                   onValueChange={(v) =>
-                    setActiveExperiment(v === "__all__" ? null : v)
+                    setActiveDocument(v === "__all__" ? null : v)
                   }
                 >
                   <SelectTrigger id="exp-select" className="w-full">
-                    <SelectValue placeholder="All experiments" />
+                    <SelectValue placeholder="All documents" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="__all__">All experiments</SelectItem>
-                    {experimentsQuery.isLoading && (
+                    <SelectItem value="__all__">All documents</SelectItem>
+                    {documentsQuery.isLoading && (
                       <SelectItem value="__loading" disabled>
                         Loading…
                       </SelectItem>
                     )}
-                    {(experimentsQuery.data?.items ?? []).map((exp: any) => (
-                      <SelectItem key={exp.id} value={exp.id}>
-                        {exp.description} ({exp.embeddingApproach}/
-                        {exp.chunkMethod})
+                    {(documentsQuery.data?.items ?? []).map((doc: any) => (
+                      <SelectItem key={doc.id} value={doc.id}>
+                        {doc.filename}
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
-                {experimentsQuery.isError && (
+                {documentsQuery.isError && (
                   isBackendOffline(experimentsQuery.error) ? (
                     <BackendOffline
                       compact
-                      onRetry={() => experimentsQuery.refetch()}
-                      message="Backend offline — experiment list unavailable."
+                      onRetry={() => documentsQuery.refetch()}
+                      message="Backend offline — document list unavailable."
                     />
                   ) : (
                     <p className="text-[11px] text-destructive">
-                      Failed to load experiments
+                      Failed to load documents
                     </p>
                   )
                 )}

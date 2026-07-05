@@ -5,7 +5,7 @@
  * Frontend_Workflow_Mapping v1.1 §3 (Dashboard).
  *
  * Server state: TanStack Query ("dashboard").
- * Local state: none beyond the seed mutation.
+ * Local state: none (seed functionality removed).
  */
 
 import * as React from "react";
@@ -50,7 +50,7 @@ import { toast } from "sonner";
 // ─── Types (typed inline since dashboard returns a loose shape) ─────────────
 
 interface DashboardStats {
-  experiments: { total: number; completed: number; failed: number };
+  // experiments stat removed (no :Experiment node)
   documents: number;
   chunks: number;
   searches: number;
@@ -58,17 +58,7 @@ interface DashboardStats {
   carts: number;
 }
 
-interface RecentExperiment {
-  id: string;
-  description: string;
-  embeddingApproach: string;
-  chunkMethod: string;
-  status: string;
-  totalChunks: number;
-  totalTimeMs: number;
-  sourceFile: string | null;
-  createdAt: string;
-}
+// RecentExperiment interface removed (no more experiment concept)
 
 interface RecentSearch {
   id: string;
@@ -83,7 +73,7 @@ interface RecentSearch {
 
 interface DashboardData {
   stats: DashboardStats;
-  recentExperiments: RecentExperiment[];
+  recentExperiments: any[]; // removed, kept for shape
   recentSearches: RecentSearch[];
   system: {
     embeddingModel: string;
@@ -152,7 +142,7 @@ function truncate(text: string, n: number): string {
 // ─── Stat card meta ─────────────────────────────────────────────────────────
 
 interface StatMeta {
-  key: keyof Omit<DashboardStats, "experiments"> | "experimentsTotal" | "experimentsCompleted" | "experimentsFailed";
+  key: keyof DashboardStats | "documentsTotal";
   label: string;
   icon: React.ComponentType<{ className?: string }>;
   subLabel: (s: DashboardStats) => string;
@@ -160,7 +150,7 @@ interface StatMeta {
 }
 
 const STAT_META: StatMeta[] = [
-  { key: "experimentsTotal", label: "Experiments", icon: FlaskConical, value: (s) => s.experiments.total, subLabel: (s) => `${s.experiments.completed} done · ${s.experiments.failed} failed` },
+  // experiments stat removed (no :Experiment node)
   { key: "documents", label: "Documents", icon: FileText, value: (s) => s.documents, subLabel: () => "uploaded source files" },
   { key: "chunks", label: "Chunks", icon: Boxes, value: (s) => s.chunks, subLabel: () => "embedded children" },
   { key: "searches", label: "Searches", icon: SearchIcon, value: (s) => s.searches, subLabel: () => "hybrid runs" },
@@ -171,34 +161,23 @@ const STAT_META: StatMeta[] = [
 const QUICK_START = [
   { key: "ingest", title: "Ingest", desc: "Upload a document, pick a chunking + embedding config, and watch per-chunk metadata stream in.", icon: Upload },
   { key: "search", title: "Hybrid Search", desc: "Run vector + BM25 retrieval with manual or adaptive alpha fusion and optional reranker.", icon: SearchIcon },
-  { key: "memory", title: "Memory Cart", desc: "Curate search hits into named carts for evaluation across experiments.", icon: ShoppingCart },
-  { key: "experiments", title: "Experiments", desc: "Inspect every ingest / search run with full observability metadata.", icon: FlaskConical },
+  { key: "memory", title: "Memory Cart", desc: "Curate search hits into named carts for evaluation across documents.", icon: ShoppingCart },
+  { key: "documents", title: "Documents", desc: "All uploaded, ingested & chunked files (from :Knowledge records).", icon: FileText },
 ] as const;
 
 // ─── Component ──────────────────────────────────────────────────────────────
 
 export function DashboardView() {
   const setView = useUIStore((s) => s.setView);
-  const setActiveExperiment = useUIStore((s) => s.setActiveExperiment);
+  const setActiveDocument = useUIStore((s) => s.setActiveDocument);
   const qc = useQueryClient();
 
   const { data, isLoading, isError, error, refetch } = useQuery<DashboardData>({
     queryKey: ["dashboard"],
     queryFn: api.dashboard,
   });
-
-  const seedMutation = useMutation({
-    mutationFn: api.seed,
-    onSuccess: (res) => {
-      toast.success(`Seeded ${res.created} sample document${res.created === 1 ? "" : "s"}${res.skipped.length ? ` · ${res.skipped.length} already existed` : ""}`);
-      qc.invalidateQueries({ queryKey: ["dashboard"] });
-      qc.invalidateQueries({ queryKey: ["documents"] });
-    },
-    onError: (err) => {
-      const msg = err instanceof APIError ? err.message : "Failed to seed sample documents";
-      toast.error(msg);
-    },
-  });
+  // observation (browser): what dashboard received from proxy (stats experiments/documents, from neo4j). ponytail: effect to avoid render spam
+  React.useEffect(() => { if (data && typeof window !== "undefined") console.debug("[obs:dashboard]", { stats: data.stats, health: data.health }); }, [data]);
 
   // POST /api/v1/neo4j/init — initialize the Neo4j schema (constraints +
   // vector + fulltext indexes). Idempotent. Only meaningful once Neo4j is up.
@@ -243,7 +222,6 @@ export function DashboardView() {
   const anyOffline = backendOffline || neo4jOffline;
   const isEmpty =
     !!stats &&
-    stats.experiments.total === 0 &&
     stats.documents === 0 &&
     stats.chunks === 0 &&
     stats.searches === 0 &&
@@ -269,16 +247,6 @@ export function DashboardView() {
               <RefreshCw className="h-3.5 w-3.5" />
               <span className="hidden sm:inline">Refresh</span>
             </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => seedMutation.mutate()}
-              disabled={seedMutation.isPending || anyOffline}
-              title={anyOffline ? "Backend offline — seeding unavailable" : "Seed sample documents"}
-            >
-              <Sparkles className="h-4 w-4" />
-              {seedMutation.isPending ? "Seeding…" : "Seed sample docs"}
-            </Button>
           </div>
         }
       />
@@ -295,7 +263,7 @@ export function DashboardView() {
                 Start the Docker stack (
                 <code className="font-mono text-xs">docker compose up -d</code>
                 ) to enable data operations. The UI is viewable but ingest /
-                search / experiments will return errors until both the FastAPI
+                search / documents will return errors until both the FastAPI
                 backend and Neo4j are healthy.
               </p>
               <div className="mt-3 flex flex-wrap gap-2">
@@ -383,14 +351,10 @@ export function DashboardView() {
               <div className="space-y-1">
                 <h2 className="text-lg font-semibold">Welcome to RAG Lab v1</h2>
                 <p className="text-sm text-muted-foreground max-w-md">
-                  Your local-first RAG experimentation platform is empty. Seed a few sample documents to explore ingest,
-                  hybrid search, and per-chunk observability in seconds.
+                  Your local-first RAG platform is empty. Go to the Ingest view to upload .md documents
+                  and start creating knowledge records.
                 </p>
               </div>
-              <Button onClick={() => seedMutation.mutate()} disabled={seedMutation.isPending}>
-                <Sparkles className="h-4 w-4" />
-                {seedMutation.isPending ? "Seeding…" : "Seed sample documents"}
-              </Button>
             </CardContent>
           </Card>
         )}
@@ -472,9 +436,9 @@ export function DashboardView() {
           <section aria-label="Recent experiments">
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-sm font-medium text-muted-foreground flex items-center gap-2">
-                <FlaskConical className="h-4 w-4" /> Recent Experiments
+                <FileText className="h-4 w-4" /> Recent Documents
               </h2>
-              <Button variant="ghost" size="sm" onClick={() => setView("experiments")}>
+              <Button variant="ghost" size="sm" onClick={() => setView("documents")}>
                 View all <ArrowRight className="h-3.5 w-3.5" />
               </Button>
             </div>
@@ -488,54 +452,12 @@ export function DashboardView() {
                   </div>
                 ) : (data?.recentExperiments.length ?? 0) === 0 ? (
                   <div className="p-6 text-center text-sm text-muted-foreground">
-                    No experiments yet. Start by <button className="text-primary hover:underline" onClick={() => setView("ingest")}>ingesting a document</button>.
+                    No documents yet. Start by <button className="text-primary hover:underline" onClick={() => setView("ingest")}>uploading in Ingest</button>.
                   </div>
                 ) : (
-                  <ul className="divide-y max-h-80 overflow-y-auto thin-scroll">
-                    {data!.recentExperiments.slice(0, 5).map((exp) => {
-                      const tone = statusTone(exp.status);
-                      return (
-                        <li key={exp.id}>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setActiveExperiment(exp.id);
-                              setView("experiments");
-                            }}
-                            className="w-full text-left px-4 py-3 hover:bg-accent/50 transition-colors flex items-center gap-3"
-                          >
-                            <div className="min-w-0 flex-1">
-                              <div className="text-sm font-medium truncate">{truncate(exp.description, 60)}</div>
-                              <div className="text-[11px] text-muted-foreground mt-0.5 flex items-center gap-2 flex-wrap">
-                                <span className="font-mono">{exp.embeddingApproach}</span>
-                                <span>·</span>
-                                <span>{exp.chunkMethod}</span>
-                                <span>·</span>
-                                <span>{exp.totalChunks} chunks</span>
-                                {exp.sourceFile && (
-                                  <>
-                                    <span>·</span>
-                                    <span className="truncate">{exp.sourceFile}</span>
-                                  </>
-                                )}
-                              </div>
-                            </div>
-                            <div className="flex flex-col items-end gap-1 shrink-0">
-                              <Badge variant="outline" className={tone.className}>
-                                {exp.status === "completed" && <CheckCircle2 className="h-3 w-3" />}
-                                {exp.status === "failed" && <XCircle className="h-3 w-3" />}
-                                {tone.label}
-                              </Badge>
-                              <span className="text-[10px] text-muted-foreground flex items-center gap-1">
-                                <Clock className="h-2.5 w-2.5" />
-                                {timeAgo(exp.createdAt)}
-                              </span>
-                            </div>
-                          </button>
-                        </li>
-                      );
-                    })}
-                  </ul>
+                  <div className="p-6 text-center text-sm text-muted-foreground">
+                    Recent documents now managed in Documents view.
+                  </div>
                 )}
               </CardContent>
             </Card>

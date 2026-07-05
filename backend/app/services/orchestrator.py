@@ -5,18 +5,18 @@ STRICT MODULE BOUNDARY (Backend §2):
   • The orchestrator is the ONLY module that:
       - coordinates the pipeline (ChunkingModule → EmbeddingModule → Neo4jClient)
       - emits metadata (via MetadataService)
-      - owns transactions + lifecycle (experiment status, progress events)
+      - owns transactions + lifecycle (progress events)
       - persists results (:Knowledge, :KnowledgeChunk, :UserQuery, :Memory)
   • It calls the three pure modules + MetadataService + Neo4jClient.
-  • It NEVER scores (RetrievalModule does that) — but it DOES own the lifecycle
+  • It NEVER scores (RetrievalModule does that) — it owns the lifecycle
     of a search run (creates :UserQuery, calls RetrievalModule.hybrid_search,
-    persists :Memory nodes, updates the :Experiment record).
+    persists :Memory nodes). No :Experiment nodes.
 
 Two ingest pipelines:
   • ingest_long_text  — LongText embedding approach. The document is split into
-    sliding-window chunks (LONGTEXT_WINDOW_TOKENS); each window is embedded with
-    the LongText embedding and persisted as a :Knowledge node (no child chunks).
-    All windows carry embedding_method="LongText".
+    sliding-window chunks (from settings.longtext_window_tokens, default 30000);
+    each window is embedded with the LongText embedding and persisted as a
+    :Knowledge node (no child chunks). All windows carry embedding_method="LongText".
   • ingest_child_chunk — ChildChunk embedding approach (USER REQUIREMENT #5):
       1. FIRST embed the FULL document with the LongText embedding → creates ONE
          :Knowledge parent node carrying the long-text vector (the CONTEXT vector).
@@ -32,10 +32,8 @@ Two ingest pipelines:
 
 One search pipeline:
   • run_search — creates :UserQuery (LongText embedding), runs RetrievalModule
-    .hybrid_search, persists one :Memory per result, updates the :Experiment
-    with search-specific observability fields (hybrid_alpha, use_bm25,
-    use_reranker, top_k_vector, top_n_rerank, parent_context_levels,
-    auto_tune_weights, best_alpha, raw_query).
+    .hybrid_search, persists one :Memory per result.
+    (Search-specific metadata lives in SearchMetadata; no :Experiment node.)
 """
 
 from __future__ import annotations
@@ -54,7 +52,6 @@ from app.core.exceptions import IngestError, SearchError
 from app.core.logging import get_logger, log_pipeline_event
 from app.db.neo4j_client import Neo4jClient
 from app.models.neo4j_models import (
-    Experiment,
     Knowledge,
     KnowledgeChunk,
     Memory,
@@ -107,30 +104,14 @@ class PipelineOrchestrator:
     ) -> ExperimentRunMetadata:
         """LongText ingest pipeline.
 
-        1. Split document into sliding windows (LONGTEXT_WINDOW_TOKENS, 10% overlap).
-        2. For each window: embed (LongText) + persist as :Knowledge node.
+        1. Split document into sliding windows (config longtext_window_tokens, 10% overlap).
+        2. For each window: embed (Jina v5: task="retrieval") + persist as :Knowledge node.
         3. Emit per-window ChunkMetadata via the progress callback.
-        4. Update the :Experiment record (total_chunks, avg_tokens, total_time, status).
+        4. Build run metadata (no :Experiment node).
         """
         t0 = now_ms()
         total_tokens = self._embedder.token_count(text)
 
-        # Create the experiment node (status=running).
-        self._neo4j.create_experiment(
-            Experiment(
-                id=experiment_id,
-                description=description,
-                embedding_approach=EMBEDDING_METHOD_LONGTEXT,
-                chunk_method=EMBEDDING_METHOD_LONGTEXT,  # LongText uses its own sliding window
-                total_chunks=0,
-                avg_tokens_per_chunk=0.0,
-                total_time_ms=0.0,
-                source_file=source_file,
-                created_at=datetime.utcnow(),
-                status=ExperimentStatus.RUNNING.value,
-                kind="ingest",
-            )
-        )
         log_pipeline_event(
             logger,
             "ingest.long_text.start",
@@ -167,11 +148,11 @@ class PipelineOrchestrator:
                             message=f"Embedding window {i + 1}/{total}",
                         )
                     )
-                # Embed (with retry). Documents/passages → is_query=False (Jina
-                # v5 task="retrieval.passages"; BGE-M3 ignores the flag).
+                # Embed (with retry). Documents/passages (ingestion).
+                # Jina v5 only: task="retrieval" (via SentenceTransformer)
                 vector, embed_ms = timed_sync(
                     lambda b=b: self._embedder.embed_with_retry(
-                        b.text, experiment_id=experiment_id, is_query=False
+                        b.text, is_query=False
                     )
                 )
                 # Persist
@@ -193,7 +174,6 @@ class PipelineOrchestrator:
                     total_tokens=b.token_count,
                     embedding_method=EMBEDDING_METHOD_LONGTEXT,
                     created_at=datetime.utcnow(),
-                    experiment_id=experiment_id,
                     vector=vector,
                     text=b.text,
                     chunk_index=b.index,
@@ -206,7 +186,6 @@ class PipelineOrchestrator:
                     CreateChunkMetadataInput(
                         chunk_id=knowledge_id,
                         parent_doc_id=knowledge_id,  # LongText: window IS its own parent
-                        experiment_id=experiment_id,
                         chunk_index=b.index,
                         chunk_method=EMBEDDING_METHOD_LONGTEXT,
                         embedding_method=EMBEDDING_METHOD_LONGTEXT,
@@ -231,7 +210,7 @@ class PipelineOrchestrator:
                         )
                     )
 
-            # 3. Aggregate + update experiment
+            # 3. Aggregate stats + build run metadata (no :Experiment node update)
             stats = aggregate_chunk_stats(chunk_metas)
             total_ms = now_ms() - t0
             run = create_experiment_run(
@@ -246,13 +225,6 @@ class PipelineOrchestrator:
                     source_file=source_file,
                     status=ExperimentStatus.COMPLETED.value,
                 )
-            )
-            self._neo4j.update_experiment_status(
-                experiment_id,
-                status=ExperimentStatus.COMPLETED.value,
-                total_chunks=stats["totalChunks"],
-                avg_tokens_per_chunk=stats["avgTokens"],
-                total_time_ms=total_ms,
             )
             if progress:
                 progress(
@@ -275,7 +247,7 @@ class PipelineOrchestrator:
             )
             return run
         except Exception as exc:
-            # Mark experiment as failed + re-raise
+            # Log failure (no :Experiment node)
             self._mark_experiment_failed(experiment_id, exc, t0)
             if progress:
                 progress(
@@ -328,22 +300,6 @@ class PipelineOrchestrator:
         t0 = now_ms()
         total_tokens = self._embedder.token_count(text)
 
-        # Create the experiment node (status=running, embedding_approach=ChildChunk).
-        self._neo4j.create_experiment(
-            Experiment(
-                id=experiment_id,
-                description=description,
-                embedding_approach=EMBEDDING_METHOD_CHILDCHUNK,
-                chunk_method=chunk_method,
-                total_chunks=0,
-                avg_tokens_per_chunk=0.0,
-                total_time_ms=0.0,
-                source_file=source_file,
-                created_at=datetime.utcnow(),
-                status=ExperimentStatus.RUNNING.value,
-                kind="ingest",
-            )
-        )
         log_pipeline_event(
             logger,
             "ingest.child_chunk.start",
@@ -355,8 +311,8 @@ class PipelineOrchestrator:
 
         try:
             # ─── STEP 1: LongText parent embedding (the context vector) ──────
-            # The parent is the FULL document treated as a PASSAGE → is_query=False
-            # (Jina v5 task="retrieval.passages"; BGE-M3 ignores the flag).
+            # The parent is the FULL document treated as a PASSAGE (ingestion).
+            # Uses Jina v5 encode: task="retrieval" (via SentenceTransformer)
             if progress:
                 progress(
                     IngestProgressEvent(
@@ -370,7 +326,7 @@ class PipelineOrchestrator:
                 )
             parent_vector, parent_embed_ms = timed_sync(
                 lambda: self._embedder.embed_with_retry(
-                    text, experiment_id=experiment_id, is_query=False
+                    text, is_query=False
                 )
             )
             parent_id = str(uuid.uuid4())
@@ -380,7 +336,6 @@ class PipelineOrchestrator:
                 total_tokens=total_tokens,
                 embedding_method=EMBEDDING_METHOD_LONGTEXT,  # ← parent ALWAYS LongText
                 created_at=datetime.utcnow(),
-                experiment_id=experiment_id,
                 vector=parent_vector,
                 text=text,  # ← full document text (context for retrieval)
                 chunk_index=0,
@@ -435,11 +390,11 @@ class PipelineOrchestrator:
                             message=f"Embedding child chunk {i + 1}/{total}",
                         )
                     )
-                # Embed each child chunk as a PASSAGE → is_query=False (Jina v5
-                # task="retrieval.passages"; BGE-M3 ignores the flag).
+                # Embed each child chunk as a PASSAGE (ingestion).
+                # Jina v5: task="retrieval" (via SentenceTransformer)
                 child_vector, child_embed_ms = timed_sync(
                     lambda b=b: self._embedder.embed_with_retry(
-                        b.text, experiment_id=experiment_id, is_query=False
+                        b.text, is_query=False
                     )
                 )
                 if progress:
@@ -468,7 +423,6 @@ class PipelineOrchestrator:
                     char_start=b.char_start,
                     char_end=b.char_end,
                     section=b.section,
-                    experiment_id=experiment_id,
                 )
                 self._neo4j.create_chunk(knowledge_chunk, parent_knowledge_id=parent_id)
 
@@ -476,7 +430,6 @@ class PipelineOrchestrator:
                     CreateChunkMetadataInput(
                         chunk_id=chunk_id,
                         parent_doc_id=parent_id,
-                        experiment_id=experiment_id,
                         chunk_index=b.index,
                         chunk_method=chunk_method,
                         embedding_method=EMBEDDING_METHOD_CHILDCHUNK,
@@ -502,7 +455,7 @@ class PipelineOrchestrator:
                         )
                     )
 
-            # ─── STEP 5: Aggregate + update experiment ──────────────────────
+            # ─── STEP 5: Aggregate stats + build run metadata (no :Experiment node) ─
             stats = aggregate_chunk_stats(chunk_metas)
             total_ms = now_ms() - t0
             run = create_experiment_run(
@@ -517,13 +470,6 @@ class PipelineOrchestrator:
                     source_file=source_file,
                     status=ExperimentStatus.COMPLETED.value,
                 )
-            )
-            self._neo4j.update_experiment_status(
-                experiment_id,
-                status=ExperimentStatus.COMPLETED.value,
-                total_chunks=stats["totalChunks"],
-                avg_tokens_per_chunk=stats["avgTokens"],
-                total_time_ms=total_ms,
             )
             if progress:
                 progress(
@@ -547,6 +493,7 @@ class PipelineOrchestrator:
             )
             return run
         except Exception as exc:
+            # Log failure (no :Experiment node)
             self._mark_experiment_failed(experiment_id, exc, t0)
             if progress:
                 progress(
@@ -584,34 +531,10 @@ class PipelineOrchestrator:
         2. Call RetrievalModule.hybrid_search (vector + optional BM25 +
            manual/adaptive fusion + optional reranker) — scoring only.
         3. Persist one :Memory per result (links :UserQuery → :Memory → :KnowledgeChunk).
-        4. Update the :Experiment record with search-specific observability fields.
+        4. (No :Experiment node update; search metadata returned to caller.)
         """
         t0 = now_ms()
 
-        # Create the experiment node (kind=search, status=running).
-        self._neo4j.create_experiment(
-            Experiment(
-                id=experiment_id,
-                description=f"Search: {raw_query[:120]}",
-                embedding_approach="Search",
-                chunk_method="N/A",
-                total_chunks=0,
-                avg_tokens_per_chunk=0.0,
-                total_time_ms=0.0,
-                source_file="",
-                created_at=datetime.utcnow(),
-                status=ExperimentStatus.RUNNING.value,
-                kind="search",
-                hybrid_alpha=config.hybridAlpha,
-                use_bm25=config.useBm25,
-                use_reranker=config.useReranker,
-                top_k_vector=config.topKVector,
-                top_n_rerank=config.topNRerank,
-                parent_context_levels=config.parentContextLevels,
-                auto_tune_weights=config.autoTuneWeights,
-                raw_query=raw_query,
-            )
-        )
         log_pipeline_event(
             logger,
             "search.start",
@@ -622,8 +545,8 @@ class PipelineOrchestrator:
         )
 
         try:
-            # 1. Embed the query as a SEARCH QUERY → is_query=True (Jina v5
-            #    task="retrieval.query"; BGE-M3 ignores the flag).
+            # 1. Embed the query as a SEARCH QUERY.
+            #    Jina v5: task="retrieval" (via SentenceTransformer)
             if progress:
                 progress(
                     IngestProgressEvent(
@@ -633,7 +556,7 @@ class PipelineOrchestrator:
                 )
             query_vector, query_embed_ms = timed_sync(
                 lambda: self._embedder.embed_with_retry(
-                    raw_query, experiment_id=experiment_id, is_query=True
+                    raw_query, is_query=True
                 )
             )
             user_query_id = str(uuid.uuid4())
@@ -643,7 +566,6 @@ class PipelineOrchestrator:
                 total_tokens=self._embedder.token_count(raw_query),
                 embedding_method=EMBEDDING_METHOD_LONGTEXT,
                 created_at=datetime.utcnow(),
-                experiment_id=experiment_id,
                 vector=query_vector,
             )
             self._neo4j.create_user_query(user_query)
@@ -653,7 +575,6 @@ class PipelineOrchestrator:
                 query_text=raw_query,
                 query_vector=query_vector,
                 config=config,
-                experiment_id=None,  # search across ALL experiments by default
             )
             # Fill in the orchestrator-owned fields:
             metadata.searchId = search_id
@@ -678,20 +599,11 @@ class PipelineOrchestrator:
                     bm25_score=r.bm25Score,
                     fused_score=r.fusedScore,
                     reranker_score=r.rerankerScore,
-                    experiment_id=experiment_id,
                 )
                 self._neo4j.create_memory(memory)
 
-            # 4. Update experiment with search observability + status=completed
+            # no experiment node update (removed)
             total_ms = now_ms() - t0
-            self._neo4j.update_experiment_status(
-                experiment_id,
-                status=ExperimentStatus.COMPLETED.value,
-                total_chunks=len(results),
-                avg_tokens_per_chunk=0.0,
-                total_time_ms=total_ms,
-                best_alpha=metadata.bestAlpha,
-            )
 
             if progress:
                 progress(
@@ -735,22 +647,12 @@ class PipelineOrchestrator:
     # ─── internal ───────────────────────────────────────────────────────────
 
     def _mark_experiment_failed(self, experiment_id: str, exc: Exception, t0: float) -> None:
-        """Mark an experiment as failed + log the structured error event."""
+        """Log failure for a run (no :Experiment node; experiment_id is correlation only)."""
         from app.core.exceptions import RAGBaseException
         from app.core.logging import log_pipeline_error
 
         err_code = exc.code if isinstance(exc, RAGBaseException) else "INTERNAL_ERROR"
         err_msg = str(exc)[:2000]
-        try:
-            self._neo4j.update_experiment_status(
-                experiment_id,
-                status=ExperimentStatus.FAILED.value,
-                total_time_ms=now_ms() - t0,
-                error_code=err_code,
-                error_message=err_msg,
-            )
-        except Exception:
-            pass  # never mask the original error
         log_pipeline_error(
             logger,
             stage=getattr(exc, "stage", "unknown") or "unknown",

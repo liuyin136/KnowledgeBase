@@ -8,7 +8,7 @@ STRICT MODULE BOUNDARY (Backend §2):
     FastAPI backend produces equivalent boundaries for the same input.
 
 Supported methods (v1 — standard paths only, NO Late/Agentic):
-  • LongText          — sliding window (~8k tokens, 10% overlap). For the
+  • LongText          — sliding window (default 30000 tokens via config, 10% overlap). For the
                         LongText embedding approach. Pure boundary detection —
                         the windows ARE the retrieval units (stored as :Knowledge).
   • Recursive         — recursive character splitter (markdown-aware) with
@@ -24,11 +24,10 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional
 
+from app.core.config import settings
 from app.core.constants import (
     CHUNK_OVERLAP_TOKENS,
     CHUNK_TARGET_TOKENS,
-    LONGTEXT_OVERLAP_TOKENS,
-    LONGTEXT_WINDOW_TOKENS,
 )
 from app.utils.tokenization import approx_token_count
 
@@ -49,8 +48,10 @@ class ChunkBoundary:
 
 
 def chunk_long_text(text: str) -> List[ChunkBoundary]:
-    target = LONGTEXT_WINDOW_TOKENS
-    overlap = LONGTEXT_OVERLAP_TOKENS
+    # Use runtime config (user can override via env / settings.longtext_window_tokens)
+    # Default now 30000 (updated for larger context windows).
+    target = settings.longtext_window_tokens
+    overlap = settings.longtext_overlap_tokens
     if not text or not text.strip():
         return []
 

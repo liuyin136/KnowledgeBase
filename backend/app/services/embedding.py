@@ -1,31 +1,24 @@
 """
-services/embedding.py — EmbeddingModule (Jina v5 default + BGE-M3 toggle).
+services/embedding.py — EmbeddingModule (Jina Embeddings v5 Text Small ONLY for ingestion).
 
 STRICT MODULE BOUNDARY (Backend §2):
   • This module ONLY produces vectors. It NEVER chunks, NEVER persists,
     NEVER coordinates. Called exclusively by the PipelineOrchestrator.
 
-v1.3 model migration (CRITICAL — read me):
-  • Default model is now `jinaai/jina-embeddings-v5-text-small` (Jina v5 small).
-    BGE-M3 (`BAAI/bge-m3`) remains available as a toggleable alternative.
-  • Jina v5 is TASK-CONDITIONED. The orchestrator must tell us whether we are
-    embedding a QUERY or a PASSAGE (document). We map that to Jina's task
-    string via `embed_batch(texts, *, is_query=False)`:
-        is_query=True  → task="retrieval.query"
-        is_query=False → task="retrieval.passages"
-    BGE-M3 ignores the task parameter (it has no task conditioning) — the
-    `is_query` flag is accepted on every call but no-op for BGE-M3.
-  • MATRYOSHKA TRUNCATION: Jina v5 small natively outputs 1536 dims, but the
-    Neo4j vector indexes are 1024-dim cosine (per neo4j-schema-v1.1.md §3).
-    To keep BOTH models writing into the SAME indexes without re-creation,
-    we invoke Jina with `dimensions=settings.embedding_dim` (1024). BGE-M3 is
-    natively 1024-dim, so no `dimensions` arg is passed for it.
-    Caveat: vectors are still model-specific. Switching models requires
-    re-ingesting documents so the persisted vectors match the active embedder.
-    The Settings UI documents this clearly.
+Forced to Jina v5 small only (per request):
+  • Model: `jinaai/jina-embeddings-v5-text-small`
+  • BGE-M3 support removed from embedding path.
+  • During encode, use task="retrieval" (for ingestion documents).
+      The Jina v5 model + sentence-transformers integration handles prompt internally via `task`.
+      (prompt_name and `texts=` kwargs not supported by this model's encode() - only `task` and `truncate_dim`).
+      Always pass list of text(s) as first positional argument to encode().
+  • Jina v5 task conditioning ("retrieval") for retrieval use-case.
+  • MATRYOSHKA TRUNCATION: always truncate to settings.embedding_dim (1024).
+    Caveat: vectors are model-specific. Re-ingest after model changes.
+  • The `is_query` flag is currently not changing the task (all use "retrieval").
 
-Construction note #1 (MANDATORY — explicit user requirement, preserved for BOTH models):
-  After `model.encode(texts, ...)`, the output may be bfloat16 on GPU.
+Construction note #1 (MANDATORY — explicit user requirement):
+  After `model.encode( list_of_texts , ...)`, the output may be bfloat16 on GPU.
   NumPy CANNOT handle bfloat16 (no native dtype). ALWAYS convert:
         vector = embedding.cpu().to(torch.float32).numpy()
   before returning any vector to callers. This is applied in `embed` and
@@ -58,8 +51,6 @@ from app.core.config import settings
 from app.core.constants import (
     EMBEDDING_BACKOFF_MS,
     EMBEDDING_MAX_RETRIES,
-    JINA_TASK_PASSAGE,
-    JINA_TASK_QUERY,
 )
 from app.core.exceptions import EmbeddingError
 from app.core.logging import get_logger
@@ -78,21 +69,19 @@ class EmbeddingModule:
         self._device: Optional[str] = None
         self._loaded = False
         self._load_error: Optional[str] = None
-        # The logical model id ("jina-v5-small" | "bge-m3") captured at load()
-        # time. Stored on the instance so callers can observe which model is
-        # actually loaded (rather than re-reading settings every encode).
-        self._model_id: str = settings.embedding_model
+        # Forced to jina-embeddings-v5-text-small only for ingestion.
+        self._model_id: str = "jina-v5-small"
 
     # ─── lifecycle ──────────────────────────────────────────────────────────
 
     def load(self) -> None:
-        """Load the selected embedding model (Jina v5 or BGE-M3). Safe to call multiple times."""
+        """Load the Jina v5 embedding model (forced only). Safe to call multiple times."""
         with self._lock:
             if self._loaded:
                 return
             device = settings.device
             self._device = device
-            self._model_id = settings.embedding_model
+            self._model_id = "jina-v5-small"  # forced
             try:
                 # Set CUDA_VISIBLE_DEVICES before importing torch if CPU-only.
                 os.environ.setdefault("CUDA_VISIBLE_DEVICES", settings.cuda_visible_devices)
@@ -100,8 +89,9 @@ class EmbeddingModule:
 
                 # Resolve the local model dir if present, else fall back to the HF repo id
                 # (so a fresh dev box without a downloaded snapshot still works).
-                local_path = os.path.join(settings.model_path, settings.embedding_model_name)
-                model_src = local_path if os.path.isdir(local_path) else settings.embedding_repo
+                # Forced Jina v5 small.
+                local_path = os.path.join(settings.model_path, "jina-embeddings-v5-text-small")
+                model_src = local_path if os.path.isdir(local_path) else settings.jina_v5_repo
                 logger.info(
                     "embedding.load.start",
                     extra={
@@ -109,41 +99,34 @@ class EmbeddingModule:
                         "model_id": self._model_id,
                         "model_src": model_src,
                         "device": device,
-                        "native_dim": settings.model_dim,
                         "embedding_dim": settings.embedding_dim,
                     },
                 )
 
-                if self._model_id == "jina-v5-small":
-                    # Jina Embeddings v5 is task-conditioned + supports Matryoshka
-                    # truncation. We pass the task at ENCODE time (not load time)
-                    # since the same model serves both query and passage paths.
-                    # `truncate_dim` is the sentence-transformers knob for the
-                    # `dimensions` Matryoshka parameter — set it at load so every
-                    # encode returns a 1024-dim vector (matches the Neo4j indexes).
-                    # `trust_remote_code=True` is required because Jina v5 ships a
-                    # custom modeling file.
-                    self._model = SentenceTransformer(
-                        model_src,
-                        device=device,
-                        trust_remote_code=True,
-                        truncate_dim=settings.embedding_dim,
-                    )
-                elif self._model_id == "bge-m3":
-                    # BGE-M3 is a vanilla transformer — let sentence-transformers
-                    # pick its default backend (PyTorch). No task conditioning.
-                    self._model = SentenceTransformer(
-                        model_src,
-                        device=device,
-                    )
-                else:
-                    # Validator on Settings should have caught this; guard anyway.
-                    raise EmbeddingError(
-                        f"Unknown embedding_model id: {self._model_id!r}. "
-                        f"Expected one of: jina-v5-small, bge-m3.",
-                        details={"embedding_model": self._model_id},
-                        stage="embedding_load",
-                    )
+                # Jina Embeddings v5 ONLY (forced for this repository ingestion).
+                # Uses task="retrieval" at encode time.
+                # `truncate_dim` configures Matryoshka to 1024 at load.
+                # `trust_remote_code=True` required for Jina v5 custom modeling.
+                # Model is placed on GPU via constructor + explicit .to(device).
+                self._model = SentenceTransformer(
+                    model_src,
+                    device=device,
+                    trust_remote_code=True,
+                    truncate_dim=settings.embedding_dim,
+                )
+
+                # Explicit GPU handling as requested:
+                # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                # self._model = self._model.to(device=device)
+                # SentenceTransformer constructor already moves it based on settings, but we ensure explicitly here.
+                try:
+                    import torch
+                    explicit_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    self._model = self._model.to(explicit_device)
+                    self._device = str(explicit_device)
+                    device = self._device  # for subsequent logs
+                except Exception:
+                    pass  # fallback to whatever constructor did
 
                 # Best-effort: also expose the underlying tokenizer for exact token counts.
                 try:
@@ -158,7 +141,6 @@ class EmbeddingModule:
                         "model_id": self._model_id,
                         "model_src": model_src,
                         "device": device,
-                        "native_dim": settings.model_dim,
                         "embedding_dim": settings.embedding_dim,
                     },
                 )
@@ -174,10 +156,10 @@ class EmbeddingModule:
                 )
                 # Permanent model-loading failure — DO NOT retry at call time.
                 raise EmbeddingError(
-                    f"Failed to load embedding model ({self._model_id}): {exc}",
+                    f"Failed to load embedding model (jina-embeddings-v5-text-small): {exc}",
                     details={
                         "model_id": self._model_id,
-                        "model_src": settings.embedding_repo,
+                        "model_src": settings.jina_v5_repo,
                         "device": device,
                     },
                     stage="embedding_load",
@@ -210,16 +192,12 @@ class EmbeddingModule:
         Args:
           texts: input strings to embed.
           batch_size: override the default batch size (used by retry-on-OOM).
-          is_query: when True, embed as a SEARCH QUERY; when False (default),
-            embed as a DOCUMENT/PASSAGE. For Jina v5 this maps to the task
-            string ("retrieval.query" vs "retrieval.passages"). For BGE-M3 this
-            flag is IGNORED (no task conditioning).
+          is_query: kept for future, but currently all ingestion uses task="retrieval"
+            (document embeddings). The model handles prompt internally via task.
 
-        Construction note #1 (MANDATORY — preserved for BOTH models): the model
-        output may be bfloat16 on GPU. NumPy has no native bfloat16 dtype and
-        will raise `TypeError: Got unsupported ArrayType <class 'numpy.dtypes.FloatDType'>`
-        (or return wrong values via object arrays). ALWAYS cast to float32 on
-        CPU before calling .numpy(). Jina on GPU may also output bfloat16.
+        Construction note #1 (MANDATORY): the model output may be bfloat16 on GPU.
+        NumPy has no native bfloat16 dtype. ALWAYS cast to float32 on CPU before
+        calling .numpy().
         """
         if not texts:
             return []
@@ -236,30 +214,27 @@ class EmbeddingModule:
             outputs: List[List[float]] = []
             for i in range(0, len(texts), bs):
                 batch = texts[i : i + bs]
-                encode_kwargs = dict(
+
+                # Correct encode call for Jina v5 small via SentenceTransformer.
+                # Pass texts as first positional arg (the list of strings).
+                # Only use supported additional kwargs: task (and truncate_dim which is set at load).
+                # prompt_name and texts= kwarg are NOT supported by this model's encode (caused the error).
+                # For LongText (full doc or windows): we still use the same API, passing [full_text] or [window_text].
+                # sentence-transformers handles both single long text and batches of chunks correctly
+                # by using the underlying transformer + proper pooling/task prompt.
+                emb = self._model.encode(
+                    batch,  # list of text(s) - positional (equivalent to wrapping texts)
                     batch_size=len(batch),
                     convert_to_numpy=False,
                     convert_to_tensor=True,
                     normalize_embeddings=True,
                     show_progress_bar=False,
+                    task="retrieval",
                 )
-                if self._model_id == "jina-v5-small":
-                    # Jina v5 task conditioning. The orchestrator passes is_query
-                    # so the same model can serve both indexing + search.
-                    encode_kwargs["task"] = JINA_TASK_QUERY if is_query else JINA_TASK_PASSAGE
-                    # NOTE: Matryoshka truncation to 1024 dims is configured at
-                    # LOAD time via `truncate_dim` (see load()). We do NOT pass
-                    # `dimensions=` here because sentence-transformers' encode()
-                    # does not accept it directly — `truncate_dim` on the model
-                    # is the supported knob.
-                # BGE-M3: no task / dimensions kwargs — encode() defaults apply.
-
-                emb = self._model.encode(batch, **encode_kwargs)
-                # ─── Construction note #1 (MANDATORY — applies to BOTH models) ──
+                # ─── Construction note #1 (MANDATORY) ──
                 # NumPy cannot handle bfloat16. Force the tensor to CPU + float32
                 # before converting to a Python list. This is the explicit user
-                # requirement and is applied on EVERY encode path (GPU and CPU),
-                # for both Jina v5 and BGE-M3.
+                # requirement and is applied on EVERY encode path (GPU and CPU).
                 emb_cpu = emb.detach().cpu().to(torch.float32)
                 outputs.extend(emb_cpu.tolist())
             return outputs
@@ -278,7 +253,7 @@ class EmbeddingModule:
                 ) from exc
             # Permanent failure
             raise EmbeddingError(
-                f"Embedding failed (model={self._model_id}): {exc}",
+                f"Embedding failed (jina-embeddings-v5-text-small): {exc}",
                 details={
                     "batch_size": bs,
                     "device": self.device,
@@ -290,9 +265,7 @@ class EmbeddingModule:
     def embed(self, text: str, *, is_query: bool = False) -> List[float]:
         """Embed a single text. Returns an `embedding_dim`-dim list[float].
 
-        Pass `is_query=True` for search queries (Jina v5 task="retrieval.query");
-        leave it False (default) for documents/passages (task="retrieval.passages").
-        BGE-M3 ignores the flag.
+        For Jina v5: uses task="retrieval" (ingestion documents use full context or chunks).
         """
         if not text:
             # Zero vector for empty input (won't be normalized, but the orchestrator
@@ -307,7 +280,6 @@ class EmbeddingModule:
         self,
         text: str,
         *,
-        experiment_id: Optional[str] = None,
         is_query: bool = False,
     ) -> List[float]:
         """Single-text embed with max 3 attempts + exp backoff 1s/2s/4s.
@@ -315,14 +287,12 @@ class EmbeddingModule:
         Retries on transient errors (CUDA OOM with smaller batch, network).
         Does NOT retry on validation errors or permanent model load failures.
 
-        Pass `is_query=True` for search queries (Jina v5 task="retrieval.query");
-        leave it False (default) for documents/passages. BGE-M3 ignores the flag.
+        Jina v5 only: uses task="retrieval" for document embeddings during ingestion.
         """
         if not text or not text.strip():
             raise EmbeddingError(
                 "Cannot embed empty text",
                 stage="embedding_encode",
-                experiment_id=experiment_id,
             )
         last_exc: Optional[Exception] = None
         for attempt in range(EMBEDDING_MAX_RETRIES):
@@ -344,7 +314,6 @@ class EmbeddingModule:
                             "attempt": attempt + 1,
                             "backoff_ms": backoff_ms,
                             "error": exc.message,
-                            "experiment_id": experiment_id,
                             "is_query": is_query,
                             "model_id": self._model_id,
                         },
@@ -358,16 +327,14 @@ class EmbeddingModule:
                     time.sleep(EMBEDDING_BACKOFF_MS[attempt] / 1000.0)
                     continue
                 raise EmbeddingError(
-                    f"Embedding failed after {EMBEDDING_MAX_RETRIES} attempts: {exc}",
+                    f"Embedding failed after {EMBEDDING_MAX_RETRIES} attempts (jina-v5): {exc}",
                     stage="embedding_encode",
-                    experiment_id=experiment_id,
                     retry_count=EMBEDDING_MAX_RETRIES,
                 ) from exc
         # Unreachable — loop either returns or raises.
         raise EmbeddingError(
             f"Embedding failed after {EMBEDDING_MAX_RETRIES} attempts: {last_exc}",
             stage="embedding_encode",
-            experiment_id=experiment_id,
             retry_count=EMBEDDING_MAX_RETRIES,
         )
 
@@ -375,13 +342,11 @@ class EmbeddingModule:
         self,
         texts: List[str],
         *,
-        experiment_id: Optional[str] = None,
         is_query: bool = False,
     ) -> List[List[float]]:
         """Batch embed with retry. On CUDA OOM, halves the batch size and retries.
 
-        Pass `is_query=True` for search queries (Jina v5 task="retrieval.query");
-        leave it False (default) for documents/passages. BGE-M3 ignores the flag.
+        Jina v5 only: uses task="retrieval".
         """
         if not texts:
             return []
@@ -408,15 +373,13 @@ class EmbeddingModule:
                     time.sleep(EMBEDDING_BACKOFF_MS[attempt] / 1000.0)
                     continue
                 raise EmbeddingError(
-                    f"Batch embedding failed after {EMBEDDING_MAX_RETRIES} attempts: {exc}",
+                    f"Batch embedding failed after {EMBEDDING_MAX_RETRIES} attempts (jina-v5): {exc}",
                     stage="embedding_encode",
-                    experiment_id=experiment_id,
                     retry_count=EMBEDDING_MAX_RETRIES,
                 ) from exc
         raise EmbeddingError(
-            f"Batch embedding failed after {EMBEDDING_MAX_RETRIES} attempts: {last_exc}",
+            f"Batch embedding failed after {EMBEDDING_MAX_RETRIES} attempts (jina-v5): {last_exc}",
             stage="embedding_encode",
-            experiment_id=experiment_id,
             retry_count=EMBEDDING_MAX_RETRIES,
         )
 

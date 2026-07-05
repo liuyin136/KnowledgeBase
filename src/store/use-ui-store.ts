@@ -1,11 +1,11 @@
 /**
  * Client UI state (Zustand). Per Frontend_Workflow_Mapping v1.1 §5:
- *   • Server state → TanStack Query (experiments, documents, search results, carts)
+ *   • Server state → TanStack Query (documents, search results, carts)
  *   • Client state → Zustand (current view, selected chunks for cart, filters)
  */
 import { create } from "zustand";
 
-export type ViewKey = "dashboard" | "ingest" | "search" | "memory" | "experiments" | "settings";
+export type ViewKey = "dashboard" | "ingest" | "search" | "memory" | "documents" | "settings";
 
 interface UIState {
   view: ViewKey;
@@ -14,9 +14,9 @@ interface UIState {
   pendingMemoryIds: string[];
   togglePending: (id: string) => void;
   clearPending: () => void;
-  // Active experiment (for search context)
-  activeExperimentId: string | null;
-  setActiveExperiment: (id: string | null) => void;
+  // Active document (for search context, repurposed from experiment)
+  activeDocumentId: string | null;
+  setActiveDocument: (id: string | null) => void;
   // Theme
   theme: "light" | "dark";
   toggleTheme: () => void;
@@ -34,8 +34,8 @@ export const useUIStore = create<UIState>((set) => ({
         : [...s.pendingMemoryIds, id],
     })),
   clearPending: () => set({ pendingMemoryIds: [] }),
-  activeExperimentId: null,
-  setActiveExperiment: (id) => set({ activeExperimentId: id }),
+  activeDocumentId: null,
+  setActiveDocument: (id) => set({ activeDocumentId: id }),
   theme: "light",
   toggleTheme: () => set((s) => ({ theme: s.theme === "light" ? "dark" : "light" })),
   setTheme: (t) => set({ theme: t }),

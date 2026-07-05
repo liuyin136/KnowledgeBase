@@ -94,7 +94,6 @@ class RetrievalModule:
         query_text: str,
         query_vector: List[float],
         config: SearchConfig,
-        experiment_id: Optional[str] = None,
     ) -> Tuple[List[SearchResult], SearchMetadata]:
         """Run hybrid search. Returns (results, metadata).
 
@@ -108,7 +107,6 @@ class RetrievalModule:
             lambda: self._neo4j.vector_search_chunks(
                 query_vector=query_vector,
                 top_k=config.topKVector,
-                experiment_id=experiment_id,
             )
         )
 
@@ -123,7 +121,7 @@ class RetrievalModule:
             candidates[cid] = _Candidate(
                 chunk_id=cid,
                 parent_id=parent.get("id", ""),
-                experiment_id=row.get("experiment_id") or parent.get("experiment_id", ""),
+                experiment_id="",
                 chunk_index=chunk.get("chunk_index", 0),
                 text=chunk.get("text", ""),
                 token_count=chunk.get("token_count", 0),
@@ -156,7 +154,7 @@ class RetrievalModule:
                     candidates[cid] = _Candidate(
                         chunk_id=cid,
                         parent_id=parent.get("id", ""),
-                        experiment_id=row.get("experiment_id") or parent.get("experiment_id", ""),
+                        experiment_id="",
                         chunk_index=chunk.get("chunk_index", 0),
                         text=chunk.get("text", ""),
                         token_count=chunk.get("token_count", 0),

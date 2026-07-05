@@ -1,5 +1,5 @@
 # =============================================================================
-# docker-compose.yml — Local-First RAG Experimentation Platform v1.3
+# docker-compose.yml — Local-First RAG Platform (no experiments node)
 # Per infrastructure-environment-spec_v1.1.md §3 (updated for v1.3 Jina models)
 #
 # Usage (from project root, via the thin root docker-compose.yml include):

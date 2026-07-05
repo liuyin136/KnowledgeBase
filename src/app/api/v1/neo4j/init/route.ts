@@ -17,7 +17,7 @@ const CONSTRAINTS = [
   "CREATE CONSTRAINT userquery_id IF NOT EXISTS FOR (q:UserQuery) REQUIRE q.id IS UNIQUE",
   "CREATE CONSTRAINT memory_id IF NOT EXISTS FOR (m:Memory) REQUIRE m.id IS UNIQUE",
   "CREATE CONSTRAINT memorycart_id IF NOT EXISTS FOR (c:MemoryCart) REQUIRE c.id IS UNIQUE",
-  "CREATE CONSTRAINT experiment_id IF NOT EXISTS FOR (e:Experiment) REQUIRE e.id IS UNIQUE",
+  // No :Experiment node (experiment concept removed from Neo4j architecture; only internal run/job correlation ids used)
 ];
 
 const VECTOR_INDEXES = [

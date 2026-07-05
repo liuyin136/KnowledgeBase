@@ -28,9 +28,8 @@ from neo4j import Driver, GraphDatabase, ManagedTransaction, Session
 from app.core.config import settings
 from app.core.constants import NEO4J_MAX_RETRIES
 from app.core.exceptions import Neo4jError
-from app.core.logging import get_logger
+from app.core.logging import get_logger, log_pipeline_event
 from app.models.neo4j_models import (
-    Experiment,
     Knowledge,
     KnowledgeChunk,
     Memory,
@@ -187,173 +186,72 @@ class Neo4jClient:
             retry_count=self._max_retries,
         ) from last_exc
 
-    # ─── Experiment ─────────────────────────────────────────────────────────
-
-    def create_experiment(self, exp: Experiment) -> Dict[str, Any]:
-        cypher = """
-        CREATE (e:Experiment {
-          id: $id,
-          description: $description,
-          embedding_approach: $embedding_approach,
-          chunk_method: $chunk_method,
-          total_chunks: $total_chunks,
-          avg_tokens_per_chunk: $avg_tokens_per_chunk,
-          total_time_ms: $total_time_ms,
-          source_file: $source_file,
-          created_at: datetime($created_at),
-          status: $status,
-          error_code: $error_code,
-          error_message: $error_message,
-          hybrid_alpha: $hybrid_alpha,
-          use_bm25: $use_bm25,
-          use_reranker: $use_reranker,
-          top_k_vector: $top_k_vector,
-          top_n_rerank: $top_n_rerank,
-          parent_context_levels: $parent_context_levels,
-          auto_tune_weights: $auto_tune_weights,
-          best_alpha: $best_alpha,
-          raw_query: $raw_query,
-          kind: $kind
-        })
-        RETURN e
-        """
-        params = {
-            "id": exp.id,
-            "description": exp.description,
-            "embedding_approach": exp.embedding_approach,
-            "chunk_method": exp.chunk_method,
-            "total_chunks": exp.total_chunks,
-            "avg_tokens_per_chunk": exp.avg_tokens_per_chunk,
-            "total_time_ms": exp.total_time_ms,
-            "source_file": exp.source_file,
-            "created_at": exp.created_at.isoformat(),
-            "status": exp.status,
-            "error_code": exp.error_code,
-            "error_message": exp.error_message,
-            "hybrid_alpha": exp.hybrid_alpha,
-            "use_bm25": exp.use_bm25,
-            "use_reranker": exp.use_reranker,
-            "top_k_vector": exp.top_k_vector,
-            "top_n_rerank": exp.top_n_rerank,
-            "parent_context_levels": exp.parent_context_levels,
-            "auto_tune_weights": exp.auto_tune_weights,
-            "best_alpha": exp.best_alpha,
-            "raw_query": exp.raw_query,
-            "kind": exp.kind,
-        }
-        rows = self._run_write_with_retry(cypher, params)
-        return rows[0]["e"] if rows else {}
-
-    def update_experiment_status(
-        self,
-        experiment_id: str,
-        *,
-        status: str,
-        total_chunks: Optional[int] = None,
-        avg_tokens_per_chunk: Optional[float] = None,
-        total_time_ms: Optional[float] = None,
-        error_code: Optional[str] = None,
-        error_message: Optional[str] = None,
-        best_alpha: Optional[float] = None,
-    ) -> None:
-        cypher = """
-        MATCH (e:Experiment {id: $id})
-        SET e.status = $status,
-            e.total_chunks = coalesce($total_chunks, e.total_chunks),
-            e.avg_tokens_per_chunk = coalesce($avg_tokens_per_chunk, e.avg_tokens_per_chunk),
-            e.total_time_ms = coalesce($total_time_ms, e.total_time_ms),
-            e.error_code = $error_code,
-            e.error_message = $error_message,
-            e.best_alpha = coalesce($best_alpha, e.best_alpha)
-        """
-        params = {
-            "id": experiment_id,
-            "status": status,
-            "total_chunks": total_chunks,
-            "avg_tokens_per_chunk": avg_tokens_per_chunk,
-            "total_time_ms": total_time_ms,
-            "error_code": error_code,
-            "error_message": error_message,
-            "best_alpha": best_alpha,
-        }
-        self._run_write_with_retry(cypher, params)
-
-    def get_experiment(self, experiment_id: str) -> Optional[Dict[str, Any]]:
-        cypher = "MATCH (e:Experiment {id: $id}) RETURN e"
-        rows = self._run_read_with_retry(cypher, {"id": experiment_id})
-        return rows[0]["e"] if rows else None
-
-    def list_experiments(
-        self,
-        *,
-        kind: Optional[str] = None,
-        page: int = 1,
-        page_size: int = 20,
-    ) -> Tuple[List[Dict[str, Any]], int]:
-        """Return (items, total). `kind` filter is optional."""
-        skip = (page - 1) * page_size
-        if kind and kind.lower() in ("ingest", "search"):
-            cypher = """
-            MATCH (e:Experiment)
-            WHERE e.kind = $kind
-            WITH e ORDER BY e.created_at DESC
-            RETURN collect(e) AS items, count(e) AS total
-            """
-            rows = self._run_read_with_retry(cypher, {"kind": kind.lower()})
-        else:
-            cypher = """
-            MATCH (e:Experiment)
-            WITH e ORDER BY e.created_at DESC
-            RETURN collect(e) AS items, count(e) AS total
-            """
-            rows = self._run_read_with_retry(cypher, {})
-        if not rows:
-            return [], 0
-        items = rows[0].get("items", []) or []
-        total = rows[0].get("total", 0) or 0
-        return items[skip : skip + page_size], total
-
-    def list_chunks_for_experiment(self, experiment_id: str) -> List[Dict[str, Any]]:
-        """Return all KnowledgeChunk rows for an experiment (observability).
-
-        For LongText experiments (no child chunks), returns the Knowledge
-        parent nodes themselves (so the chunk browser still renders).
+    def list_chunks_for_source_file(self, source_file: str) -> List[Dict[str, Any]]:
+        """Return :Knowledge (parents) + :KnowledgeChunk for a document by source_file.
+        (source_file based; experiment node removed)
         """
         cypher = """
-        MATCH (e:Experiment {id: $id})
-        OPTIONAL MATCH (k:Knowledge {experiment_id: $id})
+        MATCH (k:Knowledge {source_file: $source_file})
         OPTIONAL MATCH (k)-[:HAS_CHUNK]->(c:KnowledgeChunk)
-        WITH e, k, c
-        ORDER BY coalesce(c.chunk_index, k.chunk_index, 0)
-        RETURN collect(
-          CASE
-            WHEN c IS NOT NULL THEN c
-            ELSE k
-          END
-        ) AS chunks
+        RETURN
+          collect(DISTINCT k) AS parents,
+          collect(c) AS children
         """
-        rows = self._run_read_with_retry(cypher, {"id": experiment_id})
+        rows = self._run_read_with_retry(cypher, {"source_file": source_file})
         if not rows:
             return []
-        chunks = rows[0].get("chunks", []) or []
-        # Filter out nulls (no Knowledge nodes at all)
-        return [c for c in chunks if c is not None]
+        parents = [p for p in (rows[0].get("parents") or []) if p]
+        children = [ch for ch in (rows[0].get("children") or []) if ch]
 
-    def recent_experiments(self, limit: int = 5) -> List[Dict[str, Any]]:
-        cypher = """
-        MATCH (e:Experiment)
-        RETURN e ORDER BY coalesce(e.created_at, datetime('1900-01-01')) DESC LIMIT $limit
-        """
-        return [r["e"] for r in self._run_read_with_retry(cypher, {"limit": limit})]
+        result: List[Dict[str, Any]] = []
+        for p in sorted(parents, key=lambda x: x.get("chunk_index") or 0):
+            pp = dict(p)
+            pp["node_type"] = "knowledge"
+            result.append(pp)
+        for ch in sorted(children, key=lambda x: x.get("chunk_index") or 0):
+            cch = dict(ch)
+            cch["node_type"] = "knowledge_chunk"
+            result.append(cch)
+        return result
 
-    def recent_searches(self, limit: int = 5) -> List[Dict[str, Any]]:
-        """Recent search experiments (kind='search')."""
-        cypher = """
-        MATCH (e:Experiment)
-        WHERE coalesce(e.kind, '') = 'search'
-        RETURN e ORDER BY coalesce(e.created_at, datetime('1900-01-01')) DESC LIMIT $limit
+    def get_original_knowledge(self, source_file: str) -> Optional[Dict[str, Any]]:
+        """Return the raw uploaded :Knowledge placeholder (embedding_method='Upload').
+
+        Original file content at upload time (pre any ingest). Used by Documents view.
         """
-        return [r["e"] for r in self._run_read_with_retry(cypher, {"limit": limit})]
+        cypher = """
+        MATCH (k:Knowledge {source_file: $source_file, embedding_method: 'Upload'})
+        WHERE k.text IS NOT NULL
+        RETURN k
+        ORDER BY coalesce(k.created_at, datetime('1900-01-01')) DESC
+        LIMIT 1
+        """
+        rows = self._run_read_with_retry(cypher, {"source_file": source_file})
+        return dict(rows[0]["k"]) if rows and rows[0].get("k") else None
+
+    def get_knowledge_by_source(self, source_file: str, prefer_non_upload: bool = False) -> Optional[Dict[str, Any]]:
+        """Return one Knowledge row for a source_file.
+
+        If prefer_non_upload, prefer LongText/ingested parents over Upload placeholder.
+        """
+        if prefer_non_upload:
+            cypher = """
+            MATCH (k:Knowledge {source_file: $sf})
+            WITH k ORDER BY
+              CASE WHEN k.embedding_method = 'Upload' THEN 1 ELSE 0 END,
+              coalesce(k.created_at, datetime('1900-01-01')) DESC
+            LIMIT 1
+            RETURN k
+            """
+        else:
+            cypher = """
+            MATCH (k:Knowledge {source_file: $sf})
+            RETURN k ORDER BY coalesce(k.created_at, datetime('1900-01-01')) DESC LIMIT 1
+            """
+        rows = self._run_read_with_retry(cypher, {"sf": source_file})
+        return dict(rows[0]["k"]) if rows and rows[0].get("k") else None
+
+    # recent_* methods removed (no :Experiment node)
 
     # ─── Knowledge + KnowledgeChunk (ingest) ────────────────────────────────
 
@@ -365,7 +263,6 @@ class Neo4jClient:
           total_tokens: $total_tokens,
           embedding_method: $embedding_method,
           created_at: datetime($created_at),
-          experiment_id: $experiment_id,
           vector: $vector,
           text: $text,
           chunk_index: $chunk_index,
@@ -380,7 +277,6 @@ class Neo4jClient:
             "total_tokens": k.total_tokens,
             "embedding_method": k.embedding_method,
             "created_at": k.created_at.isoformat(),
-            "experiment_id": k.experiment_id,
             "vector": list(k.vector) if k.vector is not None else None,
             "text": k.text,
             "chunk_index": k.chunk_index,
@@ -407,8 +303,7 @@ class Neo4jClient:
           vector: $vector,
           char_start: $char_start,
           char_end: $char_end,
-          section: $section,
-          experiment_id: $experiment_id
+          section: $section
         })
         MERGE (k)-[:HAS_CHUNK]->(c)
         RETURN c
@@ -428,13 +323,12 @@ class Neo4jClient:
             "char_start": c.char_start,
             "char_end": c.char_end,
             "section": c.section,
-            "experiment_id": c.experiment_id,
         }
         rows = self._run_write_with_retry(cypher, params)
         return rows[0]["c"] if rows else {}
 
     def list_documents(self, page: int = 1, page_size: int = 20) -> Tuple[List[Dict[str, Any]], int]:
-        """Logical documents (one per unique source_file across all experiments).
+        """Logical documents (one per unique source_file).
 
         Returns the first-seen Knowledge node per source_file (preferring
         upload-time placeholders so size/createdAt reflect the upload, not a
@@ -445,24 +339,41 @@ class Neo4jClient:
         MATCH (k:Knowledge)
         WITH k.source_file AS source_file,
              head(collect(k)) AS first,
-             count(k) AS chunk_count
+             count(k) AS chunk_count,
+             // collect distinct embedding_methods for badges
+             collect(DISTINCT k.embedding_method) AS methods
+        // representative = head of collect (Upload placeholders created first are preferred for display)
         RETURN collect({
           id: source_file,
           filename: source_file,
           contentType: 'text/markdown',
           sizeBytes: size(first.text),
           totalChunks: chunk_count,
-          createdAt: first.created_at
+          createdAt: first.created_at,
+          representativeEmbeddingMethod: first.embedding_method,
+          kinds: methods
         }) AS items, count(DISTINCT source_file) AS total
         """
         rows = self._run_read_with_retry(cypher, {})
         if not rows:
+            log_pipeline_event(logger, "documents.list", "observed 0 documents (no Knowledge nodes?)", total=0)
             return [], 0
         items = rows[0].get("items", []) or []
         total = rows[0].get("total", 0) or 0
         # Sort by createdAt desc (Neo4j collect() preserves encounter order — re-sort client-side)
         items_sorted = sorted(items, key=lambda x: x.get("createdAt", ""), reverse=True)
-        return items_sorted[skip : skip + page_size], total
+        page_items = items_sorted[skip : skip + page_size]
+        # observation for "ingest documents" flow: show which neo4j Knowledge source_file records contribute to the list + document count
+        log_pipeline_event(
+            logger,
+            "documents.list",
+            "observed neo4j Knowledge records for documents list",
+            total=total,
+            page_returned=len(page_items),
+            sample_filenames=[str(it.get("filename")) for it in page_items[:3]] if page_items else [],
+            # note: if sample empty but total>0, inspect the list_documents Cypher scoping
+        )
+        return page_items, total
 
     def get_document_text(self, source_file: str) -> Optional[str]:
         """Return the stored text for an uploaded document (pre-ingest).
@@ -483,14 +394,14 @@ class Neo4jClient:
         return "\n\n".join(r["text"] for r in rows if r.get("text"))
 
     def delete_document(self, source_file: str) -> int:
-        """Delete all Knowledge + cascading KnowledgeChunk nodes for a source file.
+        """Delete upload-time placeholder Knowledge nodes for a source file.
 
-        Removes upload-time placeholders AND any ingest-time Knowledge nodes
-        (and their child KnowledgeChunks via HAS_CHUNK) for the source file.
+        Only removes :Knowledge with embedding_method='Upload' (pre-ingest placeholders).
+        Preserves any ingest-time Knowledge + child KnowledgeChunks.
         Returns the count of deleted Knowledge nodes.
         """
         cypher = """
-        MATCH (k:Knowledge {source_file: $source_file})
+        MATCH (k:Knowledge {source_file: $source_file, embedding_method: 'Upload'})
         OPTIONAL MATCH (k)-[:HAS_CHUNK]->(c:KnowledgeChunk)
         DETACH DELETE c, k
         RETURN count(k) AS deleted
@@ -508,7 +419,6 @@ class Neo4jClient:
           total_tokens: $total_tokens,
           embedding_method: $embedding_method,
           created_at: datetime($created_at),
-          experiment_id: $experiment_id,
           vector: $vector
         })
         RETURN n
@@ -519,7 +429,6 @@ class Neo4jClient:
             "total_tokens": q.total_tokens,
             "embedding_method": q.embedding_method,
             "created_at": q.created_at.isoformat(),
-            "experiment_id": q.experiment_id,
             "vector": list(q.vector),
         }
         rows = self._run_write_with_retry(cypher, params)
@@ -561,7 +470,6 @@ class Neo4jClient:
         self,
         query_vector: List[float],
         top_k: int,
-        experiment_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Vector search on :KnowledgeChunk (the child retrieval targets).
 
@@ -572,38 +480,31 @@ class Neo4jClient:
         YIELD node, score
         WHERE node:KnowledgeChunk
         MATCH (parent:Knowledge)-[:HAS_CHUNK]->(node)
-        OPTIONAL MATCH (e:Experiment {id: node.experiment_id})
-        WHERE $experiment_id IS NULL OR node.experiment_id = $experiment_id
         RETURN node AS chunk,
                parent AS parent,
-               score AS vector_score,
-               coalesce(e.id, parent.experiment_id) AS experiment_id
+               score AS vector_score
         ORDER BY score DESC
         LIMIT $top_k
         """
-        params = {"top_k": top_k, "vector": list(query_vector), "experiment_id": experiment_id}
+        params = {"top_k": top_k, "vector": list(query_vector)}
         return self._run_read_with_retry(cypher, params)
 
     def vector_search_parents(
         self,
         query_vector: List[float],
         top_k: int,
-        experiment_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Vector search on :Knowledge parent nodes (used by LongText path)."""
         cypher = """
         CALL db.index.vector.queryNodes('knowledge_vector', $top_k, $vector)
         YIELD node, score
         WHERE node:Knowledge
-        MATCH (e:Experiment {id: node.experiment_id})
-        WHERE $experiment_id IS NULL OR node.experiment_id = $experiment_id
         RETURN node AS parent,
-               score AS vector_score,
-               e.id AS experiment_id
+               score AS vector_score
         ORDER BY score DESC
         LIMIT $top_k
         """
-        params = {"top_k": top_k, "vector": list(query_vector), "experiment_id": experiment_id}
+        params = {"top_k": top_k, "vector": list(query_vector)}
         return self._run_read_with_retry(cypher, params)
 
     # ─── BM25 fulltext search ───────────────────────────────────────────────
@@ -624,8 +525,7 @@ class Neo4jClient:
         MATCH (parent:Knowledge)-[:HAS_CHUNK]->(node)
         RETURN node AS chunk,
                parent AS parent,
-               score AS bm25_score,
-               parent.experiment_id AS experiment_id
+               score AS bm25_score
         ORDER BY score DESC
         LIMIT $top_k
         """
@@ -642,8 +542,7 @@ class Neo4jClient:
         YIELD node, score
         WHERE node:Knowledge
         RETURN node AS parent,
-               score AS bm25_score,
-               node.experiment_id AS experiment_id
+               score AS bm25_score
         ORDER BY score DESC
         LIMIT $top_k
         """
@@ -670,8 +569,7 @@ class Neo4jClient:
           vector_score: $vector_score,
           bm25_score: $bm25_score,
           fused_score: $fused_score,
-          reranker_score: $reranker_score,
-          experiment_id: $experiment_id
+          reranker_score: $reranker_score
         })
         MERGE (q)-[:TRIGGERED]->(m)
         WITH m
@@ -694,7 +592,6 @@ class Neo4jClient:
             "bm25_score": m.bm25_score,
             "fused_score": m.fused_score,
             "reranker_score": m.reranker_score,
-            "experiment_id": m.experiment_id,
         }
         rows = self._run_write_with_retry(cypher, params)
         return rows[0]["m"] if rows else {}
@@ -704,34 +601,19 @@ class Neo4jClient:
         *,
         page: int = 1,
         page_size: int = 20,
-        experiment_id: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], int]:
         skip = (page - 1) * page_size
-        if experiment_id:
-            cypher = """
-            MATCH (m:Memory)
-            WHERE m.experiment_id = $experiment_id
-            OPTIONAL MATCH (cart:MemoryCart)-[:CONTAINS]->(m)
-            WITH m, cart
-            ORDER BY m.timestamp DESC
-            RETURN collect({
-              memory: m,
-              selected: cart IS NOT NULL
-            }) AS items, count(m) AS total
-            """
-            rows = self._run_read_with_retry(cypher, {"experiment_id": experiment_id})
-        else:
-            cypher = """
-            MATCH (m:Memory)
-            OPTIONAL MATCH (cart:MemoryCart)-[:CONTAINS]->(m)
-            WITH m, cart
-            ORDER BY m.timestamp DESC
-            RETURN collect({
-              memory: m,
-              selected: cart IS NOT NULL
-            }) AS items, count(m) AS total
-            """
-            rows = self._run_read_with_retry(cypher, {})
+        cypher = """
+        MATCH (m:Memory)
+        OPTIONAL MATCH (cart:MemoryCart)-[:CONTAINS]->(m)
+        WITH m, cart
+        ORDER BY m.timestamp DESC
+        RETURN collect({
+          memory: m,
+          selected: cart IS NOT NULL
+        }) AS items, count(m) AS total
+        """
+        rows = self._run_read_with_retry(cypher, {})
         if not rows:
             return [], 0
         items = rows[0].get("items", []) or []
@@ -838,11 +720,8 @@ class Neo4jClient:
 
     def dashboard_stats(self) -> Dict[str, Any]:
         cypher = """
-        MATCH (e:Experiment)
-        WITH 
-            count(e) AS total,
-            sum(CASE WHEN coalesce(e.status, '') = 'completed' THEN 1 ELSE 0 END) AS completed,
-            sum(CASE WHEN coalesce(e.status, '') = 'failed' THEN 1 ELSE 0 END) AS failed
+        -- experiments stats are synthetic (no :Experiment node)
+        WITH 0 AS total, 0 AS completed, 0 AS failed
 
         OPTIONAL MATCH (k:Knowledge)
         WITH total, completed, failed, count(DISTINCT k.source_file) AS documents
@@ -850,9 +729,8 @@ class Neo4jClient:
         OPTIONAL MATCH (c:KnowledgeChunk)
         WITH total, completed, failed, documents, count(c) AS chunks
 
-        OPTIONAL MATCH (s:Experiment)
-        WHERE coalesce(s.kind, '') = 'search'
-        WITH total, completed, failed, documents, chunks, count(s) AS searches
+        -- searches removed
+        WITH total, completed, failed, documents, chunks, 0 AS searches
 
         OPTIONAL MATCH (m:Memory)
         WITH total, completed, failed, documents, chunks, searches, count(m) AS memories
@@ -875,7 +753,7 @@ class Neo4jClient:
         """
         rows = self._run_read_with_retry(cypher, {})
         if not rows:
-            return {
+            empty = {
                 "experiments": {"total": 0, "completed": 0, "failed": 0},
                 "documents": 0,
                 "chunks": 0,
@@ -883,7 +761,12 @@ class Neo4jClient:
                 "memories": 0,
                 "carts": 0,
             }
-        return rows[0]["stats"]
+            log_pipeline_event(logger, "dashboard.stats", "observed empty stats from neo4j", stats=empty)
+            return empty
+        stats = rows[0]["stats"]
+        # observation: log exact numbers + full payload so user can see what neo4j produced for Dashboard stats (documents etc)
+        log_pipeline_event(logger, "dashboard.stats", "observed neo4j stats for dashboard", stats=stats)
+        return stats
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────

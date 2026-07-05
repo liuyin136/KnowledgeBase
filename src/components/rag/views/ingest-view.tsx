@@ -1,12 +1,15 @@
 "use client";
 
 /**
- * IngestView — document upload + IngestConfig + live per-chunk progress + chunk inspector.
- * Frontend_Workflow_Mapping v1.1 §3 (Ingest Page).
+ * IngestView — multi .md file upload + IngestConfig + live per-chunk progress + chunk inspector.
+ *
+ * Upload redesigned (v1.3+): drag/drop or browse multiple .md only. Uses multipart
+ * FormData + api.documents.upload (fixes JSON/multipart binding error).
+ * JSON create retained for edit-save flows.
  *
  * Layout: 3-column grid on lg, stacks on mobile.
  * Server state: TanStack Query ("documents", "ingest-status").
- * Local state: selectedDocumentId, form values, jobId/experimentId, inspector open.
+ * Local state: selectedDocumentId, job/experiment, inspector + upload staging.
  */
 
 import * as React from "react";
@@ -85,7 +88,8 @@ interface DocumentItem {
   id: string;
   filename: string;
   contentType: string;
-  size: number;
+  size: number;       // legacy alias
+  sizeBytes?: number; // server returns this
   createdAt: string;
 }
 
@@ -193,6 +197,8 @@ export function IngestView() {
     },
     refetchOnWindowFocus: false,
   });
+  // observation (browser): active ingestion progress (pre-neo4j events; on done will be in experiment neo4j records)
+  React.useEffect(() => { if (statusQuery.data && typeof window !== "undefined") console.debug("[obs:ingest-active]", { status: statusQuery.data.status, progress: statusQuery.data.progress, chunks: statusQuery.data.events?.length }); }, [statusQuery.data]);
 
   // On completion / failure, invalidate downstream queries once
   const lastHandledStatus = React.useRef<string | null>(null);
@@ -202,7 +208,8 @@ export function IngestView() {
     if (st === "completed" || st === "failed") {
       lastHandledStatus.current = st;
       qc.invalidateQueries({ queryKey: ["dashboard"] });
-      qc.invalidateQueries({ queryKey: ["experiments"] });
+      qc.invalidateQueries({ queryKey: ["documents"] });
+      qc.invalidateQueries({ queryKey: ["experiments"] }); // keep for backend if used
       if (st === "completed") {
         // Also refresh documents count indirectly (chunks come from a new experiment)
         qc.invalidateQueries({ queryKey: ["documents"] });
@@ -252,7 +259,7 @@ export function IngestView() {
     <>
       <ViewHeader
         title="Ingest"
-        description="Upload a document, configure chunking + embedding, and watch per-chunk metadata stream in."
+        description="Upload multiple .md files, configure chunking + embedding, and watch per-chunk metadata stream in."
         icon={Upload}
       />
       <ViewBody>
@@ -442,7 +449,7 @@ export function IngestView() {
                 Chunk Inspector
               </SheetTitle>
               <SheetDescription>
-                Full per-chunk metadata. Use this to compare chunking quality across experiments.
+                Full per-chunk metadata. Use this to compare chunking quality across documents.
               </SheetDescription>
             </SheetHeader>
             {inspectorChunk && <ChunkInspector chunk={inspectorChunk} />}
@@ -455,90 +462,196 @@ export function IngestView() {
 
 // ─── Sub-components ─────────────────────────────────────────────────────────
 
+// ─── Redesigned multi-.md file upload (replaces old paste form) ─────────────
+
 function UploadDocumentCard({ onCreated }: { onCreated: () => void }) {
-  const [filename, setFilename] = React.useState("");
-  const [contentType, setContentType] = React.useState("text/plain");
-  const [text, setText] = React.useState("");
+  const [staged, setStaged] = React.useState<File[]>([]);
+  const [isUploading, setIsUploading] = React.useState(false);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
+  const [isDragOver, setIsDragOver] = React.useState(false);
 
-  const createMutation = useMutation({
-    mutationFn: (vars: { filename: string; text: string; contentType?: string }) =>
-      api.documents.create(vars),
-    onSuccess: () => {
-      toast.success("Document saved");
-      setFilename("");
-      setText("");
-      setContentType("text/plain");
-      onCreated();
-    },
-    onError: (err) => {
-      const msg = err instanceof APIError ? err.message : "Failed to save document";
-      toast.error(msg);
-    },
-  });
-
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!filename.trim()) {
-      toast.error("Filename is required");
-      return;
-    }
-    if (!text.trim()) {
-      toast.error("Document text cannot be empty");
-      return;
-    }
-    createMutation.mutate({ filename: filename.trim(), text, contentType: contentType.trim() || "text/plain" });
+  const isMdFile = (f: File): boolean => {
+    const n = (f.name || "").toLowerCase();
+    return n.endsWith(".md") || n.endsWith(".markdown");
   };
+
+  const addFiles = (newFiles: File[]) => {
+    const valid = newFiles.filter(isMdFile);
+    const rejected = newFiles.length - valid.length;
+    if (rejected > 0) {
+      toast.error(`Only .md files are accepted. Skipped ${rejected}.`);
+    }
+    if (valid.length === 0) return;
+
+    // Avoid exact dups by name+size (simple)
+    setStaged((prev) => {
+      const existingKeys = new Set(prev.map((p) => `${p.name}:${p.size}`));
+      const toAdd = valid.filter((v) => !existingKeys.has(`${v.name}:${v.size}`));
+      return [...prev, ...toAdd];
+    });
+  };
+
+  const removeStaged = (idx: number) => {
+    setStaged((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  const clearStaged = () => setStaged([]);
+
+  // Drag & drop handlers
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(true);
+  };
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+  };
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+    const dropped = Array.from(e.dataTransfer.files || []);
+    if (dropped.length) addFiles(dropped);
+  };
+
+  // Browse
+  const openFileDialog = () => fileInputRef.current?.click();
+  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selected = Array.from(e.target.files || []);
+    if (selected.length) addFiles(selected);
+    // reset input so same file can be picked again later
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  // Batch upload via FormData (multipart) to /api/v1/documents.
+  // The proxy (backend-client.ts) now correctly forwards multipart without
+  // consuming the body via text() first.
+  const uploadStaged = async () => {
+    if (staged.length === 0) return;
+    setIsUploading(true);
+    const fd = new FormData();
+    // Use "files" (plural) to reliably bind to backend's List[UploadFile] param.
+    // Backend also accepts singular "file" for legacy single-file cases.
+    staged.forEach((f) => fd.append("files", f));
+
+    try {
+      const res = await api.documents.upload(fd);
+      const count = res?.ids?.length ?? staged.length;
+      toast.success(`Uploaded ${count} document${count === 1 ? "" : "s"}`);
+      // Auto-select the last one uploaded for convenience (if present)
+      const lastId = res?.ids?.[res.ids.length - 1];
+      if (lastId) {
+        // Parent will receive via onCreated + we can bubble if needed; here we just clear
+      }
+      clearStaged();
+      onCreated();
+    } catch (err) {
+      const msg = err instanceof APIError ? err.message : "Failed to upload files";
+      toast.error(msg);
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const totalBytes = staged.reduce((sum, f) => sum + (f.size || 0), 0);
 
   return (
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2 text-base">
           <FileUp className="h-4 w-4 text-primary" />
-          Upload Document
+          Upload Markdown Files
         </CardTitle>
-        <CardDescription>Paste document text. Markdown is recommended for Structure-Aware chunking.</CardDescription>
+        <CardDescription>
+          Drop or select one or more <span className="font-mono">.md</span> files. Only Markdown accepted.
+        </CardDescription>
       </CardHeader>
-      <CardContent>
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div className="grid grid-cols-1 sm:grid-cols-[2fr_1fr] gap-3">
-            <div className="space-y-1.5">
-              <Label htmlFor="doc-filename">Filename</Label>
-              <Input
-                id="doc-filename"
-                placeholder="my-doc.md"
-                value={filename}
-                onChange={(e) => setFilename(e.target.value)}
-                maxLength={120}
-              />
+      <CardContent className="space-y-4">
+        {/* Drop zone */}
+        <div
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+          onClick={openFileDialog}
+          className={`group flex flex-col items-center justify-center rounded-lg border-2 border-dashed p-6 text-center cursor-pointer transition-colors ${
+            isDragOver ? "border-primary bg-primary/5" : "border-muted-foreground/30 hover:border-primary/60 hover:bg-accent/30"
+          }`}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              openFileDialog();
+            }
+          }}
+          aria-label="Drop markdown files here or click to browse"
+        >
+          <Upload className="h-8 w-8 text-muted-foreground mb-2 group-hover:text-primary transition-colors" />
+          <div className="text-sm font-medium">Drop .md files here</div>
+          <div className="text-[11px] text-muted-foreground">or click to browse (multiple supported)</div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept=".md,.markdown,text/markdown"
+            className="hidden"
+            onChange={handleFileInputChange}
+          />
+        </div>
+
+        {/* Staged files */}
+        {staged.length > 0 && (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+              <span>{staged.length} file{staged.length > 1 ? "s" : ""} ready · {formatBytes(totalBytes)}</span>
+              <button className="underline hover:text-foreground" onClick={clearStaged} disabled={isUploading}>
+                Clear all
+              </button>
             </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="doc-contenttype">Content Type</Label>
-              <Input
-                id="doc-contenttype"
-                placeholder="text/plain"
-                value={contentType}
-                onChange={(e) => setContentType(e.target.value)}
-              />
-            </div>
+            <ul className="space-y-1 max-h-40 overflow-y-auto thin-scroll rounded border p-1">
+              {staged.map((f, idx) => (
+                <li key={`${f.name}-${idx}`} className="flex items-center gap-2 rounded px-2 py-1 text-sm hover:bg-accent/50">
+                  <FileText className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  <div className="min-w-0 flex-1 truncate font-mono text-xs">{f.name}</div>
+                  <div className="text-[10px] text-muted-foreground tabular-nums">{formatBytes(f.size)}</div>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-6 w-6 text-muted-foreground hover:text-red-600"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      removeStaged(idx);
+                    }}
+                    disabled={isUploading}
+                    aria-label={`Remove ${f.name}`}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </li>
+              ))}
+            </ul>
           </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="doc-text">Document Text</Label>
-            <Textarea
-              id="doc-text"
-              placeholder="Paste the full document text here…"
-              className="min-h-[200px] font-mono text-xs"
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-            />
-            <p className="text-[11px] text-muted-foreground">
-              {text.length.toLocaleString()} chars · ~{Math.ceil(text.length / 4).toLocaleString()} tokens
-            </p>
-          </div>
-          <Button type="submit" className="w-full" disabled={createMutation.isPending}>
-            <Upload className="h-4 w-4" />
-            {createMutation.isPending ? "Saving…" : "Save Document"}
-          </Button>
-        </form>
+        )}
+
+        {/* Action */}
+        <Button
+          className="w-full"
+          onClick={uploadStaged}
+          disabled={isUploading || staged.length === 0}
+        >
+          <Upload className="h-4 w-4" />
+          {isUploading
+            ? `Uploading ${staged.length}…`
+            : staged.length > 0
+              ? `Upload ${staged.length} Markdown File${staged.length > 1 ? "s" : ""}`
+              : "Select files to upload"}
+        </Button>
+
+        <p className="text-[11px] text-muted-foreground text-center">
+          Files are stored as upload placeholders (ready for ingest). Markdown enables Structure-Aware chunking.
+        </p>
       </CardContent>
     </Card>
   );
@@ -557,6 +670,8 @@ function DocumentsListCard({
     queryKey: ["documents", { page: 1, pageSize: 50 }],
     queryFn: () => api.documents.list({ page: 1, pageSize: 50 }),
   });
+  // observation (browser): neo4j Knowledge records shown in ingest documents list
+  React.useEffect(() => { if (data && typeof window !== "undefined") console.debug("[obs:ingest-documents]", { total: data.total, sample: data.items?.slice(0,2) }); }, [data]);
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => api.documents.delete(id),
@@ -584,7 +699,7 @@ function DocumentsListCard({
             </Badge>
           )}
         </CardTitle>
-        <CardDescription>Select a document to ingest. Click a row to select.</CardDescription>
+        <CardDescription>Select a document to ingest. Upload more .md files above. Click a row to select.</CardDescription>
       </CardHeader>
       <CardContent>
         {isLoading ? (
@@ -612,7 +727,7 @@ function DocumentsListCard({
           )
         ) : items.length === 0 ? (
           <div className="py-8 text-center text-sm text-muted-foreground">
-            No documents yet. Upload one above — or seed sample docs from the Dashboard.
+            No documents yet. Drop .md files above to upload.
           </div>
         ) : (
           <ul className="space-y-1 max-h-80 overflow-y-auto thin-scroll">
@@ -639,11 +754,21 @@ function DocumentsListCard({
                   <div className="min-w-0 flex-1">
                     <div className="text-sm font-medium truncate">{doc.filename}</div>
                     <div className="text-[11px] text-muted-foreground flex items-center gap-2">
-                      <span className="font-mono">{formatBytes(doc.size)}</span>
+                      <span className="font-mono">{formatBytes(doc.sizeBytes ?? doc.size ?? 0)}</span>
                       <span>·</span>
                       <span className="truncate">{doc.contentType}</span>
                       <span>·</span>
                       <span>{timeAgo(doc.createdAt)}</span>
+                      {(doc as any).representativeEmbeddingMethod && (
+                        <Badge variant="outline" className="text-[9px] ml-1">{(doc as any).representativeEmbeddingMethod}</Badge>
+                      )}
+                      {(doc as any).kinds && (doc as any).kinds.length > 1 && (
+                        <span className="text-[9px] text-primary/70">+{(doc as any).kinds.length - 1} kinds</span>
+                      )}
+                      {/* Highlight if longtext knowledge present (from Knowledge nodes) */}
+                      {(doc as any).representativeEmbeddingMethod === 'LongText' && (
+                        <Badge className="text-[9px] ml-1 bg-blue-500/20 text-blue-600">LongText :knowledge</Badge>
+                      )}
                     </div>
                   </div>
                   <AlertDialog>
@@ -714,7 +839,7 @@ function IngestProgressPanel({
   onOpenInspector: (chunk: ChunkMetadata) => void;
   onReset: () => void;
 }) {
-  const setActiveExperiment = useUIStore((s) => s.setActiveExperiment);
+  const setActiveDocument = useUIStore((s) => s.setActiveDocument);
   const setView = useUIStore((s) => s.setView);
 
   if (isLoading) {
@@ -793,19 +918,19 @@ function IngestProgressPanel({
             <CheckCircle2 className="h-4 w-4 text-emerald-600" />
             <AlertTitle>Ingestion completed</AlertTitle>
             <AlertDescription className="text-sm">
-              {chunkEvents.length} chunks embedded with full metadata. View the experiment to compare runs.
+              {chunkEvents.length} chunks embedded with full metadata. View the document to see records.
               <div className="mt-2 flex gap-2 flex-wrap">
                 <Button
                   size="sm"
                   onClick={() => {
                     if (experimentId) {
-                      setActiveExperiment(experimentId);
-                      setView("experiments");
+                      setActiveDocument(experimentId);
+                      setView("documents");
                     }
                   }}
                   disabled={!experimentId}
                 >
-                  View Experiment <ArrowRight className="h-3.5 w-3.5" />
+                  View Document <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
                 <Button size="sm" variant="outline" onClick={onReset}>
                   New Ingestion
@@ -845,7 +970,7 @@ function IngestProgressPanel({
         </div>
         {chunkEvents.length === 0 ? (
           <div className="py-8 text-center text-sm text-muted-foreground">
-            {completed ? "No chunk events emitted (LongText path)." : "Waiting for first chunk…"}
+            {completed ? "LongText windows stored as :Knowledge (full text visible in Documents). No per-child events." : "Waiting for first chunk…"}
           </div>
         ) : (
           <div className="rounded-md border max-h-96 overflow-y-auto thin-scroll">
@@ -902,7 +1027,7 @@ function ChunkInspector({ chunk }: { chunk: ChunkMetadata }) {
   const rows: { label: string; value: React.ReactNode; mono?: boolean }[] = [
     { label: "Chunk ID", value: chunk.chunkId, mono: true },
     { label: "Parent Doc ID", value: chunk.parentDocId, mono: true },
-    { label: "Experiment ID", value: chunk.experimentId, mono: true },
+    { label: "Run ID", value: chunk.experimentId, mono: true },
     { label: "Chunk Index", value: chunk.chunkIndex, mono: true },
     { label: "Chunk Method", value: chunk.chunkMethod, mono: true },
     { label: "Embedding Method", value: chunk.embeddingMethod, mono: true },

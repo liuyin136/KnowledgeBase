@@ -9,28 +9,24 @@
  * is natively 1024-dim. Both model families write into the SAME indexes.
  */
 
-// Active embedding model — repo id (v1.3 default = Jina v5 small).
-// The actual repo is selected at backend runtime via EMBEDDING_MODEL env var
-// (logical id "jina-v5-small" | "bge-m3"). This constant is the *display* default.
+// Active embedding model — FORCED to Jina Embeddings v5 Text Small only (ingestion).
 export const EMBEDDING_MODEL = "jinaai/jina-embeddings-v5-text-small";
-export const EMBEDDING_MODEL_LOGICAL = "jina-v5-small"; // logical id used in EMBEDDING_MODEL env var
-export const EMBEDDING_DIM = 1024; // matches neo4j-schema-v1.1.md §3 (kept STABLE for both Jina + BGE-M3)
-// Native output dims (for observability) — Jina v5 small = 1536, BGE-M3 = 1024.
+export const EMBEDDING_MODEL_LOGICAL = "jina-v5-small";
+export const EMBEDDING_DIM = 1024;
+// Native output dim (for observability) — Jina v5 small = 1536.
 export const JINA_V5_SMALL_NATIVE_DIM = 1536;
-export const BGE_M3_NATIVE_DIM = 1024;
 
 // Reranker — repo id (v1.3 default = Jina Reranker v3).
 export const RERANKER_MODEL = "jinaai/jina-reranker-v3";
 export const RERANKER_MODEL_LOGICAL = "jina-v3"; // logical id used in RERANKER_MODEL env var
 
-// Alternative (BGE-M3) constants — kept for reference + the Settings UI toggle.
-export const BGE_M3_REPO = "BAAI/bge-m3";
+// Reranker kept for reference (embedding is Jina v5 only).
 export const BGE_RERANKER_REPO = "BAAI/bge-reranker-base";
 
-// Jina Embeddings v5 is task-conditioned. The backend's EmbeddingModule maps
-// is_query → task string. Documented here for the Settings UI's information card.
-export const JINA_TASK_QUERY = "retrieval.query";
-export const JINA_TASK_PASSAGE = "retrieval.passages";
+// Jina Embeddings v5 (forced): backend uses task="retrieval" + prompt_name="document"|"query"
+// for encode() during ingestion. These are legacy display constants.
+export const JINA_TASK_QUERY = "retrieval";
+export const JINA_TASK_PASSAGE = "retrieval";
 
 export const CHUNK_TARGET_TOKENS: Record<string, number> = {
   Recursive: 512,
@@ -39,8 +35,8 @@ export const CHUNK_TARGET_TOKENS: Record<string, number> = {
 };
 
 export const CHUNK_OVERLAP_TOKENS = 64;
-export const LONGTEXT_WINDOW_TOKENS = 8000; // sliding window for LongText path
-export const LONGTEXT_OVERLAP_TOKENS = 800; // 10%
+export const LONGTEXT_WINDOW_TOKENS = 30000; // sliding window for LongText path
+export const LONGTEXT_OVERLAP_TOKENS = 3000; // 10%
 
 export const EMBEDDING_MAX_RETRIES = 3;
 export const EMBEDDING_BACKOFF_MS = [1000, 2000, 4000]; // exp backoff per error-handling spec §3

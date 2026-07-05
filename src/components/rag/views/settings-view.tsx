@@ -1,31 +1,13 @@
 "use client";
 
 /**
- * SettingsView — v1.3 model selection read-only display.
+ * SettingsView — read-only display (embedding forced to Jina v5 small only).
  *
- * v1.3 model migration: the default embedding is now Jina Embeddings v5 (small)
- * and the default reranker is Jina Reranker v3. BGE-M3 / BGE-reranker-base
- * remain available as toggleable alternatives.
+ * Embedding model for ingestion is locked to jinaai/jina-embeddings-v5-text-small.
+ * Encode always uses task="retrieval" + prompt_name="document" (or "query").
  *
- * DESIGN DECISION (v1.3 — read-only settings):
- *   Model selection is env-var driven (`EMBEDDING_MODEL`, `RERANKER_MODEL`) and
- *   is set at container start. The frontend Settings view is READ-ONLY — it shows
- *   the currently active model (from the dashboard `system` field) and provides
- *   clear instructions for switching. This avoids the runtime model-reload
- *   complexity (which is risky with GPU memory and would also require
- *   re-ingesting documents since vectors are model-specific).
- *
- *   Switching models requires:
- *     1. Edit docker/.env (or docker-compose env block) — set
- *        EMBEDDING_MODEL=bge-m3 (or jina-v5-small to switch back).
- *     2. Optionally also set RERANKER_MODEL=bge-reranker-base (or jina-v3).
- *     3. `docker compose up -d --force-recreate backend api-worker`
- *     4. Re-ingest documents (vectors are model-specific — old vectors
- *        were produced by the previous model and are NOT compatible).
- *
- *   The Neo4j vector indexes themselves stay 1024-dim cosine for BOTH models —
- *   Jina v5 small uses Matryoshka truncation to 1024, BGE-M3 is natively 1024.
- *   So you do NOT need to re-create the Neo4j schema when switching models.
+ * Model selection (reranker) remains env-var driven at container start.
+ * Re-ingest after changes (vectors model-specific).
  */
 
 import * as React from "react";
@@ -84,23 +66,13 @@ interface DashboardData {
 const EMBEDDING_OPTIONS = [
   {
     logicalId: "jina-v5-small",
-    name: "Jina Embeddings v5 — Text Small",
+    name: "Jina Embeddings v5 — Text Small (FORCED ONLY)",
     repo: "jinaai/jina-embeddings-v5-text-small",
     nativeDim: 1536,
     isDefault: true,
     description:
-      "Task-conditioned Matryoshka-capable model. v1.3 default. Outputs 1024-dim vectors into Neo4j (truncated from native 1536) so the existing HNSW indexes work unchanged. Passes task='retrieval.query' for search and task='retrieval.passages' for indexing.",
-    highlights: ["Task-conditioned", "Matryoshka → 1024", "Long-context", "v1.3 default"],
-  },
-  {
-    logicalId: "bge-m3",
-    name: "BGE-M3",
-    repo: "BAAI/bge-m3",
-    nativeDim: 1024,
-    isDefault: false,
-    description:
-      "Multi-function (dense + sparse + multi-vector) embedding. Natively 1024-dim. No task conditioning — the is_query flag is ignored. Kept as a toggleable alternative for backward compatibility with v1.2 ingests.",
-    highlights: ["1024-dim native", "Multi-function", "v1.2 fallback"],
+      "Forced for ingestion. model.encode uses task=\"retrieval\", prompt_name=\"document\" (passages) or \"query\". Matryoshka to 1024-dim for Neo4j HNSW.",
+    highlights: ["task=\"retrieval\" + prompt_name", "Matryoshka → 1024", "forced only"],
   },
 ];
 
@@ -149,7 +121,7 @@ export function SettingsView() {
     <>
       <ViewHeader
         title="Settings"
-        description="v1.3 model selection — Jina v5 default + BGE-M3 toggle (read-only)"
+        description="Jina-embeddings-v5-text-small only for ingestion (read-only)"
         icon={SettingsIcon}
         actions={
           <button
@@ -208,7 +180,7 @@ export function SettingsView() {
                   <Lightbulb className="h-3 w-3" /> Indexes stay 1024-dim
                 </div>
                 <p className="text-xs leading-relaxed">
-                  Jina v5 small uses Matryoshka truncation to 1024 dims; BGE-M3 is natively 1024.
+                  Jina v5 small uses Matryoshka truncation to 1024 dims.
                   The Neo4j vector indexes do NOT need re-creation when switching models.
                 </p>
               </div>
@@ -328,7 +300,7 @@ export function SettingsView() {
                 Switch via env var + container recreate
               </CardTitle>
               <CardDescription className="text-xs">
-                Example: switch from the v1.3 default (Jina v5 + Jina Reranker v3) to BGE-M3 + BGE
+                Example: configure reranker (embedding is forced Jina v5)
                 Reranker base.
               </CardDescription>
             </CardHeader>
@@ -452,7 +424,7 @@ docker compose run --rm backend \\
                   <strong>Jina task conditioning</strong>: the orchestrator passes{" "}
                   <code className="font-mono">is_query=True</code> for queries (task=&quot;retrieval.query&quot;)
                   and <code className="font-mono">is_query=False</code> for documents
-                  (task=&quot;retrieval.passages&quot;). BGE-M3 ignores the flag.
+                  (task="retrieval", prompt_name="document").
                 </li>
                 <li>
                   <strong>Matryoshka truncation</strong>: Jina v5 small is loaded with{" "}

@@ -1160,20 +1160,19 @@ function AllMemoriesSection() {
   const [open, setOpen] = React.useState(false);
   const [expFilter, setExpFilter] = React.useState<string>("all");
 
-  // Search-experiments for the filter dropdown.
-  const { data: expData } = useQuery({
-    queryKey: ["experiments", "list", { kind: "search" }],
-    queryFn: () => api.experiments.list({ page: 1, pageSize: 50, kind: "search" }),
+  // Search documents for the filter dropdown (repurposed from experiments).
+  const { data: docData } = useQuery({
+    queryKey: ["documents", "list", { kind: "search" }],
+    queryFn: () => api.documents.list({ page: 1, pageSize: 50 }),
   });
-  const searchExps = expData?.items ?? [];
+  const searchDocs = docData?.items ?? [];
 
   const { data, isLoading, isError, error } = useQuery({
-    queryKey: ["memories", "all", 1, 50, expFilter],
+    queryKey: ["memories", "all", 1, 50],
     queryFn: () =>
       api.memories.list({
         page: 1,
         pageSize: 50,
-        experimentId: expFilter === "all" ? undefined : expFilter,
       }),
     enabled: open,
   });
@@ -1201,16 +1200,16 @@ function AllMemoriesSection() {
         <CollapsibleContent>
           <CardContent className="space-y-3">
             <div className="flex items-center gap-2 flex-wrap">
-              <Label htmlFor="exp-filter" className="text-xs text-muted-foreground">Filter by experiment</Label>
+              <Label htmlFor="exp-filter" className="text-xs text-muted-foreground">Filter by document</Label>
               <Select value={expFilter} onValueChange={setExpFilter}>
                 <SelectTrigger id="exp-filter" className="h-8 w-[260px] text-xs">
-                  <SelectValue placeholder="All experiments" />
+                  <SelectValue placeholder="All documents" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="all">All experiments</SelectItem>
-                  {searchExps.map((e) => (
-                    <SelectItem key={e.id} value={e.id}>
-                      {e.description?.slice(0, 60) ?? e.id}
+                  <SelectItem value="all">All documents</SelectItem>
+                  {searchDocs.map((d) => (
+                    <SelectItem key={d.id} value={d.id}>
+                      {d.filename?.slice(0, 60) ?? d.id}
                     </SelectItem>
                   ))}
                 </SelectContent>

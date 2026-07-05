@@ -7,7 +7,7 @@ import {
   Upload,
   Search,
   ShoppingCart,
-  FlaskConical,
+  FileText,
   Moon,
   Sun,
   Database,
@@ -21,7 +21,7 @@ const NAV: { key: ViewKey; label: string; icon: React.ComponentType<{ className?
   { key: "ingest", label: "Ingest", icon: Upload, desc: "Upload & embed documents" },
   { key: "search", label: "Hybrid Search", icon: Search, desc: "Tunable retrieval" },
   { key: "memory", label: "Memory Cart", icon: ShoppingCart, desc: "Curate retrieval results" },
-  { key: "experiments", label: "Experiments", icon: FlaskConical, desc: "History & comparison" },
+  { key: "documents", label: "Documents", icon: FileText, desc: "All uploaded, ingested & chunked files" },
   { key: "settings", label: "Settings", icon: Settings, desc: "Active models & how to switch" },
 ];
 

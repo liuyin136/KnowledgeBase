@@ -5,7 +5,7 @@ api/v1/search.py — Search endpoints.
   • GET   /api/v1/searches/history    → paginated list of past search experiments
 
 The POST endpoint:
-  1. Creates a fresh :Experiment record (kind=search, status=pending).
+  1. Generates experiment_id (run tag, no :Experiment node).
   2. Creates a job in the ProgressTracker.
   3. Dispatches the background search task.
   4. Returns 202 immediately with {jobId, searchId, status:"queued"}.
@@ -22,7 +22,7 @@ from app.api.dependencies import get_db, get_embedding_module, get_job_tracker
 from app.core.constants import JobType
 from app.db.neo4j_client import Neo4jClient
 from app.schemas.common import Paginated
-from app.schemas.experiment import ExperimentResponse
+# ExperimentResponse no longer used; search history stubbed as no :Experiment node
 from app.schemas.ingest import JobStatusResponse
 from app.schemas.search import StartSearchRequest, StartSearchResponse
 from app.services.embedding import EmbeddingModule
@@ -65,39 +65,21 @@ def start_search(
     )
 
 
-@router.get("/searches/history", response_model=Paginated[ExperimentResponse])
+@router.get("/searches/history", response_model=Paginated[dict])
 def search_history(
     page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=20, ge=1, le=100),
     experimentId: Optional[str] = Query(default=None),
     db: Neo4jClient = Depends(get_db),
-) -> Paginated[ExperimentResponse]:
-    """Return paginated search-kind experiments.
-
-    If `experimentId` is provided, filter to that single experiment (the
-    frontend uses this for the search history view filtered by active experiment).
+) -> Paginated[dict]:
+    """Search history stub: :Experiment node removed per redesign.
+    Returns empty for now. Use document/source_file based history in Documents view.
     """
-    # Reuse the experiments list with kind=search filter
-    from app.api.v1.experiments import _exp_to_response
-
-    if experimentId:
-        # Single experiment lookup
-        e = db.get_experiment(experimentId)
-        if not e:
-            return Paginated[ExperimentResponse](
-                items=[], total=0, page=page, pageSize=pageSize, hasMore=False
-            )
-        items = [_exp_to_response(e)]
-        return Paginated[ExperimentResponse](
-            items=items, total=1, page=1, pageSize=pageSize, hasMore=False
-        )
-
-    items_raw, total = db.list_experiments(kind="search", page=page, page_size=pageSize)
-    items = [_exp_to_response(i) for i in items_raw]
-    return Paginated[ExperimentResponse](
-        items=items,
-        total=total,
+    # All experiment node related deleted. No more list_experiments or get_experiment.
+    return Paginated[dict](
+        items=[],
+        total=0,
         page=page,
         pageSize=pageSize,
-        hasMore=(page * pageSize) < total,
+        hasMore=False,
     )

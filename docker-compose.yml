@@ -1,5 +1,5 @@
 # =============================================================================
-# Root docker-compose.yml — Local-First RAG Experimentation Platform v1.3
+# Root docker-compose.yml — Local-First RAG Platform (experiment node removed, Documents view on :Knowledge)
 #
 # Thin wrapper so `docker compose <cmd>` (run from the project root) works
 # without having to pass `-f docker/docker-compose.yml` every time.

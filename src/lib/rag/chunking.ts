@@ -5,7 +5,7 @@
  *   (Mirrors services/chunking.py from backend-directory-structure spec.)
  *
  * Supported methods (v1 — standard paths only, NO Late/Agentic):
- *   • LongText          — sliding window (~8k tokens, 10% overlap). For the
+ *   • LongText          — sliding window (30000 tokens default via backend config, 10% overlap). For the
  *                         LongText embedding approach (whole-doc or windows).
  *   • Recursive         — recursive character splitter (markdown-aware) with
  *                         overlap, target ~512 tokens.

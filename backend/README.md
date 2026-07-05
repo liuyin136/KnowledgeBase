@@ -31,7 +31,7 @@ backend/
 ├── app/
 │   ├── main.py                          # FastAPI factory + lifespan + global exception handler
 │   ├── core/                            # config, logging, exceptions, constants
-│   ├── api/v1/                          # router + experiments, documents, ingest, search, memory, jobs, dashboard, seed
+│   ├── api/v1/                          # router + experiments, documents, ingest, search, memory, jobs, dashboard
 │   ├── schemas/                         # Pydantic v2 models mirroring src/lib/rag/types.ts EXACTLY
 │   ├── services/                        # orchestrator, chunking, embedding, retrieval, metadata (STRICT boundaries)
 │   ├── models/                          # neo4j_models.py
@@ -140,7 +140,7 @@ The Next.js proxy in `src/app/api/v1/*/route.ts` forwards requests unchanged.
 | PATCH | `/api/v1/memory-carts/{id}` | Update name/description OR set/add memory ids |
 | GET | `/api/v1/jobs/{jobId}` | Generic job status (ingest or search) |
 | GET | `/api/v1/dashboard` | Stats + recent experiments + recent searches + system info |
-| POST | `/api/v1/seed` | Seed 4 sample markdown docs into Neo4j |
+| (removed) | `/api/v1/seed` | Seed functionality removed |
 | GET | `/health` | Health check (`{status:"ok"}`) |
 
 ### Error contract
@@ -226,7 +226,7 @@ docker compose up -d
 ### Ingest — LongText
 
 ```
-Document → ChunkingModule.chunk_long_text (sliding window ~8k tokens, 10% overlap)
+Document → ChunkingModule.chunk_long_text (sliding window 30000 tokens via config, 10% overlap)
          → for each window:
              EmbeddingModule.embed_with_retry (LongText)
              Neo4jClient.create_knowledge (window IS its own :Knowledge node)

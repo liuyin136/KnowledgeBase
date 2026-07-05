@@ -6,7 +6,7 @@ api/v1/ingest.py — Ingest endpoints.
 
 The POST endpoint:
   1. Looks up the document text from Neo4j (Knowledge node stored at upload).
-  2. Creates a fresh :Experiment record (status=pending).
+  2. Generates experiment_id (run tag, no :Experiment node).
   3. Creates a job in the ProgressTracker (Redis).
   4. Dispatches the background ingest task (FastAPI BackgroundTasks).
   5. Returns 202 immediately with {jobId, experimentId, status:"queued"}.

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # =============================================================================
-# Dockerfile.backend — Local-First RAG Experimentation Platform v1.3
+# Dockerfile.backend — Local-First RAG Platform (experiment node deleted)
 #
 # ARCHITECTURAL DESIGN & TRADE-OFFS
 # =================================

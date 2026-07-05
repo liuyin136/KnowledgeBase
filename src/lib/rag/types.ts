@@ -42,7 +42,6 @@ export type SearchConfig = z.infer<typeof SearchConfigSchema>;
 export interface ChunkMetadata {
   chunkId: string;
   parentDocId: string;
-  experimentId: string;
   chunkIndex: number;
   chunkMethod: string;
   embeddingMethod: string;
@@ -53,6 +52,10 @@ export interface ChunkMetadata {
   charEnd?: number;
   section?: string;
   textPreview: string;
+  // Added for full document visibility on Experiments page
+  text?: string;
+  nodeType?: string; // 'knowledge' | 'knowledge_chunk'
+  parentSourceFile?: string;
 }
 
 export interface ExperimentRun {
@@ -188,4 +191,15 @@ export interface Paginated<T> {
   page: number;
   pageSize: number;
   hasMore: boolean;
+}
+
+// ─── Document text (for :Knowledge raw visibility in Experiments) ──────────
+export interface DocumentTextResponse {
+  sourceFile: string;
+  text: string | null;
+  kind?: string; // 'upload' | 'knowledge' | 'fallback'
+  embeddingMethod?: string;
+  experimentId?: string | null;
+  id?: string;
+  createdAt?: string;
 }

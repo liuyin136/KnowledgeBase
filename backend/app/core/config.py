@@ -2,28 +2,19 @@
 core/config.py — Pydantic Settings for the Local-First RAG Experimentation Platform v1.3.
 
 All environment-driven configuration lives here. Single source of truth for:
-  • Neo4j connection (URI/user/password) — per infrastructure-environment-spec_v1.1.md §5
+  • Neo4j connection (URI/user/password)
   • Redis URL (job queue + progress tracking)
-  • Embedding model selection (v1.3 — Jina Embeddings v5 default + BGE-M3 alternative)
-  • Reranker model selection (v1.3 — Jina Reranker v3 default + BGE-reranker-base alternative)
-  • Embedding dimension (1024 — kept STABLE for both models via Jina Matryoshka truncation)
+  • Embedding model: FORCED to jina-embeddings-v5-text-small ONLY (ingestion)
+  • Reranker model selection (Jina Reranker v3 default)
+  • Embedding dimension (1024 via Jina Matryoshka truncation)
   • Frontend CORS origin (configurable; default "*" for dev)
   • Logging level
+  • LongText sliding window (now defaults to 30000 tokens via longtext_window_tokens)
 
-v1.3 model migration decisions (CRITICAL):
-  • Default embedding: jinaai/jina-embeddings-v5-text-small (Jina v5 small, 1536-dim native)
-  • Default reranker: jinaai/jina-reranker-v3
-  • BGE-M3 + BGE-reranker-base remain available as toggleable alternatives.
-  • Neo4j vector indexes are 1024-dim cosine (per neo4j-schema-v1.1.md §3). To keep
-    these indexes working when Jina v5 is selected (which natively outputs 1536 dims),
-    we invoke Jina with Matryoshka truncation via `dimensions=settings.embedding_dim`
-    (1024). BGE-M3 is natively 1024-dim. Both models therefore emit 1024-dim vectors
-    into the SAME Neo4j vector indexes — NO re-indexing required when switching models.
-    (Caveat: vectors are still model-specific. Switching models requires re-ingesting
-    documents so the persisted vectors match the active embedder. The Settings UI
-    documents this clearly.)
-  • `embedding_dim` stays 1024. The `model_dim` property returns the model's NATIVE
-    dimension (Jina v5 small = 1536, BGE-M3 = 1024) for observability only.
+Jina v5 only for embedding (per update request):
+  • Model: jinaai/jina-embeddings-v5-text-small
+  • Encode uses task="retrieval" (document/query prompt handled internally by Jina v5 ST model)
+  • Re-ingest documents when model changes (vectors are model-specific).
 
 Loaded from environment variables (or .env) at process start; never mutated at runtime.
 """
@@ -37,25 +28,20 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-# ─── v1.3 logical model id → human-readable name ─────────────────────────────
-# These are the *selectable* logical ids exposed via EMBEDDING_MODEL / RERANKER_MODEL
-# env vars. Each maps to a HuggingFace repo id + a native output dimension.
+# ─── Model ids (Jina v5 embedding FORCED only; reranker still has choice) ─────
+# Embedding is locked to Jina Embeddings v5 Text Small for all ingestion.
 
 EMBEDDING_MODEL_IDS = {
     "jina-v5-small": "jina-embeddings-v5-text-small",
-    "bge-m3": "bge-m3",
 }
 RERANKER_MODEL_IDS = {
     "jina-v3": "jina-reranker-v3",
     "bge-reranker-base": "bge-reranker-base",
 }
 
-# Native output dims (Jina v5 small = 1536, BGE-M3 = 1024). The Neo4j vector
-# indexes are 1024-dim; Jina uses Matryoshka truncation to 1024 so both models
-# write into the SAME indexes without re-creation.
+# Native output dim for Jina v5 small.
 MODEL_NATIVE_DIM = {
-    "jina-v5-small": 1536,
-    "bge-m3": 1024,
+    "jina-v5-small": 1024,
 }
 
 
@@ -79,13 +65,12 @@ class Settings(BaseSettings):
     # ─── Redis ────────────────────────────────────────────────────────────────
     redis_url: str = Field(default="redis://localhost:6379/0", description="Redis URL (job queue + progress)")
 
-    # ─── Embedding model selection (v1.3) ─────────────────────────────────────
-    # Selectable logical id: "jina-v5-small" (default) | "bge-m3".
+    # ─── Embedding model (FORCED Jina v5 small only) ──────────────────────────
     embedding_model: str = Field(
         default="jina-v5-small",
         description=(
-            "Logical embedding model id. v1.3 default is jina-v5-small. "
-            "Set EMBEDDING_MODEL=bge-m3 to use BGE-M3 (kept as a toggleable alternative)."
+            "Embedding model is FORCED to jina-embeddings-v5-text-small only. "
+            "This value is locked for ingestion (task=\"retrieval\" conditioning)."
         ),
     )
 
@@ -129,8 +114,8 @@ class Settings(BaseSettings):
     embedding_dim: int = Field(
         default=1024,
         description=(
-            "Output dim written to Neo4j vector indexes. Stays 1024 for BOTH models — "
-            "Jina v5 small uses Matryoshka truncation to 1024; BGE-M3 is natively 1024."
+            "MUST be 1024. Jina v5 small (native 1024) is truncated via Matryoshka "
+            "`truncate_dim` at model load to match the pre-set Neo4j vector index dim."
         ),
     )
     embedding_max_retries: int = Field(default=3, description="Per error-handling spec §3")
@@ -151,8 +136,8 @@ class Settings(BaseSettings):
     chunk_target_tokens_semantic: int = 400
     chunk_target_tokens_structure: int = 600
     chunk_overlap_tokens: int = 64
-    longtext_window_tokens: int = 8000
-    longtext_overlap_tokens: int = 800
+    longtext_window_tokens: int = 30000
+    longtext_overlap_tokens: int = 3000
 
     # ─── Adaptive α/β sweep grid (construction note #2) ───────────────────────
     # alpha ∈ {0.1, 0.2, ..., 0.9}; beta = 1 - alpha.
@@ -194,10 +179,7 @@ class Settings(BaseSettings):
 
     @property
     def embedding_repo(self) -> str:
-        """Resolve the active embedding HuggingFace repo id from `embedding_model`."""
-        if self.embedding_model == "bge-m3":
-            return self.bge_m3_repo
-        # Default to Jina v5 small for "jina-v5-small" (and any unrecognized value).
+        """Always return Jina v5 small repo (embedding is forced to Jina only)."""
         return self.jina_v5_repo
 
     @property
@@ -210,11 +192,8 @@ class Settings(BaseSettings):
 
     @property
     def embedding_model_name(self) -> str:
-        """Local subdir name under MODEL_PATH for the active embedding model.
-
-        Derived from the logical id (e.g. "jina-v5-small" → "jina-embeddings-v5-text-small").
-        """
-        return EMBEDDING_MODEL_IDS.get(self.embedding_model, "jina-embeddings-v5-text-small")
+        """Local subdir name under MODEL_PATH for Jina v5 (forced)."""
+        return "jina-embeddings-v5-text-small"
 
     @property
     def reranker_model_name(self) -> str:
@@ -226,12 +205,12 @@ class Settings(BaseSettings):
 
     @property
     def model_dim(self) -> int:
-        """Native output dimension of the active embedding model (for observability).
+        """Native output dimension of the (forced) Jina v5 small embedding model.
 
-        Jina v5 small = 1536; BGE-M3 = 1024. NOTE: the ACTUAL dim written to Neo4j
-        is `embedding_dim` (1024) — Jina uses Matryoshka truncation to match.
+        Jina v5 small native = 1024. NOTE: ACTUAL stored vectors + Neo4j index
+        use `embedding_dim` (1024) via Matryoshka `truncate_dim` at load time.
         """
-        return MODEL_NATIVE_DIM.get(self.embedding_model, 1536)
+        return MODEL_NATIVE_DIM.get(self.embedding_model, 1024)
 
     @property
     def reranker_max_length(self) -> int:
@@ -247,17 +226,16 @@ class Settings(BaseSettings):
     @classmethod
     def _dim_must_be_positive(cls, v: int) -> int:
         if v <= 0:
-            raise ValueError("embedding_dim must be positive (1024 for both Jina v5 + BGE-M3)")
+            raise ValueError("embedding_dim must be positive (must be 1024 for jina-embeddings-v5-text-small + Neo4j index)")
         return v
 
     @field_validator("embedding_model")
     @classmethod
     def _embedding_model_must_be_known(cls, v: str) -> str:
         v_norm = (v or "").strip().lower()
-        if v_norm not in EMBEDDING_MODEL_IDS:
-            raise ValueError(
-                f"embedding_model must be one of {sorted(EMBEDDING_MODEL_IDS)} (got {v!r})"
-            )
+        if v_norm != "jina-v5-small":
+            # Force Jina v5 only for ingestion. Ignore other values but log intent.
+            return "jina-v5-small"
         return v_norm
 
     @field_validator("reranker_model")

@@ -1,16 +1,17 @@
 """
 schemas/document.py — Document upload + list models.
 
-Documents are stored in Neo4j as :Knowledge nodes (per ingest run). The
-`/documents` endpoint serves a logical "unique source files" view derived
-from the Knowledge graph so the frontend's Upload + DocumentsListCard flow
-works against the FastAPI backend unchanged.
+Supports:
+- JSON body for single doc (paste / edit-save flows)
+- Multipart with one or more 'file' fields for .md uploads (primary new mechanism)
+
+The `/documents` endpoint serves a logical "unique source files" view.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -32,7 +33,14 @@ class DocumentItem(BaseModel):
     sizeBytes: int
     totalChunks: int
     createdAt: datetime
+    # Extras for UI (badges distinguishing Upload vs LongText ingested :Knowledge)
+    representativeEmbeddingMethod: Optional[str] = None
+    kinds: Optional[List[str]] = None
 
 
 class DocumentCreatedResponse(BaseModel):
-    id: str
+    """Batch-friendly response for document creation (supports multi-file uploads).
+
+    ids always contains the created source_file identifiers (one or more).
+    """
+    ids: List[str]

@@ -33,7 +33,6 @@ class CreateChunkMetadataInput:
         *,
         chunk_id: str,
         parent_doc_id: str,
-        experiment_id: str,
         chunk_index: int,
         chunk_method: str,
         embedding_method: str,
@@ -47,7 +46,6 @@ class CreateChunkMetadataInput:
     ) -> None:
         self.chunk_id = chunk_id
         self.parent_doc_id = parent_doc_id
-        self.experiment_id = experiment_id
         self.chunk_index = chunk_index
         self.chunk_method = chunk_method
         self.embedding_method = embedding_method
@@ -65,7 +63,6 @@ def create_chunk_metadata(inp: CreateChunkMetadataInput) -> ChunkMetadata:
     return ChunkMetadata(
         chunkId=inp.chunk_id,
         parentDocId=inp.parent_doc_id,
-        experimentId=inp.experiment_id,
         chunkIndex=inp.chunk_index,
         chunkMethod=inp.chunk_method,
         embeddingMethod=inp.embedding_method,

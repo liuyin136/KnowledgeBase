@@ -1,8 +1,8 @@
 """
-schemas/experiment.py — Experiment request/response models.
+schemas/experiment.py — Experiment request/response models (in-memory run metadata).
 
-Mirrors the ExperimentRun interface in src/lib/rag/types.ts and the
-Experiment Neo4j node (v1.2 extended fields) in models/neo4j_models.py.
+Mirrors the ExperimentRun interface in src/lib/rag/types.ts.
+No :Experiment node in Neo4j (removed); these are pure correlation + observability DTOs.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ class CreateExperimentRequest(BaseModel):
 
 
 class ExperimentResponse(BaseModel):
-    """Full experiment record (matches the v1.2 extended Experiment node)."""
+    """Full experiment record shape (for API compat; not backed by :Experiment node)."""
 
     id: str
     description: str

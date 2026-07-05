@@ -12,7 +12,7 @@ Idempotency:
   • Each task owns exactly one job_id + one experiment_id.
   • Re-invoking a task with the same ids will create duplicate nodes —
     callers must generate fresh ids per logical run.
-  • Failed runs persist Experiment.status='failed' so the UI shows the error.
+  • Failed runs are logged; UI surfaces via job status (no :Experiment node).
 """
 
 from __future__ import annotations

@@ -12,7 +12,6 @@
   total_tokens: integer,
   embedding_method: string,           // "LongText"
   created_at: datetime,
-  experiment_id: string,
   vector: list<float>                 // dimension depends on model (e.g. 1024 for BGE-M3)
 })
 ```
@@ -82,22 +81,6 @@
 })
 ```
 
-### :Experiment
-```cypher
-(:Experiment {
-  id: string (UUID),
-  description: string,
-  embedding_approach: string,
-  chunk_method: string,
-  total_chunks: integer,
-  avg_tokens_per_chunk: float,
-  total_time_ms: float,
-  source_file: string,
-  created_at: datetime,
-  status: string
-})
-```
-
 ## 2. Relationships
 
 ```cypher
@@ -121,7 +104,7 @@ CREATE CONSTRAINT knowledgechunk_id IF NOT EXISTS FOR (c:KnowledgeChunk) REQUIRE
 CREATE CONSTRAINT userquery_id IF NOT EXISTS FOR (q:UserQuery) REQUIRE q.id IS UNIQUE;
 CREATE CONSTRAINT memory_id IF NOT EXISTS FOR (m:Memory) REQUIRE m.id IS UNIQUE;
 CREATE CONSTRAINT memorycart_id IF NOT EXISTS FOR (c:MemoryCart) REQUIRE c.id IS UNIQUE;
-CREATE CONSTRAINT experiment_id IF NOT EXISTS FOR (e:Experiment) REQUIRE e.id IS UNIQUE;
+-- No :Experiment node (removed from architecture; correlation uses internal experiment_id only)
 
 // Vector Indexes (HNSW, cosine)
 CREATE VECTOR INDEX knowledge_vector IF NOT EXISTS
@@ -145,10 +128,22 @@ CREATE FULLTEXT INDEX knowledgechunk_text IF NOT EXISTS FOR (c:KnowledgeChunk) O
 
 **Note**: Vector dimensions should be configurable via `core/config.py` based on the chosen embedding model.
 
-## 4. Recommended Query Patterns (for reference)
+## 4. Recommended Query Patterns (for reference, updated per redesign)
 
-- Get all chunks for an experiment with metadata
+- Get documents by source_file from :Knowledge (the working Ingest/Documents list query):
+  MATCH (k:Knowledge)
+  WITH k.source_file AS source_file,
+       head(collect(k)) AS first,
+       count(k) AS chunk_count,
+       collect(DISTINCT k.embedding_method) AS methods
+  RETURN collect({ id: source_file, filename: source_file, ... }) AS items, count(DISTINCT source_file) AS total
+
+- Get all :Knowledge + :KnowledgeChunk for a document (by source_file):
+  MATCH (k:Knowledge {source_file: $source_file})
+  OPTIONAL MATCH (k)-[:HAS_CHUNK]->(c:KnowledgeChunk)
+  RETURN collect(DISTINCT k) AS parents, collect(c) AS children
+
 - Parent-level vector search + child expansion
 - Memory cart retrieval with full context
 
-These will be implemented in `db/neo4j_client.py`.
+These are implemented in `db/neo4j_client.py` (list_documents, list_chunks_for_source or similar). Experiment node is secondary for run metadata only.

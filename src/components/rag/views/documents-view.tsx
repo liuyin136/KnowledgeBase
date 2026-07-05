@@ -1,19 +1,22 @@
 "use client";
 
 /**
- * ExperimentsView — Experiments Page (Frontend_Workflow_Mapping v1.1 §3).
+ * DocumentsView (repurposed from ExperimentsView per redesign plan).
+ * The "document" functionality is purely to display all uploaded, ingested, chunked files.
+ * Uses the working :Knowledge source_file grouping (Ingest documents list logic).
  * Three local modes: "list" | "detail" | "compare".
  *
- *   • list    — paginated table with kind filter + comparison checkbox (max 2).
- *   • detail  — observability stat cards + chunk browser + chunk inspector sheet.
- *   • compare — side-by-side stat panels + Δ comparison table + chunk/token bars.
+ *   • list    — documents by source_file from :Knowledge (the only working Cypher path).
+ *   • detail  — show associated :Knowledge and :KnowledgeChunk for the document.
+ *   • compare — side-by-side for two documents.
  *
- * Auto-opens detail for `useUIStore.activeExperimentId` on mount; the back
- * button clears it and returns to list.
+ * Note: "experiment" concept removed as unnecessary; experiment_id kept internally for linking runs if needed.
+ * Active "document" uses the former activeExperimentId (repurposed).
  */
 
 import * as React from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import type { DocumentTextResponse } from "@/lib/rag/types";
 import { formatDistanceToNow } from "date-fns";
 import { api, isBackendOffline } from "@/lib/api-client";
 import type { ChunkMetadata } from "@/lib/rag/types";
@@ -74,37 +77,12 @@ import {
   Save,
   FileCode2,
   Info,
+  Play,
 } from "lucide-react";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
-type ExperimentStatus = "pending" | "running" | "completed" | "failed";
-
-interface Experiment {
-  id: string;
-  description: string;
-  embeddingApproach: string;
-  chunkMethod: string;
-  advOption: string;
-  sourceFile?: string | null;
-  totalChunks: number;
-  avgTokensPerChunk: number;
-  totalTimeMs: number;
-  status: ExperimentStatus;
-  errorCode?: string | null;
-  errorMessage?: string | null;
-  // Search-run specific (null for ingest)
-  hybridAlpha?: number | null;
-  useBm25?: boolean | null;
-  useReranker?: boolean | null;
-  topKVector?: number | null;
-  topNRerank?: number | null;
-  parentContextLevels?: number | null;
-  autoTuneWeights?: boolean | null;
-  bestAlpha?: number | null;
-  rawQuery?: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
+// Old Experiment interface removed (concept and node deleted per redesign).
+// Now using document/source_file based data from :Knowledge.
 
 // Chunks endpoint returns text + parentSourceFile in addition to ChunkMetadata.
 interface ChunkRow extends ChunkMetadata {
@@ -324,9 +302,11 @@ function ChunkInspectorSheet({
         </SheetHeader>
         <div className="px-4 pb-6 space-y-4 text-sm">
           <div className="space-y-1">
-            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Text</div>
+            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+              {(chunk as any).nodeType === 'knowledge' || (chunk as any).node_type === 'knowledge' ? 'Full :Knowledge text (document)' : ' :KnowledgeChunk text'}
+            </div>
             <div className="rounded-md bg-muted/50 p-2.5 text-sm leading-relaxed whitespace-pre-wrap max-h-72 overflow-y-auto thin-scroll">
-              {chunk.text}
+              {chunk.text || chunk.textPreview || "(no text available for this row)"}
             </div>
           </div>
           <Separator />
@@ -352,7 +332,7 @@ function ChunkInspectorSheet({
             <div className="text-[10px] text-muted-foreground uppercase tracking-wide mb-0.5">
               Parent source file
             </div>
-            <div className="font-mono break-all">{chunk.parentSourceFile}</div>
+            <div className="font-mono break-all">{chunk.parentSourceFile || (chunk as any).parentDocId || "—"}</div>
           </div>
         </div>
       </SheetContent>
@@ -373,12 +353,13 @@ function MetaCell({ label, value, mono }: { label: string; value: string; mono?:
 function ChunkBrowser({ experimentId }: { experimentId: string }) {
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["experiment", experimentId, "chunks"],
-    queryFn: () => api.experiments.chunks(experimentId),
+    queryFn: () => api.documents.chunks(experimentId), // now by source_file for Documents page (redesign)
   });
   const [active, setActive] = React.useState<ChunkRow | null>(null);
   const [open, setOpen] = React.useState(false);
 
   const chunks = ((data?.items ?? []) as ChunkRow[]);
+  React.useEffect(() => { if (data && typeof window !== "undefined") console.debug("[obs:experiment-chunks]", { exp: experimentId, total: data.total, nodeTypes: (data.items ?? []).slice(0,3).map((c: any) => c.nodeType || c.node_type) }); }, [data]);
 
   const openRow = (c: ChunkRow) => {
     setActive(c);
@@ -394,6 +375,9 @@ function ChunkBrowser({ experimentId }: { experimentId: string }) {
         </CardTitle>
         <CardDescription className="text-xs">
           {chunks.length} chunk{chunks.length === 1 ? "" : "s"} · click a row to inspect
+          {chunks.some((c: any) => (c.nodeType || c.node_type) === 'knowledge') && (
+            <span className="ml-2 text-primary"> (includes full ingested parent :Knowledge — first row is usually the complete document; click to view)</span>
+          )}
         </CardDescription>
         <CardAction>
           <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => refetch()} aria-label="Refresh chunks">
@@ -414,7 +398,7 @@ function ChunkBrowser({ experimentId }: { experimentId: string }) {
           </div>
         ) : chunks.length === 0 ? (
           <div className="rounded-md border border-dashed p-6 text-center text-xs text-muted-foreground">
-            No chunks recorded for this experiment.
+            No chunks recorded for this document.
           </div>
         ) : (
           <div className="rounded-md border max-h-96 overflow-y-auto thin-scroll">
@@ -433,16 +417,22 @@ function ChunkBrowser({ experimentId }: { experimentId: string }) {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {chunks.map((c) => (
+                {chunks.map((c, idx) => {
+                  const isFullDoc = idx === 0 && ((c as any).nodeType || (c as any).node_type || "").includes("knowledge");
+                  return (
                   <TableRow
                     key={c.chunkId}
-                    className="group cursor-pointer"
+                    className={`group cursor-pointer ${isFullDoc ? "bg-primary/5 font-medium" : ""}`}
                     onClick={() => openRow(c)}
                   >
                     <TableCell className="font-mono text-xs">{c.chunkIndex}</TableCell>
                     <TableCell>{chunkMethodBadge(c.chunkMethod)}</TableCell>
                     <TableCell>
                       <Badge variant="outline" className="text-[10px]">{c.embeddingMethod}</Badge>
+                      { (c as any).nodeType && (
+                        <Badge variant="secondary" className="ml-1 text-[9px]">{(c as any).nodeType}</Badge>
+                      )}
+                      {isFullDoc && <Badge className="ml-1 text-[9px] bg-primary">FULL DOC</Badge>}
                     </TableCell>
                     <TableCell className="text-right font-mono text-xs">{fmtNum(c.tokenCount)}</TableCell>
                     <TableCell className="text-right font-mono text-xs">{fmtMs(c.chunkingTimeMs)}</TableCell>
@@ -450,14 +440,17 @@ function ChunkBrowser({ experimentId }: { experimentId: string }) {
                     <TableCell className="text-[10px] text-muted-foreground truncate max-w-[110px]" title={c.section ?? ""}>
                       {c.section ?? "—"}
                     </TableCell>
-                    <TableCell className="text-xs text-muted-foreground line-clamp-1 max-w-[280px]">
-                      {c.textPreview}
+                    <TableCell className="text-xs text-muted-foreground line-clamp-2 max-w-[280px]" title={c.text || c.textPreview}>
+                      {(c as any).nodeType === 'knowledge' || (c as any).node_type === 'knowledge' 
+                        ? (c.text || c.textPreview || '').slice(0, 200) 
+                        : c.textPreview}
                     </TableCell>
                     <TableCell>
                       <Eye className="h-3 w-3 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
                     </TableCell>
                   </TableRow>
-                ))}
+                  );
+                })}
               </TableBody>
             </Table>
           </div>
@@ -478,7 +471,7 @@ function ChunkBrowser({ experimentId }: { experimentId: string }) {
  *   - "Rendered": react-markdown preview (read-only).
  *   - "Raw":      MDXEditor with toolbar (editable). A "Save as new document"
  *                 button POSTs the edited text as a new Knowledge document
- *                 (non-destructive — the original experiment's chunks are
+ *                 (non-destructive — the original run's chunks are
  *                 untouched). The researcher can then re-run ingest on the
  *                 edited source from the Ingest view.
  *
@@ -487,27 +480,60 @@ function ChunkBrowser({ experimentId }: { experimentId: string }) {
 function SourceDocumentSection({
   experimentId,
   sourceFile,
+  documentData,
 }: {
   experimentId: string;
   sourceFile?: string | null;
+  documentData?: any;
 }) {
   const qc = useQueryClient();
   const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: ["experiment", experimentId, "chunks"],
-    queryFn: () => api.experiments.chunks(experimentId),
+    queryFn: () => api.documents.chunks(experimentId), // now by source_file for Documents page (redesign)
   });
 
   const chunks = ((data?.items ?? []) as ChunkRow[]).slice().sort(
     (a, b) => (a.chunkIndex ?? 0) - (b.chunkIndex ?? 0),
   );
 
-  // Reconstruct: join chunk texts with blank lines (preserve structure).
+  // Reconstruct the document for this document.
+  // Strongly prefer full text from the backend document ( :Knowledge ) if provided, or from chunks.
   const reconstructed = React.useMemo(() => {
+    // Prefer full from documentData (backend retrieved :knowledge)
+    const docIngested = documentData?.ingested?.text;
+    if (docIngested && docIngested.length > 30) {
+      return docIngested;
+    }
+    if (!chunks.length) return "";
+
+    // 1. Any row that came from a :Knowledge ...
+    const knowledgeRows = chunks.filter((c: any) =>
+      (c.nodeType || c.node_type || "").includes("knowledge") ||
+      (c.embeddingMethod || "").includes("LongText")
+    );
+    const bestKnowledge = knowledgeRows
+      .map((c) => c.text || c.textPreview || "")
+      .filter((t: string) => t.length > 30)
+      .sort((a: string, b: string) => b.length - a.length)[0];
+
+    if (bestKnowledge) {
+      return bestKnowledge;
+    }
+
+    // 2. Longest ...
+    const longest = [...chunks]
+      .map((c) => c.text || c.textPreview || "")
+      .filter((t: string) => t.length > 30)
+      .sort((a: string, b: string) => b.length - a.length)[0];
+
+    if (longest) return longest;
+
+    // 3. Classic ...
     return chunks
       .map((c) => c.text ?? c.textPreview ?? "")
-      .filter((t) => t.length > 0)
+      .filter((t: string) => t.length > 0)
       .join("\n\n");
-  }, [chunks]);
+  }, [chunks, documentData]);
 
   const [mode, setMode] = React.useState<"rendered" | "raw">("rendered");
   const [edited, setEdited] = React.useState<string>("");
@@ -522,7 +548,7 @@ function SourceDocumentSection({
   const saveMut = useMutation({
     mutationFn: (text: string) =>
       api.documents.create({
-        filename: `${sourceFile ?? "document"} (edited)`,
+        filename: `${sourceFile ?? "document"} (edited-${Date.now().toString(36)})`,
         text,
         contentType: "text/markdown",
       }),
@@ -558,8 +584,8 @@ function SourceDocumentSection({
         </CardTitle>
         <CardDescription className="text-xs flex flex-wrap items-center gap-x-2 gap-y-1">
           <span>
-            Reconstructed from <span className="font-mono">{chunkCount}</span> chunk
-            {chunkCount === 1 ? "" : "s"}
+            Document content for this document (pulled from :Knowledge rows with matching source_file via /chunks or document).
+            Reconstructed / full text from <span className="font-mono">{chunkCount}</span> row{chunkCount === 1 ? "" : "s"}.
           </span>
           <span aria-hidden>·</span>
           <span className="font-mono">{charCount.toLocaleString()} chars</span>
@@ -597,7 +623,7 @@ function SourceDocumentSection({
         {!isLoading && isError && isBackendOffline(error) && (
           <BackendOffline
             onRetry={() => refetch()}
-            message="The FastAPI backend is not reachable, so the experiment's chunks cannot be loaded. Start the Docker stack (`docker compose up -d`) and retry."
+            message="The FastAPI backend is not reachable, so the document's chunks cannot be loaded. Start the Docker stack (`docker compose up -d`) and retry."
           />
         )}
 
@@ -622,7 +648,7 @@ function SourceDocumentSection({
           <div className="rounded-md border border-dashed p-8 text-center">
             <Inbox className="mx-auto h-8 w-8 text-muted-foreground mb-2" />
             <p className="text-sm text-muted-foreground">
-              No chunks recorded for this experiment.
+              No chunks recorded for this document.
             </p>
           </div>
         )}
@@ -640,10 +666,9 @@ function SourceDocumentSection({
             <Alert className="border-primary/30 bg-primary/5">
               <Info className="h-4 w-4 text-primary" />
               <AlertDescription className="text-xs text-foreground/80">
-                Editing the reconstructed source does not modify the original
-                experiment. Click <strong>Save as new document</strong> to
-                create a new Knowledge node — then re-run ingest from the
-                Ingest view to test retrieval on the modified source.
+                Editing creates a <strong>new</strong> document record only.
+                Historical :Knowledge / :KnowledgeChunk for this document (and their run id if any) are never mutated.
+                Re-ingest will produce fresh nodes. Original run data stays intact.
               </AlertDescription>
             </Alert>
             <MarkdownEditor
@@ -697,6 +722,103 @@ function SourceDocumentSection({
   );
 }
 
+// ─── Original / Raw Uploaded :Knowledge (new for visibility of pre-ingest) ─
+function OriginalDocumentSection({ sourceFile, experimentId, documentData }: { sourceFile?: string | null; experimentId?: string; documentData?: any }) {
+  // If documentData pre-fetched in parent (DetailMode), use it (avoids double fetch).
+  // Otherwise, fetch here.
+  let doc = documentData;
+  let isLoading = false;
+  let isError = false;
+  let refetch = () => {};
+
+  if (!documentData && experimentId) {
+    const docQ = useQuery({
+      queryKey: ["experiment", experimentId, "document"],
+      queryFn: () => api.documents.getText(experimentId, "any"), // source_file based for document display
+      enabled: !!experimentId,
+    });
+    doc = docQ.data;
+    isLoading = docQ.isLoading;
+    isError = docQ.isError;
+    refetch = () => docQ.refetch();
+  }
+
+  if (!experimentId) return null;
+
+  // Prefer the ingested full :Knowledge text (tied to source_file), fallback to raw upload :Knowledge
+  const ingestedText = doc?.ingested?.text;
+  const originalText = doc?.original?.text;
+  const primaryText = ingestedText || originalText || "";
+  const isIngested = !!ingestedText;
+
+  const [mode, setMode] = React.useState<"rendered" | "raw">("rendered");
+
+  if (isLoading) {
+    return (
+      <Card>
+        <CardContent className="py-8">
+          <Skeleton className="h-40 w-full" />
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (isError || !primaryText) {
+    return (
+      <Card>
+        <CardContent className="py-4">
+          <div className="text-xs text-destructive">
+            Failed to load document document from backend (/experiments/{experimentId}/document).
+            <button onClick={() => refetch()} className="underline ml-1">Retry</button>
+          </div>
+          <div className="text-xs text-muted-foreground mt-2">
+            Ensure backend retrieves :Knowledge records (original Upload or source_file-linked parent) with full text.
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <FileText className="h-4 w-4 text-primary" />
+          Source Document for this document
+        </CardTitle>
+        <CardDescription className="text-xs">
+          {isIngested
+            ? "Ingested full :Knowledge (parent document text for this document_id, via backend)"
+            : "Raw uploaded :Knowledge (pre-ingest Upload node)"}
+          {doc?.ingested?.embeddingMethod && <span className="ml-2 font-mono">({doc.ingested.embeddingMethod})</span>}
+          {doc?.original?.embeddingMethod && !isIngested && <span className="ml-2 font-mono">({doc.original.embeddingMethod})</span>}
+        </CardDescription>
+        <CardAction>
+          <Tabs value={mode} onValueChange={(v) => setMode(v as "rendered" | "raw")}>
+            <TabsList className="h-7">
+              <TabsTrigger value="rendered" className="text-xs h-5 px-2.5">Rendered</TabsTrigger>
+              <TabsTrigger value="raw" className="text-xs h-5 px-2.5">Raw</TabsTrigger>
+            </TabsList>
+          </Tabs>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        {mode === "rendered" ? (
+          <div className="rounded-md border bg-background p-4 max-h-[40vh] overflow-y-auto thin-scroll">
+            <MarkdownRender value={primaryText} />
+          </div>
+        ) : (
+          <pre className="rounded-md border bg-muted/30 p-3 text-xs whitespace-pre-wrap break-words font-mono max-h-[40vh] overflow-y-auto thin-scroll">{primaryText}</pre>
+        )}
+        <div className="mt-2 text-[10px] text-muted-foreground">
+          {primaryText.length.toLocaleString()} chars · source: <span className="font-mono">{sourceFile}</span>
+          {doc?.ingested && <span className="ml-2">(from :Knowledge tied to document)</span>}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 // ─── Detail Mode ────────────────────────────────────────────────────────────
 function DetailMode({
   experimentId,
@@ -709,18 +831,30 @@ function DetailMode({
 }) {
   const { data: exp, isLoading, isError, error, refetch } = useQuery({
     queryKey: ["experiment", experimentId],
-    queryFn: () => api.experiments.get(experimentId),
+    queryFn: () => api.documents.getText(experimentId, "any"), // fallback to text for document info
   });
+  // observation (browser): neo4j Experiment + linked Knowledge records shown in Experiments view
+  React.useEffect(() => { if (exp && typeof window !== "undefined") console.debug("[obs:experiments-exp]", { id: exp.id, status: exp.status, chunks_via_doc: (exp as any).document }); }, [exp]);
+
+  // Fetch the document ( :knowledge records ) once here for the detail, so child components
+  // can receive pre-fetched data. Prioritizes frontend seeing the full :knowledge text.
+  const docQ = useQuery({
+    queryKey: ["experiment", experimentId, "document"],
+    queryFn: () => api.documents.getText(experimentId, "any"), // source_file based for document display
+    enabled: !!experimentId,
+  });
+  const experimentDocument = docQ.data;
+
   const [pickerOpen, setPickerOpen] = React.useState(false);
   const [otherId, setOtherId] = React.useState<string>("");
 
   const { data: listData } = useQuery({
-    queryKey: ["experiments", "list", { kind: "all", page: 1, pageSize: 100 }],
-    queryFn: () => api.experiments.list({ page: 1, pageSize: 100 }),
+    queryKey: ["documents", "list", { page: 1, pageSize: 100 }],
+    queryFn: () => api.documents.list({ page: 1, pageSize: 100 }),
     enabled: pickerOpen,
   });
   const candidates = (listData?.items ?? []).filter(
-    (e: Experiment) => e.id !== experimentId
+    (e: any) => e.id !== experimentId
   );
 
   if (isLoading) {
@@ -744,12 +878,12 @@ function DetailMode({
           {isBackendOffline(error) ? (
             <BackendOffline
               title="Backend offline"
-              message="The FastAPI backend is not reachable, so this experiment's metadata cannot be loaded. Start the Docker stack (`docker compose up -d`) and retry."
+              message="The FastAPI backend is not reachable, so this document's metadata cannot be loaded. Start the Docker stack (`docker compose up -d`) and retry."
               onRetry={() => refetch()}
             />
           ) : (
             <div className="flex items-center gap-2 text-sm text-destructive">
-              <AlertCircle className="h-4 w-4" /> Failed to load experiment.
+              <AlertCircle className="h-4 w-4" /> Failed to load document.
             </div>
           )}
           <div className="flex gap-2">
@@ -767,9 +901,42 @@ function DetailMode({
         <Button variant="ghost" size="sm" onClick={onBack} className="gap-1">
           <ArrowLeft className="h-4 w-4" /> Back to list
         </Button>
-        <Button variant="outline" size="sm" onClick={() => setPickerOpen(true)} className="gap-1.5">
-          <GitCompareArrows className="h-3.5 w-3.5" /> Compare with…
-        </Button>
+        <div className="flex items-center gap-2 flex-wrap">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              // Re-ingest action: navigate to Ingest + pre-select source (config user can match from exp metadata)
+              const sf = (exp as Experiment).sourceFile;
+              if (sf) {
+                // We can't deeply prefill without extra store; select doc + instruct
+                // For strong UX we set active + switch view; user sees the doc in list
+                // A minimal enhancement: we can also store a pendingSource hint
+                useUIStore.getState().setView("ingest");
+                // After switch the user can pick the matching filename from Documents list
+                toast.info(`Switched to Ingest. Select "${sf}" to re-run with similar settings.`);
+              }
+            }}
+            className="gap-1.5"
+          >
+            <Play className="h-3.5 w-3.5" /> Re-ingest this source
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => {
+              const sf = (exp as Experiment).sourceFile;
+              useUIStore.getState().setView("ingest");
+              toast.info(`In Ingest view: pick "${sf}", set Embedding Approach = ChildChunk to run child-chunk variant. New nodes will be created (original run data untouched).`);
+            }}
+            className="gap-1.5"
+          >
+            <Layers className="h-3.5 w-3.5" /> Re-ingest as ChildChunk
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => setPickerOpen(true)} className="gap-1.5">
+            <GitCompareArrows className="h-3.5 w-3.5" /> Compare with…
+          </Button>
+        </div>
       </div>
 
       <Card>
@@ -793,7 +960,7 @@ function DetailMode({
             <Alert variant="destructive">
               <AlertCircle className="h-4 w-4" />
               <AlertTitle>
-                Experiment failed
+                Document run failed
                 {exp.errorCode && <span className="font-mono ml-1">({exp.errorCode})</span>}
               </AlertTitle>
               <AlertDescription>{exp.errorMessage ?? "No error message provided."}</AlertDescription>
@@ -801,22 +968,17 @@ function DetailMode({
           )}
           <div>
             <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground mb-2">
-              Observability
+              Document Info (source_file based)
             </h3>
-            <ObservabilityPanel exp={exp as Experiment} />
+            <p className="text-sm">Chunks and knowledge records for this document. (Observability panel for run metadata hidden in document mode.)</p>
           </div>
         </CardContent>
       </Card>
 
       <ChunkBrowser experimentId={experimentId} />
 
-      {/* Source document editor (v1.2 requirement #6) */}
-      {!isSearchExp(exp as Experiment) && (
-        <SourceDocumentSection
-          experimentId={experimentId}
-          sourceFile={(exp as Experiment).sourceFile}
-        />
-      )}
+      {/* Document source info simplified for :Knowledge based display */}
+      <p className="text-xs text-muted-foreground">Full document text and source reconstruction available via document detail or Ingest. Chunks shown above from :Knowledge/:KnowledgeChunk by source_file.</p>
 
       {/* Compare-with picker */}
       <ComparePickerDialog
@@ -846,7 +1008,7 @@ function ComparePickerDialog({
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
-  candidates: Experiment[];
+  candidates: any[];
   otherId: string;
   setOtherId: (v: string) => void;
   onConfirm: () => void;
@@ -856,19 +1018,19 @@ function ComparePickerDialog({
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Compare with…</DialogTitle>
-          <DialogDescription>Pick another experiment to compare side-by-side.</DialogDescription>
+          <DialogDescription>Pick another document to compare side-by-side.</DialogDescription>
         </DialogHeader>
         <Select value={otherId} onValueChange={setOtherId}>
           <SelectTrigger className="w-full">
-            <SelectValue placeholder="Select an experiment" />
+            <SelectValue placeholder="Select a document" />
           </SelectTrigger>
           <SelectContent>
             {candidates.length === 0 ? (
-              <SelectItem value="__none" disabled>No other experiments</SelectItem>
+              <SelectItem value="__none" disabled>No other documents</SelectItem>
             ) : (
               candidates.map((e) => (
                 <SelectItem key={e.id} value={e.id}>
-                  {e.description?.slice(0, 60) ?? e.id}
+                  {e.filename || (e.description ? e.description.slice(0, 60) : '') || e.id}
                 </SelectItem>
               ))
             )}
@@ -897,19 +1059,19 @@ function CompareMode({
 }) {
   const q1 = useQuery({
     queryKey: ["experiment", ids[0]],
-    queryFn: () => api.experiments.get(ids[0]),
+    queryFn: () => api.documents.getText(ids[0], "any"),
   });
   const q2 = useQuery({
     queryKey: ["experiment", ids[1]],
-    queryFn: () => api.experiments.get(ids[1]),
+    queryFn: () => api.documents.getText(ids[1], "any"),
   });
   const c1 = useQuery({
     queryKey: ["experiment", ids[0], "chunks"],
-    queryFn: () => api.experiments.chunks(ids[0]),
+    queryFn: () => api.documents.chunks(ids[0]),
   });
   const c2 = useQuery({
     queryKey: ["experiment", ids[1], "chunks"],
-    queryFn: () => api.experiments.chunks(ids[1]),
+    queryFn: () => api.documents.chunks(ids[1]),
   });
 
   const a = q1.data as Experiment | undefined;
@@ -938,7 +1100,7 @@ function CompareMode({
       <Card>
         <CardContent className="pt-6">
           <div className="flex items-center gap-2 text-sm text-destructive">
-            <AlertCircle className="h-4 w-4" /> Failed to load one or both experiments.
+            <AlertCircle className="h-4 w-4" /> Failed to load one or both documents.
           </div>
           <Button variant="outline" size="sm" className="mt-3" onClick={onBack}>← Back</Button>
         </CardContent>
@@ -953,7 +1115,7 @@ function CompareMode({
           <ArrowLeft className="h-4 w-4" /> Back to list
         </Button>
         <Badge variant="secondary" className="gap-1 text-xs">
-          <GitCompareArrows className="h-3 w-3" /> Comparing 2 experiments
+          <GitCompareArrows className="h-3 w-3" /> Comparing 2 documents
         </Badge>
       </div>
 
@@ -1099,8 +1261,8 @@ function ComparisonTable({
             <TableHeader>
               <TableRow>
                 <TableHead className="w-[180px]">Metric</TableHead>
-                <TableHead className="w-[20%]">Experiment A</TableHead>
-                <TableHead className="w-[20%]">Experiment B</TableHead>
+                <TableHead className="w-[20%]">Document A</TableHead>
+                <TableHead className="w-[20%]">Document B</TableHead>
                 <TableHead className="w-[80px] text-right">Δ</TableHead>
               </TableRow>
             </TableHeader>
@@ -1248,16 +1410,17 @@ function ExperimentTable({
   }, [kind]);
 
   const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
-    queryKey: ["experiments", "list", { kind, page, pageSize }],
+    queryKey: ["documents", "list", { page, pageSize }],
     queryFn: () =>
-      api.experiments.list({
+      api.documents.list({
         page,
         pageSize,
-        kind: kind === "all" ? undefined : kind,
       }),
   });
+  // observation (browser): documents list from neo4j :Knowledge (the working path)
+  React.useEffect(() => { if (data && typeof window !== "undefined") console.debug("[obs:experiments-list]", { total: data.total, kind, sampleIds: (data.items ?? []).slice(0,2).map((e: any) => e.id) }); }, [data]);
 
-  const items = (data?.items ?? []) as Experiment[];
+  const items = (data?.items ?? []) as any[]; // now documents from working :Knowledge list
   const total = data?.total ?? 0;
   const hasMore = data?.hasMore ?? false;
 
@@ -1273,9 +1436,9 @@ function ExperimentTable({
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-base">Experiments</CardTitle>
+        <CardTitle className="text-base">Documents</CardTitle>
         <CardDescription className="text-xs">
-          {total} experiment{total === 1 ? "" : "s"} · page {page}
+          {total} document{total === 1 ? "" : "s"} (source_file from :Knowledge) · page {page}
         </CardDescription>
         <CardAction>
           <Button
@@ -1297,14 +1460,14 @@ function ExperimentTable({
                 <TableHead className="w-[40px]">
                   <span className="sr-only">Select for comparison</span>
                 </TableHead>
-                <TableHead className="min-w-[200px]">Description</TableHead>
-                <TableHead className="w-[100px]">Approach</TableHead>
-                <TableHead className="w-[120px]">Chunk method</TableHead>
+                <TableHead className="min-w-[200px]">Filename (source_file)</TableHead>
+                <TableHead className="w-[100px]">Embedding</TableHead>
+                <TableHead className="w-[120px]">Kinds</TableHead>
                 <TableHead className="w-[70px] text-right">Chunks</TableHead>
-                <TableHead className="w-[80px] text-right">Avg tok</TableHead>
+                <TableHead className="w-[80px] text-right">Size</TableHead>
                 <TableHead className="w-[80px] text-right">Time</TableHead>
-                <TableHead className="w-[90px]">Status</TableHead>
-                <TableHead className="w-[140px]">Source</TableHead>
+                <TableHead className="w-[90px]"> </TableHead>
+                <TableHead className="w-[140px]"> </TableHead>
                 <TableHead className="w-[110px]">Created</TableHead>
               </TableRow>
             </TableHeader>
@@ -1330,7 +1493,7 @@ function ExperimentTable({
                       </div>
                     ) : (
                       <div className="flex items-center gap-2 py-2 text-xs text-destructive">
-                        <AlertCircle className="h-4 w-4" /> Failed to load experiments.
+                        <AlertCircle className="h-4 w-4" /> Failed to load documents.
                       </div>
                     )}
                   </TableCell>
@@ -1341,7 +1504,7 @@ function ExperimentTable({
                     <div className="py-10 text-center">
                       <Inbox className="mx-auto h-8 w-8 text-muted-foreground mb-2" />
                       <p className="text-sm text-muted-foreground">
-                        No experiments yet. Start an ingest or run a search.
+                        No documents yet. Upload in Ingest view to create :Knowledge records.
                       </p>
                     </div>
                   </TableCell>
@@ -1365,17 +1528,17 @@ function ExperimentTable({
                         />
                       </TableCell>
                       <TableCell className="max-w-[280px]">
-                        <div className="text-sm line-clamp-1">{e.description}</div>
+                        <div className="text-sm line-clamp-1">{e.filename || e.description}</div>
                         <div className="text-[10px] font-mono text-muted-foreground">{e.id}</div>
                       </TableCell>
-                      <TableCell>{approachBadge(e.embeddingApproach)}</TableCell>
+                      <TableCell>{e.representativeEmbeddingMethod || approachBadge(e.embeddingApproach)}</TableCell>
                       <TableCell>{chunkMethodBadge(e.chunkMethod)}</TableCell>
-                      <TableCell className="text-right font-mono text-xs">{fmtNum(e.totalChunks)}</TableCell>
+                      <TableCell className="text-right font-mono text-xs">{fmtNum(e.totalChunks || e.chunk_count)}</TableCell>
                       <TableCell className="text-right font-mono text-xs">{fmtNum(e.avgTokensPerChunk, 1)}</TableCell>
                       <TableCell className="text-right font-mono text-xs">{fmtMs(e.totalTimeMs)}</TableCell>
                       <TableCell>{statusBadge(e.status)}</TableCell>
-                      <TableCell className="text-xs text-muted-foreground truncate max-w-[140px]" title={e.sourceFile ?? ""}>
-                        {e.sourceFile ?? "—"}
+                      <TableCell className="text-xs text-muted-foreground truncate max-w-[140px]" title={e.filename || e.sourceFile || ""}>
+                        {e.filename || e.sourceFile || "—"}
                       </TableCell>
                       <TableCell className="text-[10px] text-muted-foreground whitespace-nowrap">
                         {relativeTime(e.createdAt)}
@@ -1420,21 +1583,21 @@ function ExperimentTable({
 }
 
 // ─── Main View ──────────────────────────────────────────────────────────────
-export function ExperimentsView() {
-  const { activeExperimentId, setActiveExperiment } = useUIStore();
+export function DocumentsView() {
+  const { activeDocumentId, setActiveDocument } = useUIStore(); // document focus (ex-activeExperimentId)
   const [mode, setMode] = React.useState<Mode>("list");
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
   const [compareIds, setCompareIds] = React.useState<string[]>([]);
   const [comparePair, setComparePair] = React.useState<[string, string] | null>(null);
   const [kind, setKind] = React.useState<"all" | "ingest" | "search">("all");
 
-  // Auto-open detail if activeExperimentId is set when the view mounts.
+  // Auto-open detail if activeDocumentId is set when the view mounts.
   React.useEffect(() => {
-    if (activeExperimentId) {
-      setSelectedId(activeExperimentId);
+    if (activeDocumentId) {
+      setSelectedId(activeDocumentId);
       setMode("detail");
     }
-  }, [activeExperimentId]);
+  }, [activeDocumentId]);
 
   const openDetail = (id: string) => {
     setSelectedId(id);
@@ -1444,8 +1607,8 @@ export function ExperimentsView() {
   const backToList = () => {
     setSelectedId(null);
     setMode("list");
-    // Clear activeExperimentId so re-entering the view starts at the list.
-    if (activeExperimentId) setActiveExperiment(null);
+    // Clear active so re-entering the view starts at the list.
+    if (activeDocumentId) setActiveDocument(null);
   };
 
   const startCompare = (ids: [string, string]) => {
@@ -1457,15 +1620,15 @@ export function ExperimentsView() {
     setComparePair(null);
     setMode("list");
     setCompareIds([]);
-    if (activeExperimentId) setActiveExperiment(null);
+    if (activeDocumentId) setActiveDocument(null);
   };
 
   return (
     <>
       <ViewHeader
-        title="Experiments"
-        description="History, metadata & comparison"
-        icon={FlaskConical}
+        title="Documents"
+        description="All uploaded, ingested & chunked files (display of :Knowledge records)"
+        icon={FileText}
         actions={
           mode === "list" && (
             <ToggleGroup
@@ -1498,7 +1661,7 @@ export function ExperimentsView() {
                   onClick={() => startCompare([compareIds[0], compareIds[1]])}
                 >
                   <GitCompareArrows className="h-4 w-4" />
-                  Compare selected ({compareIds.length} experiments) →
+                  Compare selected ({compareIds.length} documents) →
                 </Button>
               </div>
             )}

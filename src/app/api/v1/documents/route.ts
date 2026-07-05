@@ -1,4 +1,4 @@
-/** POST /api/v1/documents (JSON or multipart) → proxy. GET → proxy (paginated). */
+/** POST /api/v1/documents (JSON or multipart multi-file .md) → proxy (see backend-client.ts for multipart body forwarding rules). GET → proxy (paginated). */
 import { NextRequest } from "next/server";
 import { proxyToBackend } from "@/lib/rag/backend-client";
 import { withErrors } from "@/lib/rag/api-helpers";

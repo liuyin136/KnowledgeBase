@@ -100,10 +100,9 @@ def _cart_row_to_response(row: dict) -> MemoryCartResponse:
 def list_memories(
     page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=20, ge=1, le=100),
-    experimentId: Optional[str] = Query(default=None),
     db: Neo4jClient = Depends(get_db),
 ) -> Paginated[MemoryResponse]:
-    rows, total = db.list_memories(page=page, page_size=pageSize, experiment_id=experimentId)
+    rows, total = db.list_memories(page=page, page_size=pageSize)
     return Paginated[MemoryResponse](
         items=[_memory_row_to_response(r) for r in rows],
         total=total,
@@ -132,7 +131,8 @@ def create_memory(
         bm25_score=body.bm25Score,
         fused_score=body.fusedScore,
         reranker_score=body.rerankerScore,
-        experiment_id=body.experimentId,
+        # experiment_id removed
+        # experiment_id=body.experimentId,
     )
     db.create_memory(memory)
     return {"id": memory.id}

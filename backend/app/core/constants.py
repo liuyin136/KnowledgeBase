@@ -96,7 +96,7 @@ class IngestStage(str, Enum):
 # model-specific, so switching models requires re-ingesting documents).
 EMBEDDING_MODEL = "jinaai/jina-embeddings-v5-text-small"  # active repo id (v1.3 default)
 EMBEDDING_MODEL_LOGICAL = "jina-v5-small"  # logical id used in EMBEDDING_MODEL env var
-EMBEDDING_DIM = 1024  # Neo4j vector index dim — kept STABLE for both models
+EMBEDDING_DIM = 1024  # Neo4j vector index dim — Jina v5 small (Matryoshka truncated to 1024)
 RERANKER_MODEL = "jinaai/jina-reranker-v3"  # active repo id (v1.3 default)
 RERANKER_MODEL_LOGICAL = "jina-v3"  # logical id used in RERANKER_MODEL env var
 
@@ -107,11 +107,11 @@ BGE_RERANKER_REPO = "BAAI/bge-reranker-base"
 # Jina Embeddings v5 is task-conditioned. The orchestrator passes `is_query=True`
 # for queries and `is_query=False` (default) for passages/documents; the embedder
 # maps that to the corresponding Jina task string. BGE-M3 ignores the task param.
-JINA_TASK_QUERY = "retrieval.query"
-JINA_TASK_PASSAGE = "retrieval.passages"
+JINA_TASK_QUERY = "retrieval"
+JINA_TASK_PASSAGE = "retrieval"  # encode uses task="retrieval" (prompt_name not supported in this ST integration)
 
 # Native output dims (per model). Used only for observability — the ACTUAL dim
-# written to Neo4j is EMBEDDING_DIM (1024) via Matryoshka truncation for Jina.
+# written to Neo4j is EMBEDDING_DIM (1024) via Matryoshka truncation for Jina v5.
 JINA_V5_SMALL_NATIVE_DIM = 1536
 BGE_M3_NATIVE_DIM = 1024
 
@@ -123,8 +123,8 @@ CHUNK_TARGET_TOKENS = {
     ChunkMethod.STRUCTURE_AWARE.value: 600,
 }
 CHUNK_OVERLAP_TOKENS = 64
-LONGTEXT_WINDOW_TOKENS = 8000
-LONGTEXT_OVERLAP_TOKENS = 800
+LONGTEXT_WINDOW_TOKENS = 30000
+LONGTEXT_OVERLAP_TOKENS = 3000
 
 # ─── Retry policy (per error-handling-retry-strategy_v1.1.md §3) ──────────────
 
@@ -165,7 +165,6 @@ LABEL_USER_QUERY = "UserQuery"
 LABEL_USER_QUERY_CHUNK = "UserQueryChunk"
 LABEL_MEMORY = "Memory"
 LABEL_MEMORY_CART = "MemoryCart"
-LABEL_EXPERIMENT = "Experiment"
 
 # Relationship types
 REL_HAS_CHUNK = "HAS_CHUNK"

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # =============================================================================
-# Dockerfile.frontend — Local-First RAG Experimentation Platform v1.2
+# Dockerfile.frontend — Local-First RAG Platform (Documents focus)
 # Multi-stage build (standalone Next.js output → tiny runtime image).
 #
 # Build context: .. (project root)   (set in docker/docker-compose.yml)

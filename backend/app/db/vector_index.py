@@ -31,10 +31,10 @@ CONSTRAINTS: List[str] = [
     "CREATE CONSTRAINT userquerychunk_id IF NOT EXISTS FOR (qc:UserQueryChunk) REQUIRE qc.id IS UNIQUE",
     "CREATE CONSTRAINT memory_id IF NOT EXISTS FOR (m:Memory) REQUIRE m.id IS UNIQUE",
     "CREATE CONSTRAINT memorycart_id IF NOT EXISTS FOR (c:MemoryCart) REQUIRE c.id IS UNIQUE",
-    "CREATE CONSTRAINT experiment_id IF NOT EXISTS FOR (e:Experiment) REQUIRE e.id IS UNIQUE",
+    # no Experiment constraint (experiment node removed)
 ]
 
-# Vector indexes — HNSW, cosine, BGE-M3 1024 dims.
+# Vector indexes — HNSW, cosine, 1024 dims (for jina-embeddings-v5-text-small via Matryoshka).
 # NOTE: Neo4j 5.x supports `CREATE VECTOR INDEX ... OPTIONS {indexConfig: {...}}`.
 VECTOR_INDEXES: List[str] = [
     f"""

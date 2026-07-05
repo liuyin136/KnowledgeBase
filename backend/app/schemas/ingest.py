@@ -30,7 +30,14 @@ class StartIngestResponse(BaseModel):
 
 
 class ChunkMetadata(BaseModel):
-    """ChunkMetadata — mirrors TS ChunkMetadata exactly."""
+    """ChunkMetadata — mirrors TS ChunkMetadata + extensions for full visibility.
+
+    text: full text of the chunk or parent knowledge (for inspector + reconstruction
+          in Experiments page). Previously only preview was sent; we now include
+          the authoritative stored text so raw/ingested content is visible.
+    nodeType: 'knowledge' | 'knowledge_chunk' | 'upload' (for UI labeling of
+              raw uploaded :Knowledge vs ingested parent vs children).
+    """
 
     chunkId: str
     parentDocId: str
@@ -45,6 +52,10 @@ class ChunkMetadata(BaseModel):
     charEnd: Optional[int] = None
     section: Optional[str] = None
     textPreview: str
+    # New for raw/parent visibility + mutation-safety clarity in UI
+    text: Optional[str] = None
+    nodeType: Optional[str] = None  # 'knowledge' | 'knowledge_chunk' | 'upload' (future)
+    parentSourceFile: Optional[str] = None
 
 
 class IngestProgressEvent(BaseModel):
