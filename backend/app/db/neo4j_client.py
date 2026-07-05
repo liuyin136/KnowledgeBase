@@ -342,15 +342,16 @@ class Neo4jClient:
     def recent_experiments(self, limit: int = 5) -> List[Dict[str, Any]]:
         cypher = """
         MATCH (e:Experiment)
-        RETURN e ORDER BY e.created_at DESC LIMIT $limit
+        RETURN e ORDER BY coalesce(e.created_at, datetime('1900-01-01')) DESC LIMIT $limit
         """
         return [r["e"] for r in self._run_read_with_retry(cypher, {"limit": limit})]
 
     def recent_searches(self, limit: int = 5) -> List[Dict[str, Any]]:
         """Recent search experiments (kind='search')."""
         cypher = """
-        MATCH (e:Experiment {kind: 'search'})
-        RETURN e ORDER BY e.created_at DESC LIMIT $limit
+        MATCH (e:Experiment)
+        WHERE coalesce(e.kind, '') = 'search'
+        RETURN e ORDER BY coalesce(e.created_at, datetime('1900-01-01')) DESC LIMIT $limit
         """
         return [r["e"] for r in self._run_read_with_retry(cypher, {"limit": limit})]
 
@@ -840,8 +841,8 @@ class Neo4jClient:
         MATCH (e:Experiment)
         WITH 
             count(e) AS total,
-            sum(CASE WHEN e.status = 'completed' THEN 1 ELSE 0 END) AS completed,
-            sum(CASE WHEN e.status = 'failed' THEN 1 ELSE 0 END) AS failed
+            sum(CASE WHEN coalesce(e.status, '') = 'completed' THEN 1 ELSE 0 END) AS completed,
+            sum(CASE WHEN coalesce(e.status, '') = 'failed' THEN 1 ELSE 0 END) AS failed
 
         OPTIONAL MATCH (k:Knowledge)
         WITH total, completed, failed, count(DISTINCT k.source_file) AS documents
@@ -849,7 +850,8 @@ class Neo4jClient:
         OPTIONAL MATCH (c:KnowledgeChunk)
         WITH total, completed, failed, documents, count(c) AS chunks
 
-        OPTIONAL MATCH (s:Experiment {kind: 'search'})
+        OPTIONAL MATCH (s:Experiment)
+        WHERE coalesce(s.kind, '') = 'search'
         WITH total, completed, failed, documents, chunks, count(s) AS searches
 
         OPTIONAL MATCH (m:Memory)

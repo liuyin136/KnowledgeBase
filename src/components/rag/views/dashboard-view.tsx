@@ -95,7 +95,7 @@ interface DashboardData {
     backend: {
       status: "online" | "offline";
       configured: boolean;
-      detail?: string | null;
+      detail?: unknown; // can be {status: "ok"} object from backend /health
     };
     neo4j: {
       status: "online" | "offline";
@@ -675,9 +675,18 @@ function BackendHealthCard({
   loading: boolean;
   status: "online" | "offline" | undefined;
   configured: boolean | undefined;
-  detail: string | null;
+  detail?: unknown; // was string | null — backend /health returns {status: "ok"} object
 }) {
   const offline = status === "offline";
+
+  // Safe rendering: stringify objects (e.g. {status: "ok"}) to prevent React #31
+  // "Objects are not valid as a React child (found: object with keys {status})"
+  const detailStr = detail == null
+    ? null
+    : typeof detail === "string"
+      ? detail
+      : JSON.stringify(detail);
+
   return (
     <Card className={cn(offline ? "border-red-500/30 bg-red-500/5" : "border-emerald-500/20")}>
       <CardContent className="p-4">
@@ -719,11 +728,11 @@ function BackendHealthCard({
                 {configured ? "yes (BACKEND_URL set)" : "no (BACKEND_URL missing)"}
               </dd>
             </div>
-            {detail && (
+            {detailStr != null && (
               <div className="flex items-baseline justify-between gap-2 min-w-0">
                 <dt className="text-muted-foreground shrink-0">Detail</dt>
-                <dd className="font-mono text-right truncate" title={detail}>
-                  {detail}
+                <dd className="font-mono text-right truncate" title={detailStr}>
+                  {detailStr}
                 </dd>
               </div>
             )}

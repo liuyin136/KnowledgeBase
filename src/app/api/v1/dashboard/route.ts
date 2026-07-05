@@ -76,7 +76,17 @@ export async function GET() {
       recentSearches,
       system,
       health: {
-        backend: { status: backend.status, configured: isBackendConfigured(), detail: backend.detail ?? null },
+        backend: {
+          status: backend.status,
+          configured: isBackendConfigured(),
+          // Normalize so the UI never receives a raw object for "detail"
+          // (prevents React #31 "object with keys {status}" when backend /health returns {status:"ok"})
+          detail: backend.detail == null
+            ? null
+            : typeof backend.detail === "string"
+              ? backend.detail
+              : JSON.stringify(backend.detail),
+        },
         neo4j: {
           status: neo4jConn.ok ? "online" : "offline",
           uri: cfg.uri,

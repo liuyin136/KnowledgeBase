@@ -33,3 +33,4 @@ httpx
 tenacity
 structlog
 huggingface-hub
+peft  # Required for Jina v5-small (and some transformers) model loading in embedding service. Fixes "peft" missing module warning at lifespan.
