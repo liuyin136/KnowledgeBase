@@ -112,8 +112,6 @@ services:
     build:
       context: ../backend
       dockerfile: ../docker/Dockerfile.backend
-      args:
-        DOWNLOAD_BGE: ${DOWNLOAD_BGE:-0}
     container_name: raglab-api-worker
     command: ["python", "-m", "app.workers.worker"]
     environment:

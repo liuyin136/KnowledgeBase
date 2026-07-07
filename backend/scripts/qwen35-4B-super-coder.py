@@ -15,12 +15,12 @@ print("Loading the model by using GPU...")
 llm = Llama(
     model_path=str(model_path),
     n_gpu_layers=-1, #
-    n_ctx=4096,      
+    n_ctx=32768,      
     verbose=False    
 )
 
 # 3. Extract the code from file i defined, store as "context", file_path is constant.
-file_path = "D:\\KnowledgeBase2\\backend\\app\\db\\neo4j_client.py"
+file_path = "/app/scripts/neo4j_client.py"
 with open(file_path, "r") as file:
     content = file.read()
 
@@ -35,7 +35,7 @@ response = llm.create_chat_completion(
     messages=messages,
     temperature=0.6,    # recommended temperature value by the author
     top_p=0.95,         # recommended top-p value by the author
-    max_tokens=1024     # limit the maximum output length
+    #max_tokens=1024     # limit the maximum output length
 )
 
 # 5. Print the result
