@@ -1,0 +1,10 @@
+# Baseline stub dependencies (full ML stack lives in app/requirements.txt)
+fastapi
+uvicorn[standard]
+redis
+rq
+neo4j
+pydantic
+pydantic-settings
+transformers[serving]
+huggingface_hub

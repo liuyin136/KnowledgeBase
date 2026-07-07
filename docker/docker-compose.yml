@@ -1,0 +1,195 @@
+# =============================================================================
+# docker-compose.yml — Local-First RAG Platform (no experiments node)
+# Per infrastructure-environment-spec_v1.1.md §3 (updated for v1.3 Jina models)
+#
+# Usage (from project root, via the thin root docker-compose.yml include):
+#   docker compose build
+#   docker compose run --rm backend python scripts/download_models.py
+#   docker compose run --rm backend python scripts/init_neo4j.py
+#   docker compose up -d
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Neo4j 
+  # ---------------------------------------------------------------------------
+  neo4j:
+    image: neo4j:5.20-community
+    container_name: raglab-neo4j
+    ports:
+      - "7474:7474"   # HTTP browser + REST
+      - "7687:7687"   # Bolt (driver protocol)
+    environment:
+      NEO4J_AUTH: neo4j/P@ssw0rd
+      NEO4J_PLUGINS: '["apoc"]'          # APOC for procedural helpers (Slice 5+)
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      NEO4J_dbms_memory_heap_max__size: 1G
+      NEO4J_server_memory_heap_initial__size: 512M
+      NEO4J_server_default__listen__address: 0.0.0.0
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks: [default]
+
+  # ---------------------------------------------------------------------------
+  # Redis — RQ job queue + progress tracking for the api-worker
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: raglab-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    networks: [default]
+
+  # ---------------------------------------------------------------------------
+  # Backend — FastAPI (uvicorn). Serves REST API on :8000. GPU-enabled.
+  # ---------------------------------------------------------------------------
+  backend:
+    build:
+      # Build context is the backend/ directory; paths inside the Dockerfile
+      # are relative to backend/ root.
+      context: ../backend
+      dockerfile: ../docker/Dockerfile.backend
+    container_name: raglab-backend
+    ports:
+      - "8000:8000"
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: P@ssw0rd
+      REDIS_URL: redis://redis:6379/0
+      MODEL_PATH: /app/models
+      CUDA_VISIBLE_DEVICES: "0"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      FRONTEND_ORIGIN: "*"
+      EMBEDDING_DIM: "1024"
+      EMBEDDING_MODEL: jina-v5-small
+      RERANKER_MODEL: jina-v3
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /app
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks: [default]
+
+  # ---------------------------------------------------------------------------
+  # API worker — long-running ingest/search jobs via RQ (consumes Redis queue).
+  # Same image as backend; only the command differs.
+  # ---------------------------------------------------------------------------
+  api-worker:
+    build:
+      context: ../backend
+      dockerfile: ../docker/Dockerfile.backend
+      args:
+        DOWNLOAD_BGE: ${DOWNLOAD_BGE:-0}
+    container_name: raglab-api-worker
+    command: ["python", "-m", "app.workers.worker"]
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: P@ssw0rd
+      REDIS_URL: redis://redis:6379/0
+      MODEL_PATH: /app/models
+      CUDA_VISIBLE_DEVICES: "0"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      FRONTEND_ORIGIN: "*"
+      EMBEDDING_DIM: "1024"
+      # v1.3: must mirror the backend service so the worker uses the same model.
+      EMBEDDING_MODEL: jina-v5-small
+      RERANKER_MODEL: jina-v3
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /app
+      # Worker-specific tuning
+      RQ_QUEUE_NAME: default
+      WORKER_CONCURRENCY: "1"   # BGE-M3 + 8 GB VRAM = 1 concurrent job
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks: [default]
+    volumes:
+    - ../backend/scripts:/app/scripts
+
+  # ---------------------------------------------------------------------------
+  # Frontend — Next.js 16 (standalone). Serves :3000, proxies /api/v1/* → backend.
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      # Build context is the project root (so we can COPY next.config.ts,
+      # src/, public/, package.json, bun.lock).
+      context: ..
+      dockerfile: docker/Dockerfile.frontend
+    container_name: raglab-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      BACKEND_URL: http://backend:8000
+      NEXT_PUBLIC_BACKEND_URL: ""   # empty — frontend calls same-origin /api/v1/*
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: P@ssw0rd
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [default]
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  neo4j_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  default:
+    driver: bridge

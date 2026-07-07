@@ -1,0 +1,67 @@
+# =============================================================================
+# Root .dockerignore — Local-First RAG Experimentation Platform v1.3
+# Applies to the frontend build (context = project root).
+#
+# IMPORTANT (v1.3 fix): tsconfig.json, tailwind.config.ts, postcss.config.mjs,
+# and components.json are NOT excluded — Next.js needs them to resolve the
+# `@/*` path alias + Tailwind theme + shadcn config during `next build`.
+# Excluding them breaks the production build with "Cannot find module '@/*'".
+# =============================================================================
+
+# ---- VCS ----
+.git
+.gitignore
+.gitattributes
+
+# ---- Node / Next.js ----
+node_modules
+.next
+.vercel
+.cache
+.turbo
+*.log
+dev.log
+server.log
+
+# ---- Bun ----
+.bun
+
+# ---- Build artifacts ----
+dist
+build
+out
+*.tsbuildinfo
+
+# ---- Sandboxes / tooling ----
+tool-results
+agent-ctx
+download
+examples
+mini-services
+
+# ---- Docs (keep README.md; exclude the rest to slim the context) ----
+upload
+*.md
+!README.md
+docker
+docker-compose.yml
+Caddyfile
+eslint.config.mjs
+
+# ---- Env / secrets ----
+.env
+.env.*
+!.env.example
+
+# ---- Local data ----
+db
+*.db
+*.sqlite
+*.sqlite3
+
+# ---- OS noise ----
+.DS_Store
+Thumbs.db
+
+# ---- Backend (built separately; context = backend/) ----
+backend
