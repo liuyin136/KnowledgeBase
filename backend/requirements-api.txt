@@ -1,0 +1,10 @@
+# Slim API image — backend service only (no ML stack)
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+neo4j
+redis
+rq
+aiofiles
+python-multipart

@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import os
-from download_models2 import ensure_model
+
 import redis
+from download_models2 import ensure_model
 from rq import Queue, Worker
 
+from app.workers import tasks  # noqa: F401 — register RQ task functions
+
 ensure_model()
+
 
 def main() -> None:
     redis_url = os.environ.get("REDIS_URL", "redis://redis:6379/0")

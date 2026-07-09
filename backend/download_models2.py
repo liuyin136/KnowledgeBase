@@ -1,31 +1,30 @@
-"""Build-time model downloader — ensures Qwen GGUF is present; downloads if missing."""
+"""Build-time model downloader — ensures Qwen GGUF and Jina embeddings are present."""
 from __future__ import annotations
 
 import os
 import sys
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 
 REPO_ID = "jica98/qwen3.5-4B-super-coder"
 FILENAME = "qwen3.5-4B-super-coder.Q4_0.gguf"
 MIN_SIZE_BYTES = 2_000_000_000  # sanity check for Q4_0 ~2.5 GB
 
+JINA_REPO_ID = "jinaai/jina-embeddings-v5-omni-small"
+JINA_SUBDIR = "jina-embeddings-v5-omni-small"
+
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", "/app/models"))
-
-
-def ensure_model() -> Path:
-    dest = expected_model_path()
-    try:
-        verify_model(dest)
-        return dest
-    except (FileNotFoundError, ValueError):
-        return download_qwen_model(MODEL_PATH)
 
 
 def expected_model_path(model_dir: Path | None = None) -> Path:
     base = model_dir if model_dir is not None else MODEL_PATH
     return base / FILENAME
+
+
+def expected_jina_model_path(model_dir: Path | None = None) -> Path:
+    base = model_dir if model_dir is not None else MODEL_PATH
+    return base / JINA_SUBDIR
 
 
 def verify_model(path: Path) -> None:
@@ -35,6 +34,18 @@ def verify_model(path: Path) -> None:
     if size < MIN_SIZE_BYTES:
         raise ValueError(
             f"model file too small ({size} bytes, expected >= {MIN_SIZE_BYTES}): {path}"
+        )
+
+
+def verify_jina_model(path: Path) -> None:
+    config = path / "config.json"
+    if not config.is_file():
+        raise FileNotFoundError(f"Jina config not found: {config}")
+    weights = path / "model.safetensors"
+    pytorch_weights = path / "pytorch_model.bin"
+    if not weights.is_file() and not pytorch_weights.is_file():
+        raise FileNotFoundError(
+            f"Jina weights not found in {path} (expected model.safetensors or pytorch_model.bin)"
         )
 
 
@@ -51,21 +62,51 @@ def download_qwen_model(model_dir: Path) -> Path:
     return dest
 
 
-def main() -> None:
-    MODEL_PATH.mkdir(parents=True, exist_ok=True)
+def download_jina_model(model_dir: Path) -> Path:
+    dest = expected_jina_model_path(model_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=JINA_REPO_ID,
+        local_dir=str(dest),
+    )
+    verify_jina_model(dest)
+    return dest
+
+
+def ensure_qwen_model() -> Path:
     dest = expected_model_path()
     try:
         verify_model(dest)
-        print(f"Model already present at {dest}")
-        return
+        return dest
     except (FileNotFoundError, ValueError):
-        pass
+        return download_qwen_model(MODEL_PATH)
+
+
+def ensure_jina_model() -> Path:
+    dest = expected_jina_model_path()
     try:
-        dest = download_qwen_model(MODEL_PATH)
+        verify_jina_model(dest)
+        return dest
+    except FileNotFoundError:
+        return download_jina_model(MODEL_PATH)
+
+
+def ensure_model() -> Path:
+    qwen = ensure_qwen_model()
+    ensure_jina_model()
+    return qwen
+
+
+def main() -> None:
+    MODEL_PATH.mkdir(parents=True, exist_ok=True)
+    try:
+        qwen = ensure_qwen_model()
+        print(f"Qwen model ready at {qwen}")
+        jina = ensure_jina_model()
+        print(f"Jina model ready at {jina}")
     except Exception as exc:
-        print(f"Model download failed: {exc}", file=sys.stderr)
+        print(f"Model ensure failed: {exc}", file=sys.stderr)
         sys.exit(1)
-    print(f"Downloaded model to {dest}")
 
 
 if __name__ == "__main__":

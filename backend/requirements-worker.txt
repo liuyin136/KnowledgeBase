@@ -1,0 +1,15 @@
+# GPU worker image — models, RQ jobs, scripts
+redis
+rq
+neo4j
+pydantic
+pydantic-settings
+huggingface_hub
+transformers
+sentence-transformers
+numpy
+einops
+structlog
+httpx
+tenacity
+peft

@@ -1,10 +1,3 @@
-# Baseline stub dependencies (full ML stack lives in app/requirements.txt)
-fastapi
-uvicorn[standard]
-redis
-rq
-neo4j
-pydantic
-pydantic-settings
-transformers[serving]
-huggingface_hub
+# Local dev / legacy pointer — API image uses requirements-api.txt;
+# worker image uses requirements-worker.txt (see docker/Dockerfile.*).
+-r requirements-api.txt

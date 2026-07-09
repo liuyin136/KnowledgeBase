@@ -1,119 +1,35 @@
 # syntax=docker/dockerfile:1.7
 # =============================================================================
-# Dockerfile.backend — Local-First RAG Platform (experiment node deleted)
-#
-# ARCHITECTURAL DESIGN & TRADE-OFFS
-# =================================
+# Dockerfile.backend — Slim API gateway (no CUDA, no models)
+# Connects: frontend, Neo4j, Redis (cache + enqueue), shared /data volume
+# =============================================================================
+FROM python:3.13-slim
 
-# -----------------------------------------------------------------------------
-# Stage 1 — model-downloader
-# -----------------------------------------------------------------------------
-FROM python:3.13-slim AS model-downloader
-
-# Build-time args.
-ARG HF_HUB_DOWNLOAD_TIMEOUT=120
-ENV HF_HOME=/root/.cache/huggingface \
-    HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT} \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-# git-lfs is required by huggingface_hub for repos that store weights via LFS.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        git \
-        git-lfs \
-    && git lfs install \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir "huggingface_hub>=0.24,<0.30"
-
-WORKDIR /app
-
-COPY download_models2.py /app/download_models2.py
-COPY scripts .
-
-RUN --mount=type=cache,target=/root/.cache/huggingface,sharing=locked \
-    MODEL_PATH=/app/models python /app/download_models2.py
-
-# -----------------------------------------------------------------------------
-# Stage 2 — runtime
-# -----------------------------------------------------------------------------
-FROM nvidia/cuda:13.3.0-devel-ubuntu26.04 AS runtime
-
-# Ubuntu 26.04 ships Python 3.12 in apt — no deadsnakes PPA needed.
-# Minimal system deps:
-#   • build-essential — any wheel compilation (rare; most wheels are prebuilt)
-#   • libgomp1       — OpenMP for torch CPU ops
-#   • libgl1, libglib2.0-0 — runtime libs some tokenizers/image deps pull in
-#   • ca-certificates, curl — healthcheck + outbound HTTPS to HuggingFace
-#   • git            — pip -e git+... fallbacks + HF hub clone fallbacks
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_BREAK_SYSTEM_PACKAGES=1 \
-    CUDA_VISIBLE_DEVICES=0 \
-    MODEL_PATH=/app/models \
-    PYTHONPATH=/app \
-    HF_HOME=/root/.cache/huggingface \
-    TRANSFORMERS_CACHE=/root/.cache/huggingface/hub
+    PYTHONPATH=/app
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
-        git \
-        build-essential \
-        libgomp1 \
-        libgl1 \
-        libglib2.0-0 \
-        python3 \
-        python3-venv \
-        python3-dev \
- && rm -rf /var/lib/apt/lists/* \
- && update-alternatives --install /usr/bin/python python /usr/bin/python3 1 \
- && curl -fsSLo /tmp/get-pip.py https://bootstrap.pypa.io/get-pip.py \
- && python3 /tmp/get-pip.py \
- && rm /tmp/get-pip.py \
- && pip install --upgrade pip setuptools wheel
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# ---- Install Python deps (BuildKit pip cache mount) --------------------------
-# ---- 安裝 Python 依賴（使用清華鏡像加速） -----------------------------
-COPY requirements.txt ./
+COPY requirements-api.txt ./
 
-RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    pip install -r requirements.txt \
-        --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-        --extra-index-url https://download.pytorch.org/whl/cu124
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r requirements-api.txt
 
-RUN CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python       
-        
-
-# ---- Copy models from stage 1 ------------------------------------------------
-COPY --from=model-downloader /app/models /app/models
-
-# ---- Copy backend application code -------------------------------------------
-# Build context is ../backend, so `COPY . ./` pulls in app/, scripts/,
-# pyproject.toml, etc. The backend/.dockerignore excludes __pycache__, .venv,
-# models/ (host-side dev downloads), tests, etc.
-COPY . ./
-
-# Ensure scripts are executable (download_models.py / init_neo4j.py are
-# invoked via `docker compose exec backend python scripts/...`).
-RUN if [ -d scripts ]; then chmod -R +x scripts || true; fi
+COPY app ./app
 
 EXPOSE 8000
 
-# Default CMD — the api-worker service overrides `command` in compose to run
-# `python -m app.workers.worker` instead.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
-# Healthcheck: FastAPI exposes GET /health (per Backend Design Scope v1.1).
-HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=5 \
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
     CMD curl -fsS http://localhost:8000/health || exit 1
