@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # =============================================================================
 # Dockerfile.worker — GPU worker (models, scripts, RQ job execution)
+# Stages: model-downloader → builder (CUDA devel) → runtime (CUDA runtime)
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -20,11 +21,11 @@ RUN apt-get update \
         curl \
         git \
         git-lfs \
-    && git lfs install \
-    && rm -rf /var/lib/apt/lists/*
+ && git lfs install \
+ && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir "huggingface_hub>=0.24"
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install "huggingface_hub==1.22.0"
 
 WORKDIR /app
 
@@ -34,40 +35,91 @@ RUN --mount=type=cache,target=/root/.cache/huggingface,sharing=locked \
     MODEL_PATH=/app/models python /app/download_models2.py
 
 # -----------------------------------------------------------------------------
-# Stage 2 — runtime
+# Stage 2 — builder (CUDA devel: compile jina llama.cpp + llama-cpp-python)
 # -----------------------------------------------------------------------------
-FROM nvidia/cuda:13.3.0-devel-ubuntu26.04 AS runtime
+FROM nvidia/cuda:13.3.0-devel-ubuntu26.04 AS builder
 
+ARG CUDA_ARCH=86
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
-    CUDA_VISIBLE_DEVICES=0 \
-    MODEL_PATH=/app/models \
-    PYTHONPATH=/app \
-    HF_HOME=/root/.cache/huggingface \
-    TRANSFORMERS_CACHE=/root/.cache/huggingface/hub
+    CMAKE_ARGS="-DGGML_CUDA=on -DLLAMA_FLASH_ATTN=on -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}"
 
-RUN apt-get update \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         git \
+        cmake \
+        ninja-build \
         build-essential \
-        libgomp1 \
-        libgl1 \
-        libglib2.0-0 \
         python3 \
         python3-venv \
         python3-dev \
- && rm -rf /var/lib/apt/lists/* \
  && update-alternatives --install /usr/bin/python python /usr/bin/python3 1 \
  && curl -fsSLo /tmp/get-pip.py https://bootstrap.pypa.io/get-pip.py \
  && python3 /tmp/get-pip.py \
- && rm /tmp/get-pip.py \
- && pip install --upgrade pip setuptools wheel
+ && rm -f /tmp/get-pip.py
+
+# jina-ai llama.cpp binaries (llama-server + llama-embedding) → /opt/llama
+RUN git clone --depth 1 -b feat-v5-omni https://github.com/jina-ai/llama.cpp /tmp/llama-jina \
+ && cmake -B /tmp/llama-jina/build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=ON \
+      -DGGML_CUDA=ON \
+      -DLLAMA_FLASH_ATTN=ON \
+      -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
+      /tmp/llama-jina \
+ && cmake --build /tmp/llama-jina/build --target llama-server llama-embedding -j"$(nproc)" \
+ && mkdir -p /opt/llama/bin /opt/llama/lib \
+ && install /tmp/llama-jina/build/bin/llama-server /tmp/llama-jina/build/bin/llama-embedding /opt/llama/bin/ \
+ && find /tmp/llama-jina/build -name 'lib*.so*' -exec cp -a {} /opt/llama/lib/ \; \
+ && rm -rf /tmp/llama-jina
+
+# PyPI llama-cpp-python (CUDA via CMAKE_ARGS); stage package + runtime deps for COPY
+# (diskcache/jinja2/markupsafe are not in requirements-worker.txt)
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install "llama-cpp-python==0.3.33" \
+ && SITE="$(python3 -c 'import site; print(site.getsitepackages()[0])')" \
+ && mkdir -p /opt/python-libs \
+ && cp -a "$SITE"/llama_cpp* /opt/python-libs/ \
+ && cp -a "$SITE"/diskcache* /opt/python-libs/ \
+ && cp -a "$SITE"/jinja2* /opt/python-libs/ \
+ && cp -a "$SITE"/markupsafe* /opt/python-libs/ \
+ && rm -rf /tmp/*
+
+# -----------------------------------------------------------------------------
+# Stage 3 — runtime (CUDA runtime only; no compilers)
+# -----------------------------------------------------------------------------
+FROM nvidia/cuda:13.3.0-runtime-ubuntu26.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    MODEL_PATH=/app/models \
+    PYTHONPATH=/app \
+    HF_HOME=/root/.cache/huggingface
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libgomp1 \
+        libgl1 \
+        libglib2.0-0 \
+        poppler-utils \
+        python3 \
+        python3-venv \
+ && update-alternatives --install /usr/bin/python python /usr/bin/python3 1 \
+ && curl -fsSLo /tmp/get-pip.py https://bootstrap.pypa.io/get-pip.py \
+ && python3 /tmp/get-pip.py \
+ && rm -f /tmp/get-pip.py
 
 WORKDIR /app
 
@@ -75,10 +127,18 @@ COPY requirements-worker.txt ./
 
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     pip install -r requirements-worker.txt \
-        --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-        --extra-index-url https://download.pytorch.org/whl/cu124
+        --index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
-RUN CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python
+# Compiled artifacts from builder
+COPY --from=builder /opt/llama/bin/llama-server /usr/local/bin/
+COPY --from=builder /opt/llama/bin/llama-embedding /usr/local/bin/
+COPY --from=builder /opt/llama/lib/ /usr/local/lib/
+COPY --from=builder /opt/python-libs/ /tmp/llama_cpp_pkg/
+
+RUN SITE="$(python3 -c 'import site; print(site.getsitepackages()[0])')" \
+ && cp -a /tmp/llama_cpp_pkg/. "$SITE/" \
+ && rm -rf /tmp/llama_cpp_pkg \
+ && ldconfig
 
 COPY --from=model-downloader /app/models /app/models
 

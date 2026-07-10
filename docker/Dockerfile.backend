@@ -22,8 +22,8 @@ WORKDIR /app
 
 COPY requirements-api.txt ./
 
-RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir -r requirements-api.txt
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install -r requirements-api.txt
 
 COPY app ./app
 

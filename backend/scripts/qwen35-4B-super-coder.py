@@ -3,6 +3,7 @@ import sys
 from download_models2 import expected_model_path, verify_model
 from llama_cpp import Llama
 
+
 try:
     model_path = expected_model_path()
     verify_model(model_path)
@@ -20,9 +21,12 @@ llm = Llama(
 )
 
 # 3. Extract the code from file i defined, store as "context", file_path is constant.
-file_path = "/app/scripts/neo4j_client.py"
+file_path = "/app/scripts/read-only/init_neo4j.py"
 with open(file_path, "r") as file:
     content = file.read()
+
+tokens = llm.tokenize(content.encode("utf-8"), add_bos=True)
+token_count_input = len(tokens)
 
 # 4. Define the conversation content and generate the response
 messages = [
@@ -39,4 +43,9 @@ response = llm.create_chat_completion(
 )
 
 # 5. Print the result
-print(response['choices'][0]['message']['content'])
+result = response['choices'][0]['message']['content']
+print(result)
+tokens = llm.tokenize(result.encode("utf-8"), add_bos=True)
+token_count = len(tokens)
+print(f"This input has {token_count_input} tokens.")
+print(f"This response has {token_count} tokens.")

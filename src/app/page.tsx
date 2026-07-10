@@ -3,6 +3,11 @@ export default function HomePage() {
     <main style={{ padding: "2rem", fontFamily: "system-ui, sans-serif" }}>
       <h1>RAG Lab Baseline</h1>
       <p>Docker stack is running. Backend health: <code>/health</code></p>
+      <p>
+        <a href="/experiment" style={{ color: "#00f0ff" }}>
+          Open Lab Notebook →
+        </a>
+      </p>
     </main>
   );
 }

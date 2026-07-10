@@ -12,6 +12,9 @@ node_modules
 
 # testing
 /coverage
+/data
+/data
+/Download
 
 # next.js
 /.next/
@@ -43,6 +46,10 @@ yarn-error.log*
 next-env.d.ts
 local-*
 .claude
+.cursor
+.agents
+.grok
+.next
 .z-ai-config
 *.log
 dev.log
@@ -53,3 +60,4 @@ prompt
 server.log
 # Skills directory
 /skills/
+
