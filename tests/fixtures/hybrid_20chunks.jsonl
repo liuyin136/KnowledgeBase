@@ -1,0 +1,5 @@
+{"query": "redis connection pool timeout", "gold_chunk_ids": ["c001", "c016", "c023"], "relevance_grades": [3, 3, 2]}
+{"query": "opentelemetry traceparent rq worker", "gold_chunk_ids": ["c010", "c024"], "relevance_grades": [3, 2]}
+{"query": "hybrid search bm25 vector fusion", "gold_chunk_ids": ["c005", "c013", "c018", "c020"], "relevance_grades": [3, 3, 2, 2]}
+{"query": "content hash incremental ingest skip", "gold_chunk_ids": ["c011"], "relevance_grades": [3]}
+{"query": "jina reranker gguf projector scoring", "gold_chunk_ids": ["c014"], "relevance_grades": [3]}

@@ -1,0 +1,33 @@
+{
+  "chunks": [
+    {"id": "c001", "parent_path": "RND/alpha.md", "content": "redis connection pool timeout configuration for production"},
+    {"id": "c002", "parent_path": "RND/alpha.md", "content": "vector databases and approximate nearest neighbor search tuning"},
+    {"id": "c003", "parent_path": "RND/alpha.md", "content": "general database indexing strategies without cache layers"},
+    {"id": "c004", "parent_path": "RND/alpha.md", "content": "memory allocation patterns in python asyncio services"},
+    {"id": "c005", "parent_path": "RND/alpha.md", "content": "observability metrics for hybrid retrieval pipelines"},
+    {"id": "c006", "parent_path": "RND/alpha.md", "content": "neo4j vector index coarse dimensions matryoshka truncation"},
+    {"id": "c007", "parent_path": "RND/alpha.md", "content": "docker compose health checks for redis and neo4j"},
+    {"id": "c008", "parent_path": "Daily/beta.md", "content": "daily standup notes about frontend cyberpunk styling tokens"},
+    {"id": "c009", "parent_path": "Daily/beta.md", "content": "kubernetes pod restart loops due to oom in embedding worker"},
+    {"id": "c010", "parent_path": "Daily/beta.md", "content": "rq job queue traceparent propagation with opentelemetry"},
+    {"id": "c011", "parent_path": "Daily/beta.md", "content": "content hash diff incremental ingest skipping unchanged chunks"},
+    {"id": "c012", "parent_path": "Daily/beta.md", "content": "library page ingest status badges pending indexed error"},
+    {"id": "c013", "parent_path": "Daily/beta.md", "content": "bm25 fulltext recall union with coarse vector ann search"},
+    {"id": "c014", "parent_path": "Daily/beta.md", "content": "reranker jina v3 gguf projector scoring for top hits"},
+    {"id": "c015", "parent_path": "case/gamma.md", "content": "troubleshooting nginx 502 when backend health check fails"},
+    {"id": "c016", "parent_path": "case/gamma.md", "content": "case study redis connection pool timeout under burst load"},
+    {"id": "c017", "parent_path": "case/gamma.md", "content": "gpu vram peak monitoring during sequential chunk embedding"},
+    {"id": "c018", "parent_path": "case/gamma.md", "content": "fixing z score fusion degenerate pools with minmax fallback"},
+    {"id": "c019", "parent_path": "case/gamma.md", "content": "search cache key includes coarse dim w1 w2 recall rerank"},
+    {"id": "c020", "parent_path": "case/gamma.md", "content": "benchmark ndcg gate hybrid must beat vector only baseline"},
+    {"id": "c021", "parent_path": "case/gamma.md", "content": "unrelated cooking recipe for sourdough bread starter"},
+    {"id": "c022", "parent_path": "case/gamma.md", "content": "unrelated travel guide for mountain hiking trails"},
+    {"id": "c023", "parent_path": "RND/alpha.md", "content": "pool sizing redis connections timeout retry backoff"},
+    {"id": "c024", "parent_path": "Daily/beta.md", "content": "span id footer on rag search page for jaeger debugging"},
+    {"id": "c025", "parent_path": "RND/trap.md", "content": "vector search hybrid fusion coarse approximate nearest neighbor index matryoshka embedding pipeline"},
+    {"id": "c026", "parent_path": "RND/trap.md", "content": "opentelemetry observability metrics tracing span pipeline worker queue backend service"},
+    {"id": "c027", "parent_path": "RND/trap.md", "content": "search cache fusion coarse vector bm25 rerank ndcg benchmark hybrid retrieval engine"},
+    {"id": "c028", "parent_path": "RND/trap.md", "content": "content hash incremental ingest skip chunk worker sequential embed neo4j graph"},
+    {"id": "c029", "parent_path": "RND/trap.md", "content": "jina gguf reranker projector embedding model gpu vram sequential inference worker"}
+  ]
+}

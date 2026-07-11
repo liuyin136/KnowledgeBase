@@ -127,7 +127,11 @@ COPY requirements-worker.txt ./
 
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     pip install -r requirements-worker.txt \
+        --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+ && pip install "spacy==3.8.13" --no-build-isolation \
         --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+RUN python -m spacy download en_core_web_sm
 
 # Compiled artifacts from builder
 COPY --from=builder /opt/llama/bin/llama-server /usr/local/bin/
@@ -144,8 +148,7 @@ COPY --from=model-downloader /app/models /app/models
 
 COPY download_models2.py ./
 COPY scripts ./scripts
-COPY app/__init__.py ./app/
-COPY app/workers ./app/workers
+COPY app ./app
 
 RUN if [ -d scripts ]; then chmod -R +x scripts || true; fi
 

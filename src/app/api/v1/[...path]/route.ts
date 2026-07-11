@@ -64,6 +64,14 @@ export async function PUT(
   return proxyRequest(request, path);
 }
 
+export async function PATCH(
+  request: NextRequest,
+  context: { params: Promise<{ path: string[] }> }
+) {
+  const { path } = await context.params;
+  return proxyRequest(request, path);
+}
+
 export async function DELETE(
   request: NextRequest,
   context: { params: Promise<{ path: string[] }> }

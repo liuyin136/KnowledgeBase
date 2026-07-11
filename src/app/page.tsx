@@ -8,6 +8,11 @@ export default function HomePage() {
           Open Lab Notebook →
         </a>
       </p>
+      <p>
+        <a href="/rag" style={{ color: "#ff00aa" }}>
+          Open RAG Console →
+        </a>
+      </p>
     </main>
   );
 }

@@ -80,8 +80,16 @@ services:
       DATA_ROOT: /data
       FILE_CACHE_TTL: "3600"
       FILE_CACHE_MAX_BYTES: "1048576"
+      DEFAULT_COARSE_DIM: "256"
+      SEARCH_CACHE_TTL: "3600"
+      CHUNK_TOKEN_MAX: "29500"
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: knowledgebase-api
+      VAULT_DB_PATH: /var/lib/rag/vault.db
     volumes:
       - ../data:/data
+      - vault_db_data:/var/lib/rag
+      - ../backend/app:/app/app
     depends_on:
       neo4j:
         condition: service_healthy
@@ -120,6 +128,16 @@ services:
       PYTHONPATH: /app
       WORKER_CONCURRENCY: "1"
       DATA_ROOT: /data
+      DEFAULT_COARSE_DIM: "256"
+      SEARCH_CACHE_TTL: "3600"
+      CHUNK_TOKEN_MAX: "29500"
+      RERANK_N_CTX: "131072"
+      RERANK_N_BATCH: "131072"
+      PENDING_RERANK_TTL_SEC: "1800"
+      INGEST_PROGRESS_TTL_SEC: "1800"
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: knowledgebase-worker
+      VAULT_DB_PATH: /var/lib/rag/vault.db
     depends_on:
       redis:
         condition: service_healthy
@@ -136,7 +154,10 @@ services:
     networks: [default]
     volumes:
       - ../backend/scripts:/app/scripts
+      - ../backend/app:/app/app
+      - ../tests:/app/tests
       - ../data:/data
+      - vault_db_data:/var/lib/rag
 
   # ---------------------------------------------------------------------------
   # Frontend — Next.js 16 (standalone). Serves :3000, proxies /api/v1/* → backend.
@@ -160,10 +181,24 @@ services:
     restart: unless-stopped
     networks: [default]
 
+  jaeger:
+    image: jaegertracing/all-in-one:1.64
+    container_name: raglab-jaeger
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    profiles: ["otel"]
+    restart: unless-stopped
+    networks: [default]
+
 volumes:
   neo4j_data:
     driver: local
   redis_data:
+    driver: local
+  vault_db_data:
     driver: local
 
 networks:

@@ -5,6 +5,7 @@ import atexit
 import base64
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,10 @@ _RERANK_QUERY_EMBED_TOKEN_ID = 151671
 _CHAT_IM_END = "<|" + "im_end" + "|>"
 _active_servers: dict[str, subprocess.Popen[bytes]] = {}
 _server_markers: dict[str, str] = {}
+_RERANK_N_CTX = int(os.environ.get("RERANK_N_CTX", "32768"))
+_RERANK_N_BATCH = int(os.environ.get("RERANK_N_BATCH", "32768"))
+_tokenize_llm: Llama | None = None
+_tokenize_model_path: Path | None = None
 
 
 def require_assets(paths: list[Path]) -> None:
@@ -246,19 +251,24 @@ class JinaRerankResult:
 
 
 class JinaReranker:
-    """GGUF jina-reranker-v3 using llama-embedding + projector (HF-compatible)."""
+    """GGUF jina-reranker-v3 using llama.cpp per-token embeddings + projector (HF-compatible)."""
 
     def __init__(
         self,
         model_path: Path,
         projector_path: Path,
         llama_embedding: str = _LLAMA_EMBEDDING,
+        *,
+        n_ctx: int | None = None,
+        n_batch: int | None = None,
     ) -> None:
         self.model_path = model_path
         self.projector_path = projector_path
         self.llama_embedding = llama_embedding
+        self.n_ctx = n_ctx if n_ctx is not None else _RERANK_N_CTX
+        self.n_batch = n_batch if n_batch is not None else _RERANK_N_BATCH
         self._projector = _load_reranker_projector(projector_path)
-        self._tokenizer: Llama | None = None
+        self._embed_llm: Llama | None = None
 
     def rerank(
         self,
@@ -272,21 +282,32 @@ class JinaReranker:
             return []
 
         prompt = _format_rerank_prompt(query, documents, instruction=instruction)
-        embeddings = _rerank_hidden_states(prompt, self.model_path, self.llama_embedding)
-        tokens = np.asarray(self._tokenize(prompt), dtype=np.int64)
+        llm = self._ensure_embed_llm()
+        embeddings = _rerank_hidden_states(prompt, llm)
 
-        query_positions = np.where(tokens == _RERANK_QUERY_EMBED_TOKEN_ID)[0]
-        doc_positions = np.where(tokens == _RERANK_DOC_EMBED_TOKEN_ID)[0]
+        doc_positions = _marker_token_ends(llm, prompt, _RERANK_DOC_EMBED_TOKEN)
+        query_positions = _marker_token_ends(llm, prompt, _RERANK_QUERY_EMBED_TOKEN, last=True)
         if len(query_positions) == 0:
-            raise ValueError(
-                f"query embed token (id {_RERANK_QUERY_EMBED_TOKEN_ID}) not found in prompt"
-            )
+            raise ValueError(f"query embed token {_RERANK_QUERY_EMBED_TOKEN!r} not found in prompt")
         if len(doc_positions) == 0:
+            raise ValueError(f"document embed tokens {_RERANK_DOC_EMBED_TOKEN!r} not found in prompt")
+        if len(doc_positions) != len(documents):
             raise ValueError(
-                f"document embed tokens (id {_RERANK_DOC_EMBED_TOKEN_ID}) not found in prompt"
+                f"expected {len(documents)} document embed markers, found {len(doc_positions)}"
             )
 
-        query_hidden = embeddings[query_positions[0] : query_positions[0] + 1]
+        query_pos = query_positions[0]
+        if query_pos >= len(embeddings):
+            raise ValueError(
+                f"query embed position {query_pos} out of range for {len(embeddings)} embeddings"
+            )
+        for pos in doc_positions:
+            if pos >= len(embeddings):
+                raise ValueError(
+                    f"document embed position {pos} out of range for {len(embeddings)} embeddings"
+                )
+
+        query_hidden = embeddings[query_pos : query_pos + 1]
         doc_hidden = embeddings[doc_positions]
         query_embeds = _apply_reranker_projector(self._projector, query_hidden)
         doc_embeds = _apply_reranker_projector(self._projector, doc_hidden)
@@ -301,16 +322,53 @@ class JinaReranker:
             return results[:top_n]
         return results
 
-    def _tokenize(self, prompt: str) -> list[int]:
-        if self._tokenizer is None:
-            self._tokenizer = Llama(
+    def _ensure_embed_llm(self) -> Llama:
+        if self._embed_llm is None:
+            self._embed_llm = Llama(
                 model_path=str(self.model_path),
-                embedding=False,
+                embedding=True,
+                pooling_type=llama_cpp.LLAMA_POOLING_TYPE_NONE,
                 n_gpu_layers=-1,
-                n_ctx=8192,
+                n_ctx=self.n_ctx,
+                n_batch=self.n_batch,
                 verbose=False,
             )
-        return self._tokenizer.tokenize(prompt.encode("utf-8"))
+        return self._embed_llm
+
+
+def _get_rerank_tokenize_llm(model_path: Path) -> Llama:
+    global _tokenize_llm, _tokenize_model_path
+    if _tokenize_llm is None or _tokenize_model_path != model_path:
+        if _tokenize_llm is not None:
+            close = getattr(_tokenize_llm, "close", None)
+            if callable(close):
+                close()
+            _tokenize_llm = None
+        _tokenize_llm = Llama(
+            model_path=str(model_path),
+            embedding=True,
+            pooling_type=llama_cpp.LLAMA_POOLING_TYPE_NONE,
+            n_gpu_layers=-1,
+            n_ctx=512,
+            n_batch=512,
+            verbose=False,
+        )
+        _tokenize_model_path = model_path
+    return _tokenize_llm
+
+
+def estimate_rerank_prompt_tokens(
+    query: str,
+    documents: list[str],
+    *,
+    instruction: str | None = None,
+    model_path: Path | None = None,
+) -> int:
+    path = model_path or expected_jina_reranker_path()
+    verify_gguf_file(path, JINA_RERANKER_MIN_BYTES)
+    llm = _get_rerank_tokenize_llm(path)
+    prompt = _format_rerank_prompt(query, documents, instruction=instruction)
+    return len(llm.tokenize(prompt.encode("utf-8")))
 
 
 def _load_reranker_projector(projector_path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -374,51 +432,39 @@ def _format_rerank_prompt(
     return prefix + prompt + suffix
 
 
-def _rerank_hidden_states(
+def _marker_token_ends(
+    llm: Llama,
     prompt: str,
-    model_path: Path,
-    llama_embedding: str,
-) -> np.ndarray:
-    with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", delete=False, suffix=".txt"
-    ) as handle:
-        handle.write(prompt)
-        prompt_file = handle.name
+    marker: str,
+    *,
+    last: bool = False,
+) -> list[int]:
+    positions: list[int] = []
+    start = 0
+    while True:
+        idx = prompt.find(marker, start)
+        if idx < 0:
+            break
+        end = idx + len(marker)
+        positions.append(len(llm.tokenize(prompt[:end].encode("utf-8"))) - 1)
+        if last:
+            break
+        start = end
+    if last and positions:
+        return [positions[-1]]
+    return positions
 
-    try:
-        result = subprocess.run(
-            [
-                llama_embedding,
-                "-m",
-                str(model_path),
-                "-f",
-                prompt_file,
-                "--pooling",
-                "none",
-                "--embd-separator",
-                "<#JINA_SEP#>",
-                "--embd-normalize",
-                "-1",
-                "--embd-output-format",
-                "json",
-                "--ubatch-size",
-                "512",
-                "--ctx-size",
-                "8192",
-                "--flash-attn",
-                "-ngl",
-                "99",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True,
-        )
-        payload: dict[str, Any] = json.loads(result.stdout)
-        embeddings = [item["embedding"] for item in payload["data"]]
-        return np.asarray(embeddings, dtype=np.float32)
-    finally:
-        Path(prompt_file).unlink(missing_ok=True)
+
+def _rerank_hidden_states(prompt: str, embed_llm: Llama) -> np.ndarray:
+    raw = embed_llm.embed(prompt)
+    rows: list[np.ndarray] = []
+    for item in raw:
+        vec = item
+        if isinstance(vec, list) and vec and isinstance(vec[0], (list, np.ndarray)):
+            vec = vec[0]
+        arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+        rows.append(arr)
+    return np.asarray(rows, dtype=np.float32)
 
 
 def _cosine_scores(doc_embeds: np.ndarray, query_embeds: np.ndarray) -> np.ndarray:
@@ -429,7 +475,11 @@ def _cosine_scores(doc_embeds: np.ndarray, query_embeds: np.ndarray) -> np.ndarr
     return dot / (doc_norm * query_norm)
 
 
-def load_jina_reranker() -> JinaReranker:
+def load_jina_reranker(
+    *,
+    n_ctx: int | None = None,
+    n_batch: int | None = None,
+) -> JinaReranker:
     model_path = expected_jina_reranker_path()
     projector_path = expected_jina_reranker_projector_path()
     try:
@@ -439,7 +489,12 @@ def load_jina_reranker() -> JinaReranker:
         print(f"Jina reranker assets not available: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    return JinaReranker(model_path=model_path, projector_path=projector_path)
+    return JinaReranker(
+        model_path=model_path,
+        projector_path=projector_path,
+        n_ctx=n_ctx,
+        n_batch=n_batch,
+    )
 
 
 def rerank_documents(

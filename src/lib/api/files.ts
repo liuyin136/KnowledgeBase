@@ -1,10 +1,15 @@
 export type Category = "RND" | "Daily" | "case";
+export type IndexStatus = "pending" | "indexed" | "error" | "not_indexed";
 
 export interface FileListItem {
   path: string;
   name: string;
   category: Category;
   modified_at: number;
+  index_status?: IndexStatus;
+  indexed_at?: string | null;
+  last_ingest_job_id?: string | null;
+  chunk_count?: number;
 }
 
 export interface FileListResponse {
@@ -16,6 +21,7 @@ export interface FileContentResponse {
   path: string;
   content: string;
   size: number;
+  ingest_job_id?: string | null;
 }
 
 export interface CreateLogRequest {
@@ -38,6 +44,8 @@ export interface CreateLogRequest {
 export interface CreateLogResponse {
   path: string;
   content: string;
+  job_id?: string | null;
+  ingest_job_id?: string | null;
 }
 
 const API_BASE = "/api/v1/files";
@@ -88,6 +96,13 @@ export async function createLog(body: CreateLogRequest): Promise<CreateLogRespon
     body: JSON.stringify(body),
   });
   return handleResponse<CreateLogResponse>(res);
+}
+
+export async function reindexFile(path: string): Promise<{ ingest_job_id: string; span_id: string }> {
+  const res = await fetch(`${API_BASE}/${encodeURIComponent(path)}/reindex`, {
+    method: "POST",
+  });
+  return handleResponse(res);
 }
 
 export const CATEGORY_LABELS: Record<Category, string> = {

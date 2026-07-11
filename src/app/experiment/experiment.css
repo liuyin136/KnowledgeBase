@@ -1,16 +1,7 @@
 @import url("https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700&family=Share+Tech+Mono&display=swap");
+@import "../../styles/cyberpunk-tokens.css";
 
 .experiment-root {
-  --cp-bg: #0a0a12;
-  --cp-surface: #12121f;
-  --cp-border: #1e1e35;
-  --cp-cyan: #00f0ff;
-  --cp-magenta: #ff00aa;
-  --cp-text: #c8f0ff;
-  --cp-muted: #6a8a99;
-  --cp-glow-cyan: 0 0 12px rgba(0, 240, 255, 0.35);
-  --cp-glow-magenta: 0 0 12px rgba(255, 0, 170, 0.35);
-
   min-height: 100vh;
   background-color: var(--cp-bg);
   background-image:

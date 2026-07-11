@@ -12,9 +12,8 @@ node_modules
 
 # testing
 /coverage
-/data
-/data
-/Download
+data
+Download
 
 # next.js
 /.next/
