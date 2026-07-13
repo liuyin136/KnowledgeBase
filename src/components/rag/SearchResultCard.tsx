@@ -11,12 +11,10 @@ export function SearchResultCard({
   hit,
   rank,
   onChanged,
-  showRerankScore = true,
 }: {
   hit: SearchHit;
   rank: number;
   onChanged?: () => void;
-  showRerankScore?: boolean;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -83,16 +81,15 @@ export function SearchResultCard({
         </details>
       )}
       <div>
-        display {hit.display_score.toFixed(3)}
-        {showRerankScore && hit.rerank_score != null && (
-          <> · rerank {hit.rerank_score.toFixed(3)}</>
-        )}
-        {!showRerankScore && <span className="rag-muted"> · fusion only</span>}
+        vector {(hit.vector_score ?? hit.display_score).toFixed(3)}
+        <span className="rag-muted"> · final {hit.final_score.toFixed(3)}</span>
       </div>
       <div className="rag-score-bar" aria-hidden="true">
         <div
           className="rag-score-fill"
-          style={{ width: `${Math.min(100, hit.display_score * 100)}%` }}
+          style={{
+            width: `${Math.min(100, Math.max(0, (hit.vector_score ?? hit.display_score) * 100))}%`,
+          }}
         />
       </div>
       {hit.file_id && (

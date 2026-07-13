@@ -55,12 +55,14 @@ class SearchHit(BaseModel):
     content_preview: str
     final_score: float
     display_score: float
+    vector_score: float = 0.0
     rerank_score: float | None = None
     file_id: str | None = None
     index_status: str | None = None
     relative_path: str | None = None
     parent_id: str | None = None
     child_id: str | None = None
+    family_id: str | None = None
     parent_content: str | None = None
     header_path: str | None = None
 
@@ -82,16 +84,23 @@ class FusionMeta(BaseModel):
     created_before: str | None = None
     indexed_only: bool | None = None
     allowlist_size: int | None = None
+    rerank_over_limit: bool | None = None
 
 
 WorkflowPhaseName = Literal[
     "vault_scope",
     "query_embed",
+    "family_recall",
+    "parent_recall",
+    "child_recall",
+    "grandchild_recall",
+    "hierarchical_fusion",
+    "rerank",
+    # Legacy phases kept for cached/old jobs
     "coarse_ann",
     "bm25_recall",
     "rescore_1024",
     "hybrid_fusion",
-    "rerank",
 ]
 
 
@@ -124,10 +133,15 @@ class SearchProgress(BaseModel):
 
 
 IngestPhaseName = Literal[
-    "ast_split",
+    "front_matter",
+    "family_split",
+    "parent_split",
     "child_split",
     "grandchild_split",
-    "embed_children",
+    "embed_family",
+    "embed_parent",
+    "embed_child",
+    "embed_grandchild",
     "neo4j_upsert",
 ]
 
@@ -139,6 +153,7 @@ class IngestPhase(BaseModel):
     parent_count: int | None = None
     child_count: int | None = None
     grandchild_count: int | None = None
+    family_count: int | None = None
     embedded_count: int | None = None
 
 

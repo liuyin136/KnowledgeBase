@@ -13,7 +13,9 @@ export function VaultFileList({
   selected,
   onToggle,
   onToggleAll,
-  onReindex,
+  onIngest,
+  onClearIndex,
+  globalMigrating = false,
   page,
   pageSize,
   total,
@@ -25,7 +27,9 @@ export function VaultFileList({
   selected: Set<string>;
   onToggle: (id: string) => void;
   onToggleAll: () => void;
-  onReindex: (id: string) => void;
+  onIngest: (id: string) => void;
+  onClearIndex: (id: string) => void;
+  globalMigrating?: boolean;
   page: number;
   pageSize: number;
   total: number;
@@ -70,7 +74,9 @@ export function VaultFileList({
         </thead>
         <tbody>
           {files.map((f) => {
-            const locked = f.ingest_locked || f.index_status === "pending";
+            const locked = f.ingest_locked || f.index_status === "pending" || globalMigrating;
+            const canClear =
+              !locked && (f.index_status === "indexed" || f.index_status === "error");
             const pathHref = encodePathSegments(f.relative_path);
             return (
               <tr key={f.id} style={{ borderTop: "1px solid var(--cp-border)" }}>
@@ -107,10 +113,19 @@ export function VaultFileList({
                     type="button"
                     className="cp-link"
                     disabled={locked}
-                    onClick={() => onReindex(f.id)}
+                    onClick={() => onIngest(f.id)}
                   >
-                    Reindex
+                    Ingest
                   </button>
+                  {canClear ? (
+                    <button
+                      type="button"
+                      className="cp-link"
+                      onClick={() => onClearIndex(f.id)}
+                    >
+                      Clear index
+                    </button>
+                  ) : null}
                 </td>
               </tr>
             );

@@ -2,21 +2,27 @@ import type { FusionMeta, WorkflowPhase, WorkflowPhaseName } from "@/lib/api/sea
 
 const BASE_PHASE_ORDER: WorkflowPhaseName[] = [
   "query_embed",
-  "coarse_ann",
-  "bm25_recall",
-  "rescore_1024",
-  "hybrid_fusion",
+  "family_recall",
+  "parent_recall",
+  "child_recall",
+  "grandchild_recall",
+  "hierarchical_fusion",
   "rerank",
 ];
 
 const PHASE_LABELS: Record<WorkflowPhaseName, string> = {
   vault_scope: "Vault scope",
   query_embed: "Query embed",
+  family_recall: "W1 Family recall",
+  parent_recall: "W2 Parent recall",
+  child_recall: "W3 Child recall",
+  grandchild_recall: "W4 Grandchild recall",
+  hierarchical_fusion: "Hierarchical fusion",
+  rerank: "W5 Rerank",
   coarse_ann: "Coarse ANN recall",
   bm25_recall: "BM25 recall",
   rescore_1024: "1024d rescore",
   hybrid_fusion: "Hybrid fusion",
-  rerank: "Rerank",
 };
 
 function phaseOrder(
@@ -39,7 +45,7 @@ function phaseMetrics(phase: WorkflowPhase): string {
   if (phase.coarse_dim != null) parts.push(`${phase.coarse_dim}d`);
   if (phase.rescore_dim != null) parts.push(`${phase.rescore_dim}d`);
   if (phase.w1 != null && phase.w2 != null) parts.push(`w1=${phase.w1} w2=${phase.w2}`);
-  if (phase.rerank_k != null && phase.phase !== "hybrid_fusion") parts.push(`top ${phase.rerank_k}`);
+  if (phase.rerank_k != null && phase.phase !== "hierarchical_fusion") parts.push(`top ${phase.rerank_k}`);
   if (phase.vram_peak_mb != null) parts.push(`VRAM ${phase.vram_peak_mb} MB`);
   parts.push(`${phase.latency_ms} ms`);
   return parts.join(" · ");
@@ -175,6 +181,7 @@ export function SearchWorkflowLog({
           {fusionMeta.allowlist_size != null && (
             <> · Allowlist {fusionMeta.allowlist_size} paths</>
           )}
+          {fusionMeta.rerank_over_limit && <> · Rerank over 8192-token gate</>}
         </footer>
       )}
     </section>

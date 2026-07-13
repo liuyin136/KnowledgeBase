@@ -32,3 +32,16 @@ docker exec -it raglab-api-worker bash
 
 redis:
 docker exec -it raglab-redis redis-cli
+
+# 1. 確認 api-worker 在跑（負責 ingest）
+docker compose ps api-worker
+docker compose up -d api-worker
+
+# 2. 預覽（不會改任何資料）
+docker compose run --rm api-worker python scripts/vault_reset_and_reindex.py --dry-run
+
+# 3. 執行重置 + 重新 ingest（只清 library / vault 相關 Neo4j）
+docker compose run --rm api-worker python scripts/vault_reset_and_reindex.py
+
+計劃註明：若日後加入 Memory，需重用同一 is_blocked_source guard 
+

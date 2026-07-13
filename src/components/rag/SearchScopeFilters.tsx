@@ -87,14 +87,9 @@ export function SearchScopeFilters({
         </label>
       </div>
 
-      <label className="rag-scope-indexed">
-        <input
-          type="checkbox"
-          checked={value.indexedOnly}
-          onChange={(e) => onChange({ ...value, indexedOnly: e.target.checked })}
-        />
-        Indexed files only
-      </label>
+      <p className="rag-muted rag-scope-indexed-note">
+        Search includes indexed files only.
+      </p>
     </div>
   );
 }

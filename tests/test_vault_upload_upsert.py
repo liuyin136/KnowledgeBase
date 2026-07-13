@@ -31,9 +31,9 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     return TestClient(app)
 
 
-def test_upload_same_name_replaces_and_reingests(client: TestClient) -> None:
+def test_upload_same_name_replaces_without_ingest(client: TestClient) -> None:
     folder = client.post("/api/v1/rag/vault/folders", json={"name": "Docs"}).json()
-    with patch("app.routers.vault.enqueue_vault_ingest", return_value="job-1") as mock_ingest:
+    with patch("app.routers.vault.enqueue_vault_ingest") as mock_ingest:
         first = client.post(
             "/api/v1/rag/vault/files",
             json={"folder_id": folder["id"], "filename": "a.md", "content": "v1"},
@@ -50,8 +50,9 @@ def test_upload_same_name_replaces_and_reingests(client: TestClient) -> None:
         body = second.json()
         assert body["replaced"] is True
         assert body["file"]["id"] == file_id
+        assert body["ingest_job_id"] is None
 
-    assert mock_ingest.call_count == 2
+    mock_ingest.assert_not_called()
     content = client.get(f"/api/v1/rag/vault/files/{file_id}/content")
     assert content.json()["content"] == "v2"
 
@@ -60,11 +61,10 @@ def test_upload_after_soft_delete_resurrects(client: TestClient) -> None:
     from app.core.config import get_settings
 
     folder = client.post("/api/v1/rag/vault/folders", json={"name": "News"}).json()
-    with patch("app.routers.vault.enqueue_vault_ingest", return_value="job-1"):
-        first = client.post(
-            "/api/v1/rag/vault/files",
-            json={"folder_id": folder["id"], "filename": "revive.md", "content": "old"},
-        )
+    first = client.post(
+        "/api/v1/rag/vault/files",
+        json={"folder_id": folder["id"], "filename": "revive.md", "content": "old"},
+    )
     assert first.status_code == 201
     file_id = first.json()["file"]["id"]
 
@@ -82,15 +82,14 @@ def test_upload_after_soft_delete_resurrects(client: TestClient) -> None:
     assert row is not None
     assert row["index_status"] == "deleted"
 
-    with patch("app.routers.vault.enqueue_vault_ingest", return_value="job-r"):
-        res = client.post(
-            "/api/v1/rag/vault/files",
-            json={
-                "folder_id": folder["id"],
-                "filename": "revive.md",
-                "content": "new body",
-            },
-        )
+    res = client.post(
+        "/api/v1/rag/vault/files",
+        json={
+            "folder_id": folder["id"],
+            "filename": "revive.md",
+            "content": "new body",
+        },
+    )
     assert res.status_code == 201
     body = res.json()
     assert body["replaced"] is True
@@ -100,11 +99,10 @@ def test_upload_after_soft_delete_resurrects(client: TestClient) -> None:
 
 def test_upload_locked_file_409(client: TestClient) -> None:
     folder = client.post("/api/v1/rag/vault/folders", json={"name": "Lock"}).json()
-    with patch("app.routers.vault.enqueue_vault_ingest", return_value="job-1"):
-        first = client.post(
-            "/api/v1/rag/vault/files",
-            json={"folder_id": folder["id"], "filename": "x.md", "content": "a"},
-        )
+    first = client.post(
+        "/api/v1/rag/vault/files",
+        json={"folder_id": folder["id"], "filename": "x.md", "content": "a"},
+    )
     file_id = first.json()["file"]["id"]
     vault_db.update_file_fields(file_id, ingest_lock_job_id="busy-job")
 
@@ -117,54 +115,52 @@ def test_upload_locked_file_409(client: TestClient) -> None:
 
 def test_on_conflict_fail_returns_409(client: TestClient) -> None:
     folder = client.post("/api/v1/rag/vault/folders", json={"name": "Fail"}).json()
-    with patch("app.routers.vault.enqueue_vault_ingest", return_value="job-1"):
-        client.post(
-            "/api/v1/rag/vault/files",
-            json={"folder_id": folder["id"], "filename": "dup.md", "content": "1"},
-        )
-        res = client.post(
-            "/api/v1/rag/vault/files?on_conflict=fail",
-            json={"folder_id": folder["id"], "filename": "dup.md", "content": "2"},
-        )
+    client.post(
+        "/api/v1/rag/vault/files",
+        json={"folder_id": folder["id"], "filename": "dup.md", "content": "1"},
+    )
+    res = client.post(
+        "/api/v1/rag/vault/files?on_conflict=fail",
+        json={"folder_id": folder["id"], "filename": "dup.md", "content": "2"},
+    )
     assert res.status_code == 409
 
 
 def test_batch_upload_reports_replaced_and_failed(client: TestClient) -> None:
     folder = client.post("/api/v1/rag/vault/folders", json={"name": "Batch"}).json()
-    with patch("app.routers.vault.enqueue_vault_ingest", return_value="job-b"):
-        client.post(
-            "/api/v1/rag/vault/files",
-            json={"folder_id": folder["id"], "filename": "exist.md", "content": "old"},
-        )
+    client.post(
+        "/api/v1/rag/vault/files",
+        json={"folder_id": folder["id"], "filename": "exist.md", "content": "old"},
+    )
 
     files = [
         ("files", ("exist.md", b"new", "text/markdown")),
         ("files", ("fresh.md", b"hello", "text/markdown")),
     ]
-    with patch("app.routers.vault.enqueue_vault_ingest", return_value="job-b"):
-        res = client.post(
-            "/api/v1/rag/vault/files/batch-upload",
-            data={"folder_id": folder["id"]},
-            files=files,
-        )
+    res = client.post(
+        "/api/v1/rag/vault/files/batch-upload",
+        data={"folder_id": folder["id"]},
+        files=files,
+    )
     assert res.status_code == 201
     results = {f["filename"]: f for f in res.json()["files"]}
     assert results["exist.md"]["status"] == "replaced"
-    assert results["fresh.md"]["status"] == "created"
+    assert results["exist.md"]["job_id"] is None
+    assert results["fresh.md"]["status"] == "uploaded"
+    assert results["fresh.md"]["job_id"] is None
 
 
 def test_list_files_includes_content_preview(client: TestClient) -> None:
     folder = client.post("/api/v1/rag/vault/folders", json={"name": "Prev"}).json()
     long_text = "# Title\n\n" + ("word " * 80)
-    with patch("app.routers.vault.enqueue_vault_ingest", return_value="job-p"):
-        client.post(
-            "/api/v1/rag/vault/files",
-            json={
-                "folder_id": folder["id"],
-                "filename": "long.md",
-                "content": long_text,
-            },
-        )
+    client.post(
+        "/api/v1/rag/vault/files",
+        json={
+            "folder_id": folder["id"],
+            "filename": "long.md",
+            "content": long_text,
+        },
+    )
     listed = client.get("/api/v1/rag/vault/files")
     assert listed.status_code == 200
     file_row = listed.json()["files"][0]

@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.middleware.otel import setup_otel, shutdown_otel
-from app.routers import files, jobs, knowledge, search, vault
+from app.routers import files, graph, jobs, knowledge, memory, search, vault
 from app.services import file_store
 from app.services.vault_db import init_vault_db
 
@@ -38,6 +38,8 @@ app.include_router(jobs.router)
 app.include_router(knowledge.router)
 app.include_router(search.router)
 app.include_router(vault.router)
+app.include_router(memory.router)
+app.include_router(graph.router)
 
 
 @app.get("/health")

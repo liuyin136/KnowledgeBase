@@ -1,0 +1,4 @@
+﻿{
+  "next_adr": 6,
+  "note": "ADR-005: GLiNER2 + Qwen3-8B 4-bit extraction stack. INC-005 covers snapshot_download + gliner2 --no-deps pydantic failure."
+}

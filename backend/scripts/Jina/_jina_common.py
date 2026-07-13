@@ -1,67 +1,35 @@
-"""Shared helpers for Jina v5 omni GGUF smoke-test scripts."""
+"""Shared helpers for Jina retrieval embed + reranker (worker runtime)."""
 from __future__ import annotations
 
-import atexit
-import base64
-import io
-import json
 import os
-import subprocess
 import sys
-import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
-import httpx
 import llama_cpp
 import numpy as np
 from llama_cpp import Llama
-from pdf2image import convert_from_path
-from PIL import Image
 from safetensors import safe_open
 
 from download_models2 import (
     JINA_RERANKER_MIN_BYTES,
     JINA_RERANKER_PROJECTOR_MIN_BYTES,
+    JINA_RETRIEVAL_TASK,
     JINA_TEXT_MIN_BYTES,
-    JINA_VISION_MIN_BYTES,
     expected_jina_gguf_path,
     expected_jina_reranker_path,
     expected_jina_reranker_projector_path,
     verify_gguf_file,
 )
 
-DATA_ROOT = Path("/data")
-PIC_DIR = DATA_ROOT / "pic"
-PDF_DIR = DATA_ROOT / "pdf"
-
-_LLAMA_SERVER = "llama-server"
 _LLAMA_EMBEDDING = "/usr/local/bin/llama-embedding"
-_SERVER_HOST = "127.0.0.1"
-_SERVER_BASE_PORT = 18080
 _RERANK_DOC_EMBED_TOKEN = "<|embed_token|>"
 _RERANK_QUERY_EMBED_TOKEN = "<|rerank_token|>"
-_RERANK_DOC_EMBED_TOKEN_ID = 151670
-_RERANK_QUERY_EMBED_TOKEN_ID = 151671
 _CHAT_IM_END = "<|" + "im_end" + "|>"
-_active_servers: dict[str, subprocess.Popen[bytes]] = {}
-_server_markers: dict[str, str] = {}
 _RERANK_N_CTX = int(os.environ.get("RERANK_N_CTX", "32768"))
 _RERANK_N_BATCH = int(os.environ.get("RERANK_N_BATCH", "32768"))
 _tokenize_llm: Llama | None = None
 _tokenize_model_path: Path | None = None
-
-
-def require_assets(paths: list[Path]) -> None:
-    missing = [p for p in paths if not p.is_file()]
-    if missing:
-        print("Missing fixture files:", file=sys.stderr)
-        for p in missing:
-            print(f"  - {p}", file=sys.stderr)
-        sys.exit(1)
-
 
 def to_float32_numpy(vec) -> np.ndarray:
     """F16/BF16 GGUF outputs are not numpy-safe; always cast via float32."""
@@ -78,7 +46,9 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))
 
 
-def load_jina_text(task: str) -> Llama:
+def load_jina_text(task: str = JINA_RETRIEVAL_TASK) -> Llama:
+    if task != JINA_RETRIEVAL_TASK:
+        raise ValueError(f"only {JINA_RETRIEVAL_TASK!r} jina task is supported, got {task!r}")
     path = expected_jina_gguf_path(task, "text")
     try:
         verify_gguf_file(path, JINA_TEXT_MIN_BYTES)
@@ -102,145 +72,6 @@ def embed_text(llm: Llama, text: str) -> np.ndarray:
     if isinstance(out, list) and out and isinstance(out[0], (list, np.ndarray)):
         out = out[0]
     return to_float32_numpy(out)
-
-
-def _task_port(task: str) -> int:
-    return _SERVER_BASE_PORT + abs(hash(task)) % 1000
-
-
-def _stop_server(task: str) -> None:
-    proc = _active_servers.pop(task, None)
-    _server_markers.pop(task, None)
-    if proc is None:
-        return
-    proc.terminate()
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-
-
-def _image_to_png_b64(image_path: Path) -> str:
-    """Decode via PIL and re-encode as PNG — JPEG bytes fail mtmd decode on this fork."""
-    with Image.open(image_path) as img:
-        rgb = img.convert("RGB")
-        buf = io.BytesIO()
-        rgb.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("ascii")
-
-
-def _ensure_server(task: str) -> tuple[str, str]:
-    """Return (base_url, media_marker) for a healthy llama-server."""
-    if (
-        task in _active_servers
-        and _active_servers[task].poll() is None
-        and task in _server_markers
-    ):
-        return f"http://{_SERVER_HOST}:{_task_port(task)}", _server_markers[task]
-
-    text_path = expected_jina_gguf_path(task, "text")
-    vision_path = expected_jina_gguf_path(task, "vision")
-    try:
-        verify_gguf_file(text_path, JINA_TEXT_MIN_BYTES)
-        verify_gguf_file(vision_path, JINA_VISION_MIN_BYTES)
-    except (FileNotFoundError, ValueError) as exc:
-        print(f"Jina GGUF not available for server: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    port = _task_port(task)
-    base_url = f"http://{_SERVER_HOST}:{port}"
-    cmd = [
-        _LLAMA_SERVER,
-        "-m",
-        str(text_path),
-        "--mmproj",
-        str(vision_path),
-        "--embedding",
-        "--pooling",
-        "last",
-        "--host",
-        _SERVER_HOST,
-        "--port",
-        str(port),
-        "-ngl",
-        "99",
-        "-c",
-        "8192",
-    ]
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
-    _active_servers[task] = proc
-    atexit.register(_stop_server, task)
-
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            err = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
-            print(f"llama-server exited early for task={task}:\n{err}", file=sys.stderr)
-            sys.exit(1)
-        try:
-            r = httpx.get(f"{base_url}/health", timeout=2.0)
-            if r.status_code == 200:
-                props = httpx.get(f"{base_url}/props", timeout=5.0)
-                props.raise_for_status()
-                marker = props.json().get("media_marker")
-                if not marker:
-                    print(
-                        f"llama-server /props missing media_marker for task={task}",
-                        file=sys.stderr,
-                    )
-                    sys.exit(1)
-                _server_markers[task] = marker
-                return base_url, marker
-        except httpx.HTTPError:
-            pass
-        time.sleep(1.0)
-
-    _stop_server(task)
-    print(f"llama-server failed to become healthy for task={task}", file=sys.stderr)
-    sys.exit(1)
-
-
-def _embed_via_server(task: str, multimodal_b64: list[str]) -> np.ndarray:
-    base_url, marker = _ensure_server(task)
-    payload = {
-        "content": [
-            {
-                "prompt_string": marker,
-                "multimodal_data": multimodal_b64,
-            }
-        ]
-    }
-    with httpx.Client(timeout=180.0) as client:
-        resp = client.post(f"{base_url}/embeddings", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-
-    if isinstance(data, list):
-        emb = data[0]["embedding"]
-    elif isinstance(data, dict) and "data" in data:
-        emb = data["data"][0]["embedding"]
-    else:
-        emb = data[0]["embedding"]
-    return to_float32_numpy(emb)
-
-
-def embed_image(task: str, image_path: Path) -> np.ndarray:
-    return _embed_via_server(task, [_image_to_png_b64(image_path)])
-
-
-def embed_pdf_page(task: str, pdf_path: Path) -> np.ndarray:
-    pages = convert_from_path(str(pdf_path), first_page=1, last_page=1)
-    tmp = pdf_path.with_suffix(".page1.png")
-    try:
-        pages[0].save(tmp, format="PNG")
-        return embed_image(task, tmp)
-    finally:
-        if tmp.is_file():
-            tmp.unlink()
 
 
 @dataclass(frozen=True)

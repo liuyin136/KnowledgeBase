@@ -13,6 +13,7 @@ INGEST_TASK = "app.workers.tasks.ingest_document"
 INDEX_LOG_TASK = "app.workers.tasks.index_log_file"
 HYBRID_SEARCH_FUSION_TASK = "app.workers.tasks.hybrid_search_fusion"
 HYBRID_SEARCH_RERANK_TASK = "app.workers.tasks.hybrid_search_rerank"
+EXTRACT_MEMORY_GRAPH_TASK = "app.workers.tasks.extract_memory_graph"
 # Backward-compatible alias for tests/scripts that still reference hybrid_search
 HYBRID_SEARCH_TASK = HYBRID_SEARCH_FUSION_TASK
 
@@ -46,7 +47,7 @@ def enqueue_ingest_document(relative_path: str, *, traceparent: str = "") -> str
     )
     from app.services import ingest_progress
 
-    ingest_progress.init_progress(job.id, active_phase="ast_split", relative_path=relative_path)
+    ingest_progress.init_progress(job.id, active_phase="front_matter", relative_path=relative_path)
     set_pending(relative_path, job.id)
     return job.id
 
@@ -70,7 +71,7 @@ def enqueue_vault_ingest(file_id: str, *, traceparent: str = "") -> str:
     )
     from app.services import ingest_progress
 
-    ingest_progress.init_progress(job.id, active_phase="ast_split", relative_path=relative_path)
+    ingest_progress.init_progress(job.id, active_phase="front_matter", relative_path=relative_path)
     vault_db.set_file_pending(relative_path, job.id)
     set_pending(relative_path, job.id)
     return job.id
@@ -166,5 +167,30 @@ def enqueue_hybrid_rerank(parent_job_id: str, *, traceparent: str = "") -> str:
         active_phase="rerank",
         span_id=span_id,
         workflow_log=workflow_log,
+    )
+    return job.id
+
+
+def enqueue_extract_memory_graph(
+    *,
+    query_text: str,
+    grandchild_ids: list[str],
+    user_query_id: str | None = None,
+    session_id: str | None = None,
+    traceparent: str = "",
+    span_id: str = "",
+) -> str:
+    if not grandchild_ids:
+        raise ValueError("grandchild_ids required")
+    job = get_queue().enqueue(
+        EXTRACT_MEMORY_GRAPH_TASK,
+        query_text,
+        grandchild_ids,
+        user_query_id,
+        session_id,
+        traceparent,
+        span_id,
+        meta={"traceparent": traceparent, "task": "extract_memory_graph", "span_id": span_id},
+        job_timeout=900,
     )
     return job.id

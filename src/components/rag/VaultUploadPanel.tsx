@@ -1,14 +1,14 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { batchUploadVaultFiles, getBatchStatus } from "@/lib/api/vault";
+import { batchUploadVaultFiles } from "@/lib/api/vault";
 
 function summarizeBatch(files: { status: string }[]): string {
-  const created = files.filter((f) => f.status === "created").length;
+  const uploaded = files.filter((f) => f.status === "uploaded" || f.status === "created").length;
   const replaced = files.filter((f) => f.status === "replaced").length;
   const failed = files.filter((f) => f.status === "failed").length;
   const parts: string[] = [];
-  if (created) parts.push(`${created} created`);
+  if (uploaded) parts.push(`${uploaded} uploaded`);
   if (replaced) parts.push(`${replaced} replaced`);
   if (failed) parts.push(`${failed} failed`);
   return parts.join(", ") || "done";
@@ -24,7 +24,7 @@ export function VaultUploadPanel({
   const inputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [progress, setProgress] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
   const [outcomes, setOutcomes] = useState<
     { filename: string; status: string; error_message?: string | null }[]
   >([]);
@@ -38,7 +38,7 @@ export function VaultUploadPanel({
     if (!fileList?.length) return;
     setBusy(true);
     setError(null);
-    setProgress(null);
+    setToast(null);
     setOutcomes([]);
     try {
       const files = Array.from(fileList);
@@ -50,16 +50,12 @@ export function VaultUploadPanel({
           error_message: f.error_message,
         }))
       );
-      setProgress(`Batch ${batch.batch_id.slice(0, 8)}… — ${summarizeBatch(batch.files)}`);
-      for (let i = 0; i < 60; i++) {
-        const status = await getBatchStatus(batch.batch_id);
-        const done = status.completed_files + status.failed_files;
-        setProgress(
-          `Indexing ${done}/${status.total_files} (ok ${status.completed_files}, fail ${status.failed_files}) · ${summarizeBatch(batch.files)}`
-        );
-        if (done >= status.total_files) break;
-        await new Promise((r) => setTimeout(r, 2000));
-      }
+      const ok = batch.files.filter((f) => f.status !== "failed").length;
+      setToast(
+        ok
+          ? `${ok} file(s) uploaded (not indexed). Use Ingest selected in the library to index.`
+          : "Upload failed for all files."
+      );
       onDone();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Upload failed");
@@ -75,6 +71,7 @@ export function VaultUploadPanel({
     }
     setBusy(true);
     setError(null);
+    setToast(null);
     setOutcomes([]);
     try {
       const { createVaultFile } = await import("@/lib/api/vault");
@@ -85,6 +82,7 @@ export function VaultUploadPanel({
           status: res.replaced ? "replaced" : "created",
         },
       ]);
+      setToast("File created (not indexed). Use Ingest in the library to index.");
       onDone();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Create failed");
@@ -148,7 +146,7 @@ export function VaultUploadPanel({
           ))}
         </ul>
       )}
-      {progress && <div className="rag-toast">{progress}</div>}
+      {toast && <div className="rag-toast">{toast}</div>}
       {error && <div className="rag-error">{error}</div>}
     </div>
   );

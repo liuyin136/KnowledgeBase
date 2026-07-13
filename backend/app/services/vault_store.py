@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from app.core.config import get_settings
+from app.core.logging import get_logger
 from app.models.vault_schemas import (
     FolderRenamePreview,
     FolderRenamePreviewFile,
@@ -19,6 +20,8 @@ from app.models.vault_schemas import (
     VaultFolder,
 )
 from app.services import vault_db
+
+logger = get_logger("rag.vault.store")
 
 MUTABLE_EXTENSIONS = {".md", ".txt"}
 ALLOWED_EXTENSIONS = {".md", ".txt"}
@@ -30,6 +33,12 @@ PREVIEW_MAX_CHARS = 240
 class WriteFileResult:
     file: VaultFile
     replaced: bool
+
+
+@dataclass(frozen=True)
+class SaveFileResult:
+    file: VaultFile
+    auto_ingest: bool = False
 
 
 class VaultStoreError(Exception):
@@ -180,11 +189,17 @@ def preview_folder_rename(folder_id: str, name: str) -> FolderRenamePreview:
 
 def create_folder(name: str) -> VaultFolder:
     slug = slugify(name)
-    if vault_db.get_folder_by_slug(slug):
-        raise VaultStoreError(f"Folder slug already exists: {slug}", 409)
+    existing = vault_db.get_folder_by_slug(slug)
     relative_path = f"{slug}/"
     disk_path = resolve_vault_path(slug)
-    disk_path.mkdir(parents=True, exist_ok=False)
+    if existing:
+        raise VaultStoreError(f"Folder slug already exists: {slug}", 409)
+    if disk_path.exists() and not disk_path.is_dir():
+        raise VaultStoreError(f"Vault path exists and is not a directory: {slug}", 409)
+    try:
+        disk_path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise VaultStoreError(f"Could not create folder directory: {slug}", 500) from exc
     row = vault_db.insert_folder(
         folder_id=str(uuid.uuid4()),
         name=name.strip(),
@@ -282,7 +297,7 @@ def replace_file_content(
     content: str,
     *,
     source: str | None = None,
-) -> VaultFile:
+) -> SaveFileResult:
     row = vault_db.get_file_by_id(file_id)
     if not row:
         raise VaultStoreError("File not found", 404)
@@ -299,18 +314,19 @@ def replace_file_content(
     if prev_status == "deleted":
         new_status = "not_indexed"
         chunk_count = 0
-    elif prev_status == "indexed":
-        try:
-            from app.services.neo4j_client import get_neo4j_client
-
-            get_neo4j_client().delete_knowledge_by_source(row["relative_path"])
-        except Exception:
-            pass
-        new_status = "modified"
+        auto_ingest = False
+    elif prev_status in ("indexed", "modified"):
+        new_status = "indexed"
         chunk_count = int(row.get("chunk_count") or 0)
+        auto_ingest = True
+    elif prev_status == "error":
+        new_status = "not_indexed"
+        chunk_count = 0
+        auto_ingest = False
     else:
         new_status = prev_status
         chunk_count = int(row.get("chunk_count") or 0)
+        auto_ingest = False
 
     fields: dict[str, Any] = {
         "size_bytes": len(data),
@@ -325,7 +341,7 @@ def replace_file_content(
         fields["source"] = source
 
     updated = vault_db.update_file_fields(file_id, **fields)
-    return row_to_vault_file(updated)  # type: ignore[arg-type]
+    return SaveFileResult(file=row_to_vault_file(updated), auto_ingest=auto_ingest)  # type: ignore[arg-type]
 
 
 def create_text_file(
@@ -352,8 +368,8 @@ def create_text_file(
     if existing:
         if on_conflict == "fail":
             raise VaultStoreError("File already exists", 409)
-        replaced = replace_file_content(existing["id"], content, source=source)
-        return WriteFileResult(file=replaced, replaced=True)
+        replaced_result = replace_file_content(existing["id"], content, source=source)
+        return WriteFileResult(file=replaced_result.file, replaced=True)
 
     path = resolve_vault_path(relative_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -429,7 +445,7 @@ def read_file_content(file_id: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def save_file_content(file_id: str, content: str) -> VaultFile:
+def save_file_content(file_id: str, content: str) -> SaveFileResult:
     row = vault_db.get_file_by_id(file_id)
     if not row or row["index_status"] == "deleted":
         raise VaultStoreError("File not found", 404)
@@ -438,7 +454,54 @@ def save_file_content(file_id: str, content: str) -> VaultFile:
     return replace_file_content(file_id, content)
 
 
-def delete_file(file_id: str, *, purge_neo4j: bool = True) -> None:
+def _purge_neo4j_ingestion(source_file: str) -> dict[str, int]:
+    from app.services.neo4j_client import get_neo4j_client
+
+    return get_neo4j_client().delete_ingestion_tree_for_source(source_file)
+
+
+def _file_content_matches(relative_path: str, keyword: str) -> bool:
+    try:
+        text = resolve_vault_path(relative_path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, VaultStoreError):
+        return False
+    return keyword.lower() in text.lower()
+
+
+def clear_file_index(file_id: str) -> VaultFile:
+    row = vault_db.get_file_by_id(file_id)
+    if not row or row["index_status"] == "deleted":
+        raise VaultStoreError("File not found", 404)
+    _require_unlocked(row)
+    if row["index_status"] == "not_indexed":
+        raise VaultStoreError("File is not indexed", 409)
+    if row["index_status"] not in ("indexed", "error", "modified"):
+        raise VaultStoreError(f"Cannot clear index for status: {row['index_status']}", 409)
+    try:
+        _purge_neo4j_ingestion(row["relative_path"])
+    except Exception as exc:
+        logger.warning(
+            "neo4j_purge_failed",
+            file_id=file_id,
+            relative_path=row["relative_path"],
+            error=str(exc),
+        )
+        raise VaultStoreError("Failed to clear Neo4j index", 500) from exc
+    updated = vault_db.update_file_status(
+        file_id,
+        index_status="not_indexed",
+        chunk_count=0,
+        ingest_lock_job_id=None,
+        error_message=None,
+    )
+    return row_to_vault_file(updated)  # type: ignore[arg-type]
+
+
+def _should_purge_neo4j_on_delete(index_status: str) -> bool:
+    return index_status in ("indexed", "error", "modified")
+
+
+def delete_file(file_id: str, *, purge_neo4j: bool | None = None) -> None:
     row = vault_db.get_file_by_id(file_id)
     if not row or row["index_status"] == "deleted":
         raise VaultStoreError("File not found", 404)
@@ -447,13 +510,17 @@ def delete_file(file_id: str, *, purge_neo4j: bool = True) -> None:
     path = resolve_vault_path(row["relative_path"])
     if path.is_file():
         path.unlink()
-    if purge_neo4j:
+    do_purge = purge_neo4j if purge_neo4j is not None else _should_purge_neo4j_on_delete(row["index_status"])
+    if do_purge:
         try:
-            from app.services.neo4j_client import get_neo4j_client
-
-            get_neo4j_client().delete_knowledge_by_source(row["relative_path"])
-        except Exception:
-            pass
+            _purge_neo4j_ingestion(row["relative_path"])
+        except Exception as exc:
+            logger.warning(
+                "neo4j_purge_failed",
+                file_id=file_id,
+                relative_path=row["relative_path"],
+                error=str(exc),
+            )
     vault_db.delete_file_row(file_id)
 
 
@@ -462,6 +529,7 @@ def list_files(
     folder_id: str | None = None,
     keyword: str | None = None,
     index_status: str | None = None,
+    search_content: bool = False,
     page: int = 1,
     page_size: int = 10,
 ) -> PaginatedFilesResponse:
@@ -469,8 +537,10 @@ def list_files(
         folder_id=folder_id,
         keyword=keyword,
         index_status=index_status,
+        search_content=search_content,
         page=page,
         page_size=page_size,
+        content_matcher=_file_content_matches if search_content and keyword else None,
     )
     files = [
         row_to_vault_file(

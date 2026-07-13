@@ -1,8 +1,13 @@
 export type IngestPhaseName =
-  | "ast_split"
+  | "front_matter"
+  | "family_split"
+  | "parent_split"
   | "child_split"
   | "grandchild_split"
-  | "embed_children"
+  | "embed_family"
+  | "embed_parent"
+  | "embed_child"
+  | "embed_grandchild"
   | "neo4j_upsert";
 
 export interface IngestPhase {
@@ -12,6 +17,7 @@ export interface IngestPhase {
   parent_count?: number | null;
   child_count?: number | null;
   grandchild_count?: number | null;
+  family_count?: number | null;
   embedded_count?: number | null;
 }
 

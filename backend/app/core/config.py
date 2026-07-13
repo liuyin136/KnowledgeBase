@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     rerank_n_ctx: int = 131072
     rerank_n_batch: int = 131072
     pending_rerank_ttl_sec: int = 1800
+    episodic_memory_ttl_sec: int = 1800
     ingest_progress_ttl_sec: int = 1800
     otel_exporter_otlp_endpoint: str = ""
     otel_service_name: str = "knowledgebase-api"
@@ -54,6 +55,7 @@ def get_settings() -> Settings:
         rerank_n_ctx=int(os.environ.get("RERANK_N_CTX", "131072")),
         rerank_n_batch=int(os.environ.get("RERANK_N_BATCH", "131072")),
         pending_rerank_ttl_sec=int(os.environ.get("PENDING_RERANK_TTL_SEC", "1800")),
+        episodic_memory_ttl_sec=int(os.environ.get("EPISODIC_MEMORY_TTL_SEC", "1800")),
         ingest_progress_ttl_sec=int(os.environ.get("INGEST_PROGRESS_TTL_SEC", "1800")),
         otel_exporter_otlp_endpoint=os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
         otel_service_name=os.environ.get("OTEL_SERVICE_NAME", "knowledgebase-api"),

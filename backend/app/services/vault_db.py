@@ -71,6 +71,13 @@ CREATE TABLE IF NOT EXISTS vault_batch_files (
     status TEXT NOT NULL DEFAULT 'pending',
     PRIMARY KEY (batch_id, file_id)
 );
+
+CREATE TABLE IF NOT EXISTS vault_doc_meta (
+    file_id TEXT PRIMARY KEY REFERENCES vault_files(id) ON DELETE CASCADE,
+    raw_yaml TEXT,
+    fields_json TEXT NOT NULL DEFAULT '{}',
+    parsed_at TEXT NOT NULL
+);
 """
 
 
@@ -277,20 +284,45 @@ def list_files_paginated(
     folder_id: str | None = None,
     keyword: str | None = None,
     index_status: str | None = None,
+    search_content: bool = False,
     page: int = 1,
     page_size: int = 10,
+    content_matcher: Any = None,
+    content_scan_limit: int = 200,
 ) -> tuple[list[dict[str, Any]], int]:
     clauses = ["index_status != 'deleted'"]
     params: list[Any] = []
     if folder_id:
         clauses.append("folder_id = ?")
         params.append(folder_id)
-    if keyword:
-        clauses.append("filename LIKE ?")
-        params.append(f"%{keyword}%")
     if index_status:
         clauses.append("index_status = ?")
         params.append(index_status)
+
+    if keyword and content_matcher is not None:
+        scan_clauses = list(clauses)
+        scan_params = list(params)
+        where_scan = " AND ".join(scan_clauses)
+        with get_connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM vault_files WHERE {where_scan} ORDER BY created_at DESC LIMIT ?",
+                [*scan_params, content_scan_limit],
+            ).fetchall()
+        kw = keyword.lower()
+        matched = [
+            dict(r)
+            for r in rows
+            if kw in r["filename"].lower()
+            or kw in r["relative_path"].lower()
+            or content_matcher(r["relative_path"], keyword)
+        ]
+        total = len(matched)
+        offset = max(page - 1, 0) * page_size
+        return matched[offset : offset + page_size], total
+
+    if keyword:
+        clauses.append("(filename LIKE ? OR relative_path LIKE ?)")
+        params.extend([f"%{keyword}%", f"%{keyword}%"])
     where = " AND ".join(clauses)
     with get_connection() as conn:
         total_row = conn.execute(
@@ -520,12 +552,62 @@ def wipe_vault_metadata() -> None:
     with get_connection() as conn:
         conn.execute("DELETE FROM vault_batch_files")
         conn.execute("DELETE FROM vault_batches")
+        conn.execute("DELETE FROM vault_doc_meta")
         conn.execute("DELETE FROM vault_files")
         conn.execute("DELETE FROM vault_folders")
         conn.execute(
             "UPDATE vault_sync_state SET last_sync_at = NULL, files_scanned = 0, "
             "drift_modified = 0, drift_added = 0, drift_removed = 0 WHERE id = 1"
         )
+        conn.commit()
+
+
+def upsert_doc_meta(
+    file_id: str,
+    *,
+    raw_yaml: str | None,
+    fields: dict[str, Any],
+) -> dict[str, Any]:
+    import json
+
+    now = _utc_now()
+    fields_json = json.dumps(fields, ensure_ascii=False)
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO vault_doc_meta (file_id, raw_yaml, fields_json, parsed_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(file_id) DO UPDATE SET
+                raw_yaml = excluded.raw_yaml,
+                fields_json = excluded.fields_json,
+                parsed_at = excluded.parsed_at
+            """,
+            (file_id, raw_yaml, fields_json, now),
+        )
+        conn.commit()
+    return get_doc_meta(file_id)  # type: ignore[return-value]
+
+
+def get_doc_meta(file_id: str) -> dict[str, Any] | None:
+    import json
+
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM vault_doc_meta WHERE file_id = ?", (file_id,)
+        ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        try:
+            data["fields"] = json.loads(data.get("fields_json") or "{}")
+        except json.JSONDecodeError:
+            data["fields"] = {}
+        return data
+
+
+def delete_doc_meta(file_id: str) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM vault_doc_meta WHERE file_id = ?", (file_id,))
         conn.commit()
 
 

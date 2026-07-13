@@ -12,6 +12,7 @@ FROM python:3.13-slim AS model-downloader
 ARG HF_HUB_DOWNLOAD_TIMEOUT=120
 ENV HF_HOME=/root/.cache/huggingface \
     HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT} \
+    #HF_ENDPOINT=https://hf-mirror.com \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
@@ -25,7 +26,12 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    pip install "huggingface_hub==1.22.0"
+    pip install "torch==2.6.0" --index-url https://download.pytorch.org/whl/cpu \
+ && pip install "huggingface_hub==1.22.0" "transformers>=4.48" "accelerate==1.6.0" \
+        "sentencepiece==0.2.2" "gliner==0.2.24" "pydantic==2.13.4" \
+        --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+ && pip install "gliner2[local]" --no-build-isolation \
+        --index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
 WORKDIR /app
 
@@ -72,7 +78,7 @@ RUN git clone --depth 1 -b feat-v5-omni https://github.com/jina-ai/llama.cpp /tm
       -DLLAMA_FLASH_ATTN=ON \
       -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
       /tmp/llama-jina \
- && cmake --build /tmp/llama-jina/build --target llama-server llama-embedding -j"$(nproc)" \
+ && cmake --build /tmp/llama-jina/build --target llama-server llama-embedding -j4 \
  && mkdir -p /opt/llama/bin /opt/llama/lib \
  && install /tmp/llama-jina/build/bin/llama-server /tmp/llama-jina/build/bin/llama-embedding /opt/llama/bin/ \
  && find /tmp/llama-jina/build -name 'lib*.so*' -exec cp -a {} /opt/llama/lib/ \; \
@@ -91,9 +97,11 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
  && rm -rf /tmp/*
 
 # -----------------------------------------------------------------------------
-# Stage 3 — runtime (CUDA runtime only; no compilers)
+# Stage 3 — runtime (CUDA runtime + Python 3.13; Ubuntu 26.04 ships 3.13 — no torch/sentencepiece wheels)
 # -----------------------------------------------------------------------------
 FROM nvidia/cuda:13.3.0-runtime-ubuntu26.04 AS runtime
+
+COPY --from=python:3.13-slim /usr/local /usr/local
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -102,7 +110,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     MODEL_PATH=/app/models \
     PYTHONPATH=/app \
-    HF_HOME=/root/.cache/huggingface
+    HF_HOME=/root/.cache/huggingface \
+    PATH="/usr/local/bin:${PATH}"
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
@@ -114,19 +123,19 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libgl1 \
         libglib2.0-0 \
         poppler-utils \
-        python3 \
-        python3-venv \
- && update-alternatives --install /usr/bin/python python /usr/bin/python3 1 \
- && curl -fsSLo /tmp/get-pip.py https://bootstrap.pypa.io/get-pip.py \
- && python3 /tmp/get-pip.py \
- && rm -f /tmp/get-pip.py
+        build-essential
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements-worker.txt ./
 
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    pip install -r requirements-worker.txt \
+    pip install "torch==2.6.0" \
+        --index-url https://download.pytorch.org/whl/cu124 \
+ && pip install -r requirements-worker.txt \
+        --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+ && pip install "gliner2[local]" --no-deps --no-build-isolation \
         --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
  && pip install "spacy==3.8.13" --no-build-isolation \
         --index-url https://pypi.tuna.tsinghua.edu.cn/simple
@@ -139,7 +148,7 @@ COPY --from=builder /opt/llama/bin/llama-embedding /usr/local/bin/
 COPY --from=builder /opt/llama/lib/ /usr/local/lib/
 COPY --from=builder /opt/python-libs/ /tmp/llama_cpp_pkg/
 
-RUN SITE="$(python3 -c 'import site; print(site.getsitepackages()[0])')" \
+RUN SITE="$(python -c 'import site; print(site.getsitepackages()[0])')" \
  && cp -a /tmp/llama_cpp_pkg/. "$SITE/" \
  && rm -rf /tmp/llama_cpp_pkg \
  && ldconfig

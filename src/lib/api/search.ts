@@ -19,12 +19,14 @@ export interface SearchHit {
   content_preview: string;
   final_score: number;
   display_score: number;
+  vector_score?: number;
   rerank_score?: number | null;
   file_id?: string | null;
   index_status?: string | null;
   relative_path?: string | null;
   parent_id?: string | null;
   child_id?: string | null;
+  family_id?: string | null;
   parent_content?: string | null;
   header_path?: string | null;
 }
@@ -59,16 +61,22 @@ export interface FusionMeta {
   created_before?: string | null;
   indexed_only?: boolean | null;
   allowlist_size?: number | null;
+  rerank_over_limit?: boolean | null;
 }
 
 export type WorkflowPhaseName =
   | "vault_scope"
   | "query_embed"
+  | "family_recall"
+  | "parent_recall"
+  | "child_recall"
+  | "grandchild_recall"
+  | "hierarchical_fusion"
+  | "rerank"
   | "coarse_ann"
   | "bm25_recall"
   | "rescore_1024"
-  | "hybrid_fusion"
-  | "rerank";
+  | "hybrid_fusion";
 
 export interface WorkflowPhase {
   phase: WorkflowPhaseName;

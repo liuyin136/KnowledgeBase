@@ -152,6 +152,7 @@ export async function listVaultFiles(params: {
   folder_id?: string;
   keyword?: string;
   index_status?: string;
+  search_content?: boolean;
   page?: number;
   page_size?: number;
 }): Promise<PaginatedFilesResponse> {
@@ -159,6 +160,7 @@ export async function listVaultFiles(params: {
   if (params.folder_id) search.set("folder_id", params.folder_id);
   if (params.keyword) search.set("keyword", params.keyword);
   if (params.index_status) search.set("index_status", params.index_status);
+  if (params.search_content) search.set("search_content", "true");
   if (params.page) search.set("page", String(params.page));
   if (params.page_size) search.set("page_size", String(params.page_size));
   const qs = search.toString();
@@ -239,9 +241,100 @@ export async function batchDeleteVaultFiles(fileIds: string[]): Promise<BatchDel
   return handleResponse<BatchDeleteResult>(res);
 }
 
-export async function reindexVaultFile(fileId: string): Promise<{ ingest_job_id: string }> {
+export async function reindexVaultFile(fileId: string): Promise<{
+  file_id: string;
+  relative_path: string;
+  ingest_job_id: string;
+}> {
   const res = await fetch(`${API_BASE}/files/${fileId}/reindex`, { method: "POST" });
   return handleResponse(res);
+}
+
+export interface IngestPreviewItem {
+  file_id: string;
+  relative_path: string;
+  estimated_tokens: number;
+  ingestible: boolean;
+  block_reason?: string | null;
+}
+
+export interface IngestPreviewResponse {
+  items: IngestPreviewItem[];
+  total_estimated_tokens: number;
+  file_count: number;
+}
+
+export async function previewIngest(fileIds: string[]): Promise<IngestPreviewResponse> {
+  const res = await fetch(`${API_BASE}/files/ingest-preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ file_ids: fileIds }),
+  });
+  return handleResponse(res);
+}
+
+export async function ingestVaultFile(fileId: string): Promise<{
+  file_id: string;
+  relative_path: string;
+  ingest_job_id: string;
+}> {
+  const res = await fetch(`${API_BASE}/files/${fileId}/ingest`, { method: "POST" });
+  return handleResponse(res);
+}
+
+export interface BatchIngestSkippedItem {
+  file_id: string;
+  reason: string;
+}
+
+export interface BatchIngestResponse {
+  batch_id: string;
+  queued: string[];
+  skipped: BatchIngestSkippedItem[];
+}
+
+export async function batchIngestVaultFiles(fileIds: string[]): Promise<BatchIngestResponse> {
+  const res = await fetch(`${API_BASE}/files/batch-ingest`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ file_ids: fileIds }),
+  });
+  return handleResponse(res);
+}
+
+export async function clearVaultIndex(fileId: string): Promise<{
+  file_id: string;
+  relative_path: string;
+  index_status: VaultIndexStatus;
+}> {
+  const res = await fetch(`${API_BASE}/files/${fileId}/clear-index`, { method: "POST" });
+  return handleResponse(res);
+}
+
+export interface MigrateV16JobEntry {
+  file_id: string;
+  relative_path: string;
+  ingest_job_id: string;
+}
+
+export interface MigrateV16Response {
+  total_files: number;
+  job_ids: MigrateV16JobEntry[];
+  dry_run?: boolean;
+  neo4j_stats?: Record<string, number>;
+  redis_keys_deleted?: number;
+}
+
+export async function migrateVaultV16(params?: {
+  purge_mode?: "vault" | "all";
+  dry_run?: boolean;
+}): Promise<MigrateV16Response> {
+  const search = new URLSearchParams();
+  if (params?.purge_mode) search.set("purge_mode", params.purge_mode);
+  if (params?.dry_run) search.set("dry_run", "true");
+  const qs = search.toString();
+  const res = await fetch(`${API_BASE}/migrate-v16${qs ? `?${qs}` : ""}`, { method: "POST" });
+  return handleResponse<MigrateV16Response>(res);
 }
 
 export async function syncVault(): Promise<SyncReport> {

@@ -1,6 +1,7 @@
 """RAG Content Vault REST API."""
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
@@ -9,13 +10,22 @@ from app.models.vault_schemas import (
     BatchDeleteRequest,
     BatchDeleteItem,
     BatchDeleteResult,
+    BatchIngestRequest,
+    BatchIngestResponse,
+    BatchIngestSkippedItem,
     BatchStatusResponse,
     BatchUploadFileResult,
     BatchUploadResponse,
+    ClearIndexResponse,
     CreateFileRequest,
     CreateFolderRequest,
     FolderListResponse,
     FolderRenamePreview,
+    IngestPreviewItem,
+    IngestPreviewRequest,
+    IngestPreviewResponse,
+    MigrateV16JobEntry,
+    MigrateV16Response,
     PaginatedFilesResponse,
     RenameFolderRequest,
     ReindexResponse,
@@ -27,7 +37,9 @@ from app.models.vault_schemas import (
     PAGE_SIZES,
 )
 from app.services import vault_db, vault_store
+from app.services.ingest_estimate import preview_ingest_files
 from app.services.job_queue import enqueue_vault_ingest
+from app.services.vault_migration import any_ingest_locked, run_full_vault_migration
 from app.services.vault_store import VaultStoreError
 from app.services.vault_sync import sync_vault
 
@@ -54,6 +66,13 @@ def _maybe_stale_sync() -> None:
     age = (datetime.now(timezone.utc) - ts).total_seconds()
     if age > SYNC_STALE_SECONDS:
         sync_vault()
+
+
+def _enqueue_ingest_or_409(file_id: str, *, traceparent: str = "") -> str:
+    try:
+        return enqueue_vault_ingest(file_id, traceparent=traceparent)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/folders", response_model=FolderListResponse)
@@ -103,6 +122,7 @@ def get_files(
     folder_id: str | None = Query(default=None),
     keyword: str | None = Query(default=None),
     index_status: str | None = Query(default=None),
+    search_content: bool = Query(default=False),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10),
 ) -> PaginatedFilesResponse:
@@ -116,6 +136,7 @@ def get_files(
         folder_id=folder_id,
         keyword=keyword,
         index_status=index_status,
+        search_content=search_content,
         page=page,
         page_size=page_size,
     )
@@ -124,7 +145,6 @@ def get_files(
 @router.post("/files", response_model=UploadResponse, status_code=201)
 def post_file(
     body: CreateFileRequest,
-    request: Request,
     on_conflict: str = Query(default="replace"),
 ) -> UploadResponse:
     if on_conflict not in ("replace", "fail"):
@@ -140,15 +160,11 @@ def post_file(
     except VaultStoreError as exc:
         _raise_store(exc)
         raise  # pragma: no cover
-    traceparent = request.headers.get("traceparent", "")
-    job_id = enqueue_vault_ingest(result.file.id, traceparent=traceparent)
-    refreshed = vault_store.get_file(result.file.id)
-    return UploadResponse(file=refreshed, ingest_job_id=job_id, replaced=result.replaced)
+    return UploadResponse(file=result.file, ingest_job_id=None, replaced=result.replaced)
 
 
 @router.post("/files/upload", response_model=UploadResponse, status_code=201)
 async def upload_file(
-    request: Request,
     folder_id: str = Form(...),
     file: UploadFile = File(...),
     on_conflict: str = Query(default="replace"),
@@ -169,24 +185,19 @@ async def upload_file(
         raise  # pragma: no cover
     except UnicodeDecodeError as exc:
         raise HTTPException(status_code=400, detail="File must be UTF-8 text") from exc
-    traceparent = request.headers.get("traceparent", "")
-    job_id = enqueue_vault_ingest(result.file.id, traceparent=traceparent)
     return UploadResponse(
-        file=vault_store.get_file(result.file.id),
-        ingest_job_id=job_id,
+        file=result.file,
+        ingest_job_id=None,
         replaced=result.replaced,
     )
 
 
 @router.post("/files/batch-upload", response_model=BatchUploadResponse, status_code=201)
 async def batch_upload(
-    request: Request,
     folder_id: str = Form(...),
     files: list[UploadFile] = File(...),
     on_conflict: str = Query(default="replace"),
 ) -> BatchUploadResponse:
-    import uuid
-
     if on_conflict not in ("replace", "fail"):
         raise HTTPException(status_code=422, detail="on_conflict must be replace or fail")
     if not files:
@@ -194,7 +205,6 @@ async def batch_upload(
     batch_id = str(uuid.uuid4())
     vault_db.insert_batch(batch_id=batch_id, total_files=len(files))
     results: list[BatchUploadFileResult] = []
-    traceparent = request.headers.get("traceparent", "")
 
     for upload in files:
         filename = upload.filename or "upload.md"
@@ -206,14 +216,13 @@ async def batch_upload(
                 data=data,
                 on_conflict=on_conflict,  # type: ignore[arg-type]
             )
-            job_id = enqueue_vault_ingest(result.file.id, traceparent=traceparent)
-            vault_db.add_batch_file(batch_id, result.file.id, job_id)
+            vault_db.add_batch_file(batch_id, result.file.id, job_id=None)
             results.append(
                 BatchUploadFileResult(
                     file_id=result.file.id,
                     filename=filename,
-                    job_id=job_id,
-                    status="replaced" if result.replaced else "created",
+                    job_id=None,
+                    status="uploaded" if not result.replaced else "replaced",
                 )
             )
         except (VaultStoreError, UnicodeDecodeError, ValueError) as exc:
@@ -230,6 +239,48 @@ async def batch_upload(
 
     vault_db.refresh_batch_counts(batch_id)
     return BatchUploadResponse(batch_id=batch_id, files=results)
+
+
+@router.post("/files/ingest-preview", response_model=IngestPreviewResponse)
+def post_ingest_preview(body: IngestPreviewRequest) -> IngestPreviewResponse:
+    raw = preview_ingest_files(body.file_ids)
+    items = [IngestPreviewItem(**item) for item in raw]
+    ingestible = [i for i in items if i.ingestible]
+    return IngestPreviewResponse(
+        items=items,
+        total_estimated_tokens=sum(i.estimated_tokens for i in ingestible),
+        file_count=len(ingestible),
+    )
+
+
+@router.post("/files/batch-ingest", response_model=BatchIngestResponse, status_code=202)
+def post_batch_ingest(body: BatchIngestRequest, request: Request) -> BatchIngestResponse:
+    batch_id = str(uuid.uuid4())
+    vault_db.insert_batch(batch_id=batch_id, total_files=len(body.file_ids))
+    traceparent = request.headers.get("traceparent", "")
+    queued: list[str] = []
+    skipped: list[BatchIngestSkippedItem] = []
+
+    for file_id in body.file_ids:
+        row = vault_db.get_file_by_id(file_id)
+        if not row or row["index_status"] == "deleted":
+            skipped.append(BatchIngestSkippedItem(file_id=file_id, reason="File not found"))
+            continue
+        if row.get("ingest_lock_job_id") or row["index_status"] == "pending":
+            skipped.append(
+                BatchIngestSkippedItem(file_id=file_id, reason="Ingest already in progress")
+            )
+            continue
+        try:
+            job_id = enqueue_vault_ingest(file_id, traceparent=traceparent)
+        except ValueError as exc:
+            skipped.append(BatchIngestSkippedItem(file_id=file_id, reason=str(exc)))
+            continue
+        vault_db.add_batch_file(batch_id, file_id, job_id)
+        queued.append(file_id)
+
+    vault_db.refresh_batch_counts(batch_id)
+    return BatchIngestResponse(batch_id=batch_id, queued=queued, skipped=skipped)
 
 
 @router.get("/files/{file_id}", response_model=VaultFile)
@@ -262,13 +313,15 @@ def put_file_content(
     file_id: str, body: SaveContentRequest, request: Request
 ) -> UploadResponse:
     try:
-        file = vault_store.save_file_content(file_id, body.content)
+        result = vault_store.save_file_content(file_id, body.content)
     except VaultStoreError as exc:
         _raise_store(exc)
         raise  # pragma: no cover
-    traceparent = request.headers.get("traceparent", "")
-    job_id = enqueue_vault_ingest(file.id, traceparent=traceparent)
-    return UploadResponse(file=vault_store.get_file(file.id), ingest_job_id=job_id)
+    job_id: str | None = None
+    if result.auto_ingest:
+        traceparent = request.headers.get("traceparent", "")
+        job_id = _enqueue_ingest_or_409(file_id, traceparent=traceparent)
+    return UploadResponse(file=vault_store.get_file(file_id), ingest_job_id=job_id)
 
 
 @router.delete("/files/batch", response_model=BatchDeleteResult)
@@ -285,8 +338,8 @@ def delete_files_batch(body: BatchDeleteRequest) -> BatchDeleteResult:
     return BatchDeleteResult(results=results)
 
 
-@router.post("/files/{file_id}/reindex", response_model=ReindexResponse)
-def reindex_file(file_id: str, request: Request) -> ReindexResponse:
+@router.post("/files/{file_id}/ingest", response_model=ReindexResponse)
+def ingest_file(file_id: str, request: Request) -> ReindexResponse:
     try:
         file = vault_store.get_file(file_id)
     except VaultStoreError as exc:
@@ -295,10 +348,7 @@ def reindex_file(file_id: str, request: Request) -> ReindexResponse:
     if file.ingest_locked:
         raise HTTPException(status_code=409, detail="File is locked while ingest is running")
     traceparent = request.headers.get("traceparent", "")
-    try:
-        job_id = enqueue_vault_ingest(file_id, traceparent=traceparent)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    job_id = _enqueue_ingest_or_409(file_id, traceparent=traceparent)
     return ReindexResponse(
         file_id=file_id,
         relative_path=file.relative_path,
@@ -306,9 +356,60 @@ def reindex_file(file_id: str, request: Request) -> ReindexResponse:
     )
 
 
+@router.post("/files/{file_id}/reindex", response_model=ReindexResponse)
+def reindex_file(file_id: str, request: Request) -> ReindexResponse:
+    """Alias for manual ingest (Phase 1.7)."""
+    return ingest_file(file_id, request)
+
+
+@router.post("/files/{file_id}/clear-index", response_model=ClearIndexResponse)
+def clear_file_index(file_id: str) -> ClearIndexResponse:
+    try:
+        file = vault_store.clear_file_index(file_id)
+    except VaultStoreError as exc:
+        _raise_store(exc)
+        raise  # pragma: no cover
+    return ClearIndexResponse(
+        file_id=file.id,
+        relative_path=file.relative_path,
+        index_status=file.index_status,
+    )
+
+
 @router.post("/sync", response_model=SyncReport)
 def post_sync() -> SyncReport:
     return sync_vault()
+
+
+@router.post("/migrate-v16", response_model=MigrateV16Response)
+def migrate_vault_v16(
+    purge_mode: str = Query(default="vault", pattern="^(vault|all)$"),
+    dry_run: bool = Query(default=False),
+) -> MigrateV16Response:
+    if any_ingest_locked():
+        raise HTTPException(
+            status_code=409,
+            detail="Vault migration blocked: one or more files have ingest in progress",
+        )
+    report = run_full_vault_migration(
+        dry_run=dry_run,
+        purge_mode=purge_mode,  # type: ignore[arg-type]
+        skip_reindex=True,
+    )
+    return MigrateV16Response(
+        total_files=report.total_files,
+        job_ids=[
+            MigrateV16JobEntry(
+                file_id=entry.file_id,
+                relative_path=entry.relative_path,
+                ingest_job_id=entry.ingest_job_id,
+            )
+            for entry in report.job_ids
+        ],
+        dry_run=dry_run,
+        neo4j_stats=report.neo4j_stats,
+        redis_keys_deleted=report.redis_keys_deleted,
+    )
 
 
 @router.get("/batches/{batch_id}", response_model=BatchStatusResponse)

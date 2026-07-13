@@ -1,27 +1,35 @@
-# Phase 1.6 migration — full vault reindex (hard cutover)
+# Phase 1.61 migration — full vault reindex (hard cutover patch)
 
-After deploying v1.6, **all vault files must be reindexed** before search returns results.
+After deploying Phase 1.61, use **one-shot full migration** to purge incomplete v1.6
+Neo4j nodes, clear Redis caches, reset vault metadata, and reindex all library files.
 
 ## Why
 
-- Flat `:KnowledgeChunk` nodes are replaced by `:Knowledgechunk` / `:Knowledgechunk_sen` / `:Knowledgechunk_grand`.
-- Vector and fulltext indexes target `:Knowledgechunk_sen` only.
-- Search cache keys include `v16` suffix (old cache entries are ignored).
+- `delete_all_knowledge()` only removed `:Knowledge` + `:KnowledgeChunk`, leaving orphan
+  `:Knowledgechunk*` and `:LogFile` nodes.
+- Ingest progress cleared Redis before the UI could see the 5th phase (`neo4j_upsert`).
+- Library had single-file Reindex only; bulk migration is required for v1.6 cutover.
 
 ## Steps
 
-1. Deploy infrastructure:
+1. Deploy app changes (no new Docker deps):
    ```bash
-   docker compose build api-worker
-   docker compose restart api-worker backend neo4j
+   docker compose restart api-worker backend
    ```
 2. Apply Neo4j DDL (if not auto-run):
    ```bash
+   docker compose exec api-worker python scripts/read-only/init_neo4j.py
+   ```
+   Or use the convenience wrapper:
+   ```bash
    docker compose exec api-worker python scripts/init_neo4j.py
    ```
-3. Reindex every file:
-   - **UI:** Library → select file → Reindex (or Save & Re-ingest in editor)
-   - **Bulk:** Rescan then reindex pending/error files
+3. **Full migration (recommended):**
+   ```bash
+   docker compose run --rm api-worker python scripts/vault_reset_and_reindex.py --dry-run
+   docker compose run --rm api-worker python scripts/vault_reset_and_reindex.py
+   ```
+   Or in Library UI: **Migrate & Reindex All**
 4. Verify search:
    ```bash
    curl -X POST http://localhost:8000/api/v1/search \
@@ -29,10 +37,18 @@ After deploying v1.6, **all vault files must be reindexed** before search return
      -d '{"query":"test query","coarse_dim":256}'
    ```
 
-## Exit checklist (CP-1.6C)
+## Exit checklist (CP-1.61C)
 
-- [ ] Ingest shows 5-phase workflow progress in library UI
-- [ ] Neo4j has `HAS_SECTION` / `HAS_CHILD` / `HAS_GRANDCHILD` edges for a test doc
+- [ ] Ingest shows 5-phase workflow progress in library UI (including neo4j_upsert DONE)
+- [ ] Full migration CLI completes without orphan v1.6 nodes
+- [ ] Neo4j has `HAS_SECTION` / `HAS_CHILD` / `HAS_GRANDCHILD` edges for vault docs
 - [ ] Search hits include `parent_id`, `child_id`, `parent_content`
-- [ ] Legacy `:KnowledgeChunk` count is 0 after reindex
-- [ ] `retrieval_tree` saved in Redis on rerank confirm/skip
+- [ ] Legacy `:KnowledgeChunk` count is 0 after migration
+- [ ] `MATCH (p:Knowledgechunk) WHERE NOT (()-[:HAS_SECTION]->(p)) RETURN count(p)` = 0
+
+## Verification Cypher
+
+```cypher
+MATCH (c:KnowledgeChunk) RETURN count(c) AS legacy_chunks;
+MATCH (p:Knowledgechunk) WHERE NOT (()-[:HAS_SECTION]->(p)) RETURN count(p) AS orphan_parents;
+```

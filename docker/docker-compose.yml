@@ -108,6 +108,7 @@ services:
   # API worker — GPU worker: models, scripts, RQ job execution
   # ---------------------------------------------------------------------------
   api-worker:
+    image: raglab-api-worker:latest
     build:
       context: ../backend
       dockerfile: ../docker/Dockerfile.worker

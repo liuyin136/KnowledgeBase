@@ -11,11 +11,12 @@ import numpy as np
 from neo4j import GraphDatabase
 
 from app.core.config import get_settings
-from app.core.constants import GRANDCHILD_RERANK_TOKEN_LIMIT
+from app.core.constants import GRANDCHILD_RERANK_TOKEN_LIMIT, TIER_RECALL_K
 from app.core.logging import configure_logging, get_logger
 from app.models.neo4j_models import (
     Knowledge,
     KnowledgeChild,
+    KnowledgeFamily,
     KnowledgeGrandchild,
     KnowledgeParent,
     node_to_dict,
@@ -23,7 +24,12 @@ from app.models.neo4j_models import (
 from app.services import ingest_progress, jina_runtime, pending_rerank, retrieval_memory, search_cache, search_progress
 from app.services.fusion import fuse_hybrid
 from app.services.gpu_utils import get_vram_used_mb
-from app.services.hierarchical_chunking import split_children, split_grandchildren, split_parents_ast
+from app.services.hierarchical_chunking import build_hierarchical_tree
+from app.services.hierarchical_fusion import (
+    HierarchicalHit,
+    aggregate_hierarchical_scores,
+    fuse_tier_pool,
+)
 from app.services.ingest_status import set_error, set_indexed
 from app.services.matryoshka import cosine_sim, matryoshka_truncate
 from app.services.metrics import push_metrics
@@ -161,10 +167,18 @@ def ingest_document(relative_path: str, traceparent: str = "") -> dict[str, Any]
         workflow_log.append(entry)
         logger.info("ingest_phase", **entry)
 
+    def _embed_text(llm: Any, content: str) -> tuple[list[float], list[float], list[float]]:
+        nonlocal vram_peak_mb
+        full_vec = jina_runtime.embed_document(llm, content)
+        coarse_256 = matryoshka_truncate(full_vec, 256).tolist()
+        coarse_512 = matryoshka_truncate(full_vec, 512).tolist()
+        vram_peak_mb = max(vram_peak_mb, get_vram_used_mb())
+        return full_vec.tolist(), coarse_256, coarse_512
+
     if job_id:
         ingest_progress.init_progress(
             job_id,
-            active_phase="ast_split",
+            active_phase="front_matter",
             relative_path=relative_path,
         )
 
@@ -190,65 +204,166 @@ def ingest_document(relative_path: str, traceparent: str = "") -> dict[str, Any]
         if existing_k and existing_k.get("id"):
             knowledge_id = existing_k["id"]
 
-        _publish_ingest_progress(job_id, workflow_log, "ast_split", relative_path)
-        t0 = time.perf_counter()
-        parents_records = split_parents_ast(text)
-        for parent in parents_records:
-            parent.id = f"{knowledge_id}__p{parent.parent_index}"
-        _log_phase(
-            {
-                "phase": "ast_split",
-                "status": "done",
-                "latency_ms": int((time.perf_counter() - t0) * 1000),
-                "parent_count": len(parents_records),
-            }
-        )
-
         llm = jina_runtime.load_retrieval_model()
         try:
             tokenize, detokenize = jina_runtime.tokenizers_from_llm(llm)
 
+            _publish_ingest_progress(job_id, workflow_log, "front_matter", relative_path)
+            t0 = time.perf_counter()
+            tree = build_hierarchical_tree(text, tokenize=tokenize, detokenize=detokenize)
+            _log_phase(
+                {
+                    "phase": "front_matter",
+                    "status": "done",
+                    "latency_ms": int((time.perf_counter() - t0) * 1000),
+                    "family_count": 1 if tree.front_matter.fields or tree.front_matter.raw_yaml else 0,
+                }
+            )
+
+            if mode == "vault":
+                file_row = vault_db.get_file_by_path(relative_path)
+                if file_row:
+                    vault_db.upsert_doc_meta(
+                        file_row["id"],
+                        raw_yaml=tree.front_matter.raw_yaml,
+                        fields=tree.front_matter.fields,
+                    )
+
+            # Assign stable IDs under knowledge_id
+            for fam in tree.families:
+                fam.id = f"{knowledge_id}__f{fam.family_index}"
+            for parent in tree.parents:
+                parent.id = f"{knowledge_id}__p{parent.parent_index}"
+                parent.family_id = next(
+                    (f.id for f in tree.families if f.family_index == parent.family_index),
+                    tree.families[0].id if tree.families else "",
+                )
+            # Rebuild children/grandchildren IDs after parent id rewrite
+            for child in tree.children:
+                parent = next((p for p in tree.parents if p.parent_index == child.parent_index), None)
+                if parent:
+                    child.parent_id = parent.id
+                    child.family_id = parent.family_id
+                child.id = f"{child.parent_id}__c{child.child_index}"
+            for g in tree.grandchildren:
+                child = next(
+                    (
+                        c
+                        for c in tree.children
+                        if c.child_index == g.child_index and c.parent_index == g.parent_index
+                    ),
+                    None,
+                )
+                if child:
+                    g.child_id = child.id
+                    g.parent_id = child.parent_id
+                g.id = f"{g.parent_id}__c{g.child_index}__g{g.grandchild_index}"
+
+            _publish_ingest_progress(job_id, workflow_log, "family_split", relative_path)
+            t0 = time.perf_counter()
+            _log_phase(
+                {
+                    "phase": "family_split",
+                    "status": "done",
+                    "latency_ms": int((time.perf_counter() - t0) * 1000),
+                    "family_count": len(tree.families),
+                }
+            )
+
+            _publish_ingest_progress(job_id, workflow_log, "parent_split", relative_path)
+            t0 = time.perf_counter()
+            _log_phase(
+                {
+                    "phase": "parent_split",
+                    "status": "done",
+                    "latency_ms": int((time.perf_counter() - t0) * 1000),
+                    "parent_count": len(tree.parents),
+                }
+            )
+
             _publish_ingest_progress(job_id, workflow_log, "child_split", relative_path)
             t0 = time.perf_counter()
-            children_records = []
-            for parent in parents_records:
-                children_records.extend(
-                    split_children(parent, tokenize=tokenize, detokenize=detokenize)
-                )
             _log_phase(
                 {
                     "phase": "child_split",
                     "status": "done",
                     "latency_ms": int((time.perf_counter() - t0) * 1000),
-                    "child_count": len(children_records),
+                    "child_count": len(tree.children),
                 }
             )
 
             _publish_ingest_progress(job_id, workflow_log, "grandchild_split", relative_path)
             t0 = time.perf_counter()
-            grandchildren_records = []
-            for child in children_records:
-                grandchildren_records.extend(split_grandchildren(child))
             _log_phase(
                 {
                     "phase": "grandchild_split",
                     "status": "done",
                     "latency_ms": int((time.perf_counter() - t0) * 1000),
-                    "grandchild_count": len(grandchildren_records),
+                    "grandchild_count": len(tree.grandchildren),
                 }
             )
 
-            _publish_ingest_progress(job_id, workflow_log, "embed_children", relative_path)
+            _publish_ingest_progress(job_id, workflow_log, "embed_family", relative_path)
+            t0 = time.perf_counter()
+            knowledge_families: list[KnowledgeFamily] = []
+            for fam in tree.families:
+                vec, c256, c512 = _embed_text(llm, fam.content)
+                knowledge_families.append(
+                    KnowledgeFamily(
+                        id=fam.id,
+                        family_index=fam.family_index,
+                        content=fam.content,
+                        content_hash=fam.content_hash,
+                        source_file=relative_path,
+                        token_count=fam.token_count,
+                        vector=vec,
+                        vector_coarse_256=c256,
+                        vector_coarse_512=c512,
+                    )
+                )
+            _log_phase(
+                {
+                    "phase": "embed_family",
+                    "status": "done",
+                    "latency_ms": int((time.perf_counter() - t0) * 1000),
+                    "embedded_count": len(knowledge_families),
+                }
+            )
+
+            _publish_ingest_progress(job_id, workflow_log, "embed_parent", relative_path)
+            t0 = time.perf_counter()
+            knowledge_parents: list[KnowledgeParent] = []
+            for p in tree.parents:
+                vec, c256, c512 = _embed_text(llm, p.content)
+                knowledge_parents.append(
+                    KnowledgeParent(
+                        id=p.id,
+                        parent_index=p.parent_index,
+                        content=p.content,
+                        content_hash=p.content_hash,
+                        header_path=p.header_path,
+                        source_file=relative_path,
+                        token_count=p.token_count,
+                        family_id=p.family_id,
+                        vector=vec,
+                        vector_coarse_256=c256,
+                        vector_coarse_512=c512,
+                    )
+                )
+            _log_phase(
+                {
+                    "phase": "embed_parent",
+                    "status": "done",
+                    "latency_ms": int((time.perf_counter() - t0) * 1000),
+                    "embedded_count": len(knowledge_parents),
+                }
+            )
+
+            _publish_ingest_progress(job_id, workflow_log, "embed_child", relative_path)
             t0 = time.perf_counter()
             knowledge_children: list[KnowledgeChild] = []
-            embedded_count = 0
-            for child in children_records:
-                full_vec = jina_runtime.embed_document(llm, child.content)
-                coarse_256 = matryoshka_truncate(full_vec, 256).tolist()
-                coarse_512 = matryoshka_truncate(full_vec, 512).tolist()
-                vram_peak_mb = max(vram_peak_mb, get_vram_used_mb())
-                embedded_count += 1
-
+            for child in tree.children:
+                vec, c256, c512 = _embed_text(llm, child.content)
                 knowledge_children.append(
                     KnowledgeChild(
                         id=child.id,
@@ -258,17 +373,47 @@ def ingest_document(relative_path: str, traceparent: str = "") -> dict[str, Any]
                         content_hash=child.content_hash,
                         token_count=child.token_count,
                         source_file=relative_path,
-                        vector=full_vec.tolist(),
-                        vector_coarse_256=coarse_256,
-                        vector_coarse_512=coarse_512,
+                        block_type=child.block_type,
+                        vector=vec,
+                        vector_coarse_256=c256,
+                        vector_coarse_512=c512,
                     )
                 )
             _log_phase(
                 {
-                    "phase": "embed_children",
+                    "phase": "embed_child",
                     "status": "done",
                     "latency_ms": int((time.perf_counter() - t0) * 1000),
-                    "embedded_count": embedded_count,
+                    "embedded_count": len(knowledge_children),
+                }
+            )
+
+            _publish_ingest_progress(job_id, workflow_log, "embed_grandchild", relative_path)
+            t0 = time.perf_counter()
+            knowledge_grandchildren: list[KnowledgeGrandchild] = []
+            for g in tree.grandchildren:
+                vec, c256, c512 = _embed_text(llm, g.content)
+                knowledge_grandchildren.append(
+                    KnowledgeGrandchild(
+                        id=g.id,
+                        child_id=g.child_id,
+                        parent_id=g.parent_id,
+                        grandchild_index=g.grandchild_index,
+                        content=g.content,
+                        source_file=relative_path,
+                        content_hash=g.content_hash,
+                        token_count=g.token_count,
+                        vector=vec,
+                        vector_coarse_256=c256,
+                        vector_coarse_512=c512,
+                    )
+                )
+            _log_phase(
+                {
+                    "phase": "embed_grandchild",
+                    "status": "done",
+                    "latency_ms": int((time.perf_counter() - t0) * 1000),
+                    "embedded_count": len(knowledge_grandchildren),
                 }
             )
         finally:
@@ -280,45 +425,20 @@ def ingest_document(relative_path: str, traceparent: str = "") -> dict[str, Any]
             source_file=relative_path,
             title=file_path.stem,
             category=parts[0] if parts else "",
-            token_count=sum(c.token_count for c in children_records),
-            chunk_count=len(children_records),
-            last_content_hash=children_records[-1].content_hash if children_records else "",
+            token_count=sum(c.token_count for c in knowledge_children),
+            chunk_count=len(knowledge_children),
+            last_content_hash=knowledge_children[-1].content_hash if knowledge_children else "",
             mtime=file_path.stat().st_mtime,
         )
 
-        knowledge_parents = [
-            KnowledgeParent(
-                id=p.id,
-                parent_index=p.parent_index,
-                content=p.content,
-                content_hash=p.content_hash,
-                header_path=p.header_path,
-                source_file=relative_path,
-                token_count=p.token_count,
-            )
-            for p in parents_records
-        ]
-        knowledge_grandchildren = [
-            KnowledgeGrandchild(
-                id=g.id,
-                child_id=g.child_id,
-                parent_id=g.parent_id,
-                grandchild_index=g.grandchild_index,
-                content=g.content,
-                source_file=relative_path,
-            )
-            for g in grandchildren_records
-        ]
-
         _publish_ingest_progress(job_id, workflow_log, "neo4j_upsert", relative_path)
         t0 = time.perf_counter()
-        client.delete_knowledge_tree_for_source(relative_path)
-        stats = client.upsert_knowledge_tree(
+        stats = client.upsert_knowledge_tree_v162(
             knowledge,
+            knowledge_families,
             knowledge_parents,
             knowledge_children,
             knowledge_grandchildren,
-            skip_child_ids=set(),
             link_log_file=(mode != "vault"),
         )
         legacy_deleted = client.delete_legacy_chunks_for_source(relative_path)
@@ -328,10 +448,12 @@ def ingest_document(relative_path: str, traceparent: str = "") -> dict[str, Any]
                 "status": "done",
                 "latency_ms": int((time.perf_counter() - t0) * 1000),
                 "children_written": stats["children_written"],
-                "children_skipped": stats["children_skipped"],
-                "legacy_chunks_deleted": legacy_deleted,
+                "family_count": stats["families_written"],
+                "parent_count": stats["parents_written"],
+                "grandchild_count": stats["grandchildren_written"],
             }
         )
+        _publish_ingest_progress(job_id, workflow_log, None, relative_path)
 
         latency_ms = int((time.perf_counter() - start) * 1000)
         content_hash = knowledge.last_content_hash
@@ -339,18 +461,17 @@ def ingest_document(relative_path: str, traceparent: str = "") -> dict[str, Any]
             _clear_vault_lock(
                 relative_path,
                 index_status="indexed",
-                chunk_count=len(children_records),
+                chunk_count=len(knowledge_children),
                 content_hash=content_hash,
             )
         if job_id:
-            set_indexed(relative_path, job_id, chunk_count=len(children_records))
+            set_indexed(relative_path, job_id, chunk_count=len(knowledge_children))
 
         push_metrics(
             {
                 "stage": "ingest_document",
                 "latency_ms": latency_ms,
                 "chunks_written": stats["children_written"],
-                "chunks_skipped": stats["children_skipped"],
                 "vram_peak_mb": vram_peak_mb,
             }
         )
@@ -359,6 +480,8 @@ def ingest_document(relative_path: str, traceparent: str = "") -> dict[str, Any]
             "parent_id": knowledge_id,
             "legacy_chunks_deleted": legacy_deleted,
             "vram_peak_mb": vram_peak_mb,
+            "workflow_log": workflow_log,
+            "relative_path": relative_path,
         }
     except Exception as exc:
         if mode == "vault":
@@ -373,9 +496,6 @@ def ingest_document(relative_path: str, traceparent: str = "") -> dict[str, Any]
         if job_id:
             set_error(relative_path, job_id, str(exc))
         raise
-    finally:
-        if job_id:
-            ingest_progress.clear_progress(job_id)
 
 
 def _build_parent_paths(
@@ -407,8 +527,36 @@ def _build_fusion_hits(
 ) -> list[dict[str, Any]]:
     hits: list[dict[str, Any]] = []
     for i, hit in enumerate(fused):
-        chunk = pool[hit.chunk_id]
-        parent_path = parent_paths.get(hit.chunk_id, "")
+        if isinstance(hit, HierarchicalHit):
+            chunk_id = hit.grandchild_id
+            entry = pool.get(chunk_id) or {
+                "parent_id": hit.parent_id,
+                "child_id": hit.child_id,
+                "family_id": hit.family_id,
+                "child_index": hit.child_index,
+                "content": hit.content,
+                "parent_content": hit.parent_content,
+                "header_path": hit.header_path,
+                "source_file": hit.source_file,
+            }
+            parent_path = parent_paths.get(chunk_id) or hit.source_file or ""
+            vector_score = hit.vector_score
+            final_score = hit.final_score
+            display_score = hit.display_score
+            child_id = hit.child_id
+            parent_id = hit.parent_id
+            family_id = hit.family_id
+        else:
+            chunk_id = hit.chunk_id
+            entry = pool[chunk_id]
+            parent_path = parent_paths.get(chunk_id, "")
+            vector_score = float(getattr(hit, "vector_score", 0.0) or 0.0)
+            final_score = hit.final_score
+            display_score = hit.display_score
+            child_id = chunk_id
+            parent_id = entry.get("parent_id")
+            family_id = entry.get("family_id")
+
         file_id = None
         index_status = None
         relative_path = parent_path or None
@@ -424,16 +572,18 @@ def _build_fusion_hits(
             except Exception:
                 pass
         hit_dict: dict[str, Any] = {
-            "chunk_id": hit.chunk_id,
-            "child_id": hit.chunk_id,
-            "parent_id": chunk.get("parent_id"),
-            "parent_content": chunk.get("parent_content"),
-            "header_path": chunk.get("header_path"),
+            "chunk_id": chunk_id,
+            "child_id": child_id,
+            "parent_id": parent_id,
+            "family_id": family_id,
+            "parent_content": entry.get("parent_content"),
+            "header_path": entry.get("header_path"),
             "parent_path": parent_path,
-            "chunk_index": int(chunk.get("child_index", 0)),
-            "content_preview": (chunk.get("content") or "")[:240],
-            "final_score": hit.final_score,
-            "display_score": hit.display_score,
+            "chunk_index": int(entry.get("child_index", 0)),
+            "content_preview": (entry.get("content") or "")[:240],
+            "final_score": final_score,
+            "display_score": display_score,
+            "vector_score": vector_score,
             "file_id": file_id,
             "index_status": index_status,
             "relative_path": relative_path,
@@ -559,14 +709,27 @@ def _retrieval_tree_from_fused(
     parent_ids: list[str] = []
     child_ids: list[str] = []
     grandchild_ids: list[str] = []
+    family_ids: list[str] = []
     for hit in fused:
-        entry = pool[hit.chunk_id]
+        if isinstance(hit, HierarchicalHit):
+            if hit.parent_id:
+                parent_ids.append(hit.parent_id)
+            if hit.child_id:
+                child_ids.append(hit.child_id)
+            grandchild_ids.append(hit.grandchild_id)
+            if hit.family_id:
+                family_ids.append(hit.family_id)
+            continue
+        entry = pool.get(hit.chunk_id) or {}
         parent_id = entry.get("parent_id")
         if parent_id:
             parent_ids.append(str(parent_id))
         child_ids.append(hit.chunk_id)
         grandchild_ids.extend(entry.get("grandchild_ids") or [])
+        if entry.get("family_id"):
+            family_ids.append(str(entry["family_id"]))
     return {
+        "family_ids": list(dict.fromkeys(family_ids)),
         "parent_ids": list(dict.fromkeys(parent_ids)),
         "child_ids": list(dict.fromkeys(child_ids)),
         "grandchild_ids": list(dict.fromkeys(grandchild_ids)),
@@ -587,14 +750,33 @@ def _hybrid_recall_and_fusion(
     job_id: str | None = None,
     span_id: str | None = None,
 ) -> dict[str, Any]:
+    """Cascade W1–W4 recall + hierarchical vector aggregation (v1.62)."""
+    del recall_k  # replaced by TIER_RECALL_K
     client = get_neo4j_client()
     workflow_log: list[dict[str, Any]] = []
     vram_peak_mb = 0
     scope_meta = scope_meta or {}
+    k_family = TIER_RECALL_K["family"]
+    k_parent = TIER_RECALL_K["parent"]
+    k_child = TIER_RECALL_K["child"]
+    k_gc = TIER_RECALL_K["grandchild"]
 
     def _log_phase(entry: dict[str, Any]) -> None:
         workflow_log.append(entry)
         logger.info("search_phase", **entry)
+
+    def _rescore_pool(
+        label: str, ids: list[str], q_vec: np.ndarray
+    ) -> dict[str, float]:
+        meta = client.get_node_vectors(label, ids)
+        out: dict[str, float] = {}
+        for nid, row in meta.items():
+            vec = row.get("vector")
+            if vec is None:
+                out[nid] = 0.0
+                continue
+            out[nid] = cosine_sim(q_vec, np.asarray(vec, dtype=np.float32))
+        return out
 
     if allowed_paths is not None:
         _publish_phase_progress(job_id, workflow_log, "vault_scope", span_id=span_id)
@@ -607,7 +789,6 @@ def _hybrid_recall_and_fusion(
                 "hit_count": len(allowed_paths),
             }
         )
-        _publish_phase_progress(job_id, workflow_log, "query_embed", span_id=span_id)
         if len(allowed_paths) == 0:
             return {
                 "empty_scope": True,
@@ -619,6 +800,7 @@ def _hybrid_recall_and_fusion(
                 "bm25_hits": [],
                 "parent_paths": {},
                 "vram_peak_mb": vram_peak_mb,
+                "rerank_over_limit": False,
             }
 
     _publish_phase_progress(job_id, workflow_log, "query_embed", span_id=span_id)
@@ -638,120 +820,244 @@ def _hybrid_recall_and_fusion(
             "vram_peak_mb": vram_peak_mb,
         }
     )
-    _publish_phase_progress(job_id, workflow_log, "coarse_ann", span_id=span_id)
+    q_coarse = matryoshka_truncate(q_full, coarse_dim).tolist()
 
-    q_coarse = matryoshka_truncate(q_full, coarse_dim)
-
+    # --- W1 Family ---
+    _publish_phase_progress(job_id, workflow_log, "family_recall", span_id=span_id)
     t0 = time.perf_counter()
-    vector_hits = client.vector_search_coarse_children(
-        coarse_dim, q_coarse.tolist(), recall_k, allowed_paths=allowed_paths
+    fam_vec_hits = client.vector_search_coarse_family(
+        coarse_dim, q_coarse, k_family, allowed_paths=allowed_paths
     )
+    fam_bm25_hits = client.bm25_search_family(query, k_family, allowed_paths=allowed_paths)
+    fam_pool: dict[str, dict[str, Any]] = {}
+    fam_v: dict[str, float] = {}
+    fam_b: dict[str, float] = {}
+    for row in fam_vec_hits:
+        node = node_to_dict(row["family"])
+        fam_pool[node["id"]] = node
+        fam_v[node["id"]] = float(row.get("vector_score") or 0.0)
+    for row in fam_bm25_hits:
+        node = node_to_dict(row["family"])
+        fam_pool[node["id"]] = node
+        fam_b[node["id"]] = float(row.get("bm25_score") or 0.0)
+    fam_v.update(_rescore_pool("Knowledgechunk_family", list(fam_pool.keys()), q_full))
+    fam_fused = fuse_tier_pool(
+        list(fam_pool.keys()), fam_v, fam_b, w1=w1, w2=w2, use_minmax_fallback=use_minmax_fallback, top_k=k_family
+    )
+    family_ids = [h.chunk_id for h in fam_fused]
+    family_vector_by_id = {h.chunk_id: h.vector_score for h in fam_fused}
     _log_phase(
         {
-            "phase": "coarse_ann",
+            "phase": "family_recall",
             "status": "done",
             "latency_ms": int((time.perf_counter() - t0) * 1000),
-            "hit_count": len(vector_hits),
-            "coarse_dim": coarse_dim,
+            "hit_count": len(family_ids),
+            "pool_size": len(fam_pool),
         }
     )
-    _publish_phase_progress(job_id, workflow_log, "bm25_recall", span_id=span_id)
 
+    # --- W2 Parent ---
+    _publish_phase_progress(job_id, workflow_log, "parent_recall", span_id=span_id)
     t0 = time.perf_counter()
-    bm25_hits = client.bm25_search_children(query, recall_k, allowed_paths=allowed_paths)
+    par_vec_hits = client.vector_search_coarse_parents(
+        coarse_dim, q_coarse, k_parent, allowed_paths=allowed_paths, allowed_family_ids=family_ids or None
+    )
+    par_bm25_hits = client.bm25_search_parents(
+        query, k_parent, allowed_paths=allowed_paths, allowed_family_ids=family_ids or None
+    )
+    par_pool: dict[str, dict[str, Any]] = {}
+    par_v: dict[str, float] = {}
+    par_b: dict[str, float] = {}
+    parent_family: dict[str, str] = {}
+    for row in par_vec_hits + par_bm25_hits:
+        node = node_to_dict(row["parent"])
+        fam = node_to_dict(row.get("family"))
+        par_pool[node["id"]] = node
+        parent_family[node["id"]] = fam.get("id") or node.get("family_id") or ""
+        if "vector_score" in row:
+            par_v[node["id"]] = float(row["vector_score"] or 0.0)
+        if "bm25_score" in row:
+            par_b[node["id"]] = float(row["bm25_score"] or 0.0)
+    par_v.update(_rescore_pool("Knowledgechunk", list(par_pool.keys()), q_full))
+    par_fused = fuse_tier_pool(
+        list(par_pool.keys()), par_v, par_b, w1=w1, w2=w2, use_minmax_fallback=use_minmax_fallback, top_k=k_parent
+    )
+    parent_ids = [h.chunk_id for h in par_fused]
+    parent_vector_by_id = {h.chunk_id: h.vector_score for h in par_fused}
     _log_phase(
         {
-            "phase": "bm25_recall",
+            "phase": "parent_recall",
             "status": "done",
             "latency_ms": int((time.perf_counter() - t0) * 1000),
-            "hit_count": len(bm25_hits),
+            "hit_count": len(parent_ids),
+            "pool_size": len(par_pool),
         }
     )
-    _publish_phase_progress(job_id, workflow_log, "rescore_1024", span_id=span_id)
 
-    pool: dict[str, dict[str, Any]] = {}
-    vector_scores: dict[str, float] = {}
-    bm25_scores: dict[str, float] = {}
-
-    for row in vector_hits:
-        child = node_to_dict(row["child"])
-        cid = child["id"]
+    # --- W3 Child ---
+    _publish_phase_progress(job_id, workflow_log, "child_recall", span_id=span_id)
+    t0 = time.perf_counter()
+    ch_vec_hits = client.vector_search_coarse_children_v162(
+        coarse_dim, q_coarse, k_child, allowed_paths=allowed_paths, allowed_parent_ids=parent_ids or None
+    )
+    ch_bm25_hits = client.bm25_search_children_v162(
+        query, k_child, allowed_paths=allowed_paths, allowed_parent_ids=parent_ids or None
+    )
+    ch_pool: dict[str, dict[str, Any]] = {}
+    ch_v: dict[str, float] = {}
+    ch_b: dict[str, float] = {}
+    child_parent: dict[str, str] = {}
+    child_family: dict[str, str] = {}
+    for row in ch_vec_hits + ch_bm25_hits:
+        node = node_to_dict(row["child"])
         parent = node_to_dict(row.get("parent"))
-        pool[cid] = {
-            "id": cid,
-            "parent_id": parent.get("id") or child.get("parent_id"),
-            "child_index": int(child.get("child_index", 0)),
-            "content": child.get("content") or "",
-        }
-        vector_scores[cid] = float(row.get("vector_score") or 0.0)
-
-    for row in bm25_hits:
-        child = node_to_dict(row["child"])
-        cid = child["id"]
-        parent = node_to_dict(row.get("parent"))
-        pool[cid] = {
-            "id": cid,
-            "parent_id": parent.get("id") or child.get("parent_id"),
-            "child_index": int(child.get("child_index", 0)),
-            "content": child.get("content") or "",
-        }
-        bm25_scores[cid] = float(row.get("bm25_score") or 0.0)
-
-    t0 = time.perf_counter()
-    child_meta = client.get_child_vectors(list(pool.keys()))
-    for cid, meta in child_meta.items():
-        vec = np.asarray(meta["vector"], dtype=np.float32)
-        vector_scores[cid] = cosine_sim(q_full, vec)
-        if cid in pool:
-            pool[cid]["parent_id"] = meta.get("parent_id") or pool[cid].get("parent_id")
+        fam = node_to_dict(row.get("family"))
+        ch_pool[node["id"]] = node
+        child_parent[node["id"]] = parent.get("id") or node.get("parent_id") or ""
+        child_family[node["id"]] = fam.get("id") or ""
+        if "vector_score" in row:
+            ch_v[node["id"]] = float(row["vector_score"] or 0.0)
+        if "bm25_score" in row:
+            ch_b[node["id"]] = float(row["bm25_score"] or 0.0)
+    ch_v.update(_rescore_pool("Knowledgechunk_sen", list(ch_pool.keys()), q_full))
+    ch_fused = fuse_tier_pool(
+        list(ch_pool.keys()), ch_v, ch_b, w1=w1, w2=w2, use_minmax_fallback=use_minmax_fallback, top_k=k_child
+    )
+    child_ids = [h.chunk_id for h in ch_fused]
+    child_vector_by_id = {h.chunk_id: h.vector_score for h in ch_fused}
     _log_phase(
         {
-            "phase": "rescore_1024",
+            "phase": "child_recall",
             "status": "done",
             "latency_ms": int((time.perf_counter() - t0) * 1000),
-            "pool_size": len(pool),
-            "rescore_dim": 1024,
+            "hit_count": len(child_ids),
+            "pool_size": len(ch_pool),
         }
     )
-    _publish_phase_progress(job_id, workflow_log, "hybrid_fusion", span_id=span_id)
 
+    # --- W4 Grandchild ---
+    _publish_phase_progress(job_id, workflow_log, "grandchild_recall", span_id=span_id)
     t0 = time.perf_counter()
-    fused = fuse_hybrid(
-        list(pool.keys()),
-        vector_scores,
-        bm25_scores,
-        w1=w1,
-        w2=w2,
-        use_minmax_fallback=use_minmax_fallback,
-    )[:rerank_k]
+    gc_vec_hits = client.vector_search_coarse_grandchildren(
+        coarse_dim, q_coarse, k_gc, allowed_paths=allowed_paths, allowed_child_ids=child_ids or None
+    )
+    gc_bm25_hits = client.bm25_search_grandchildren(
+        query, k_gc, allowed_paths=allowed_paths, allowed_child_ids=child_ids or None
+    )
+    gc_pool: dict[str, dict[str, Any]] = {}
+    gc_v: dict[str, float] = {}
+    gc_b: dict[str, float] = {}
+    for row in gc_vec_hits + gc_bm25_hits:
+        node = node_to_dict(row["grandchild"])
+        child = node_to_dict(row.get("child"))
+        parent = node_to_dict(row.get("parent"))
+        fam = node_to_dict(row.get("family"))
+        gc_pool[node["id"]] = {
+            **node,
+            "child_id": child.get("id") or node.get("child_id"),
+            "parent_id": parent.get("id") or node.get("parent_id"),
+            "family_id": fam.get("id") or "",
+            "parent_content": parent.get("content") or "",
+            "header_path": parent.get("header_path") or "",
+            "source_file": node.get("source_file") or fam.get("source_file") or "",
+            "child_index": int(child.get("child_index") or 0),
+        }
+        if "vector_score" in row:
+            gc_v[node["id"]] = float(row["vector_score"] or 0.0)
+        if "bm25_score" in row:
+            gc_b[node["id"]] = float(row["bm25_score"] or 0.0)
+    gc_v.update(_rescore_pool("Knowledgechunk_grand", list(gc_pool.keys()), q_full))
+    gc_fused = fuse_tier_pool(
+        list(gc_pool.keys()), gc_v, gc_b, w1=w1, w2=w2, use_minmax_fallback=use_minmax_fallback, top_k=k_gc
+    )
     _log_phase(
         {
-            "phase": "hybrid_fusion",
+            "phase": "grandchild_recall",
+            "status": "done",
+            "latency_ms": int((time.perf_counter() - t0) * 1000),
+            "hit_count": len(gc_fused),
+            "pool_size": len(gc_pool),
+        }
+    )
+
+    # --- Hierarchical aggregation ---
+    _publish_phase_progress(job_id, workflow_log, "hierarchical_fusion", span_id=span_id)
+    t0 = time.perf_counter()
+    paths: list[dict[str, Any]] = []
+    for h in gc_fused:
+        entry = gc_pool[h.chunk_id]
+        cid = entry.get("child_id") or ""
+        pid = entry.get("parent_id") or ""
+        fid = entry.get("family_id") or child_family.get(cid) or parent_family.get(pid) or ""
+        paths.append(
+            {
+                "grandchild_id": h.chunk_id,
+                "child_id": cid,
+                "parent_id": pid,
+                "family_id": fid,
+                "family_vector": family_vector_by_id.get(fid, 0.0),
+                "parent_vector": parent_vector_by_id.get(pid, 0.0),
+                "child_vector": child_vector_by_id.get(cid, 0.0),
+                "grandchild_vector": h.vector_score,
+                "bm25_score": h.bm25_score,
+                "content": entry.get("content") or "",
+                "parent_content": entry.get("parent_content") or "",
+                "header_path": entry.get("header_path") or "",
+                "source_file": entry.get("source_file") or "",
+                "child_index": entry.get("child_index") or 0,
+            }
+        )
+    fused = aggregate_hierarchical_scores(paths)[: max(rerank_k, TIER_RECALL_K["rerank"])]
+    _log_phase(
+        {
+            "phase": "hierarchical_fusion",
             "status": "done",
             "latency_ms": int((time.perf_counter() - t0) * 1000),
             "w1": w1,
             "w2": w2,
-            "pool_size": len(pool),
+            "pool_size": len(paths),
             "rerank_k": rerank_k,
         }
     )
 
-    fused = _apply_grandchild_rerank_if_fit(query, fused, pool, client)
-    _assemble_parent_context(fused, pool, client)
-    rerank_inputs = _parent_rerank_inputs(fused, pool)
-    parent_paths = _build_parent_paths(vector_hits, bm25_hits)
-    _publish_phase_progress(job_id, workflow_log, None, span_id=span_id)
+    pool = {h.grandchild_id: {
+        "id": h.grandchild_id,
+        "parent_id": h.parent_id,
+        "child_id": h.child_id,
+        "family_id": h.family_id,
+        "child_index": h.child_index,
+        "content": h.content,
+        "parent_content": h.parent_content,
+        "header_path": h.header_path,
+        "source_file": h.source_file,
+    } for h in fused}
 
+    rerank_inputs = [h.content for h in fused if h.content.strip()]
+    parent_paths = {h.grandchild_id: h.source_file for h in fused if h.source_file}
+
+    # Token estimate for W5 gate
+    rerank_token_count = 0
+    rerank_over_limit = False
+    if rerank_inputs:
+        try:
+            rerank_token_count = jina_runtime.estimate_rerank_prompt_tokens(query, rerank_inputs)
+            rerank_over_limit = rerank_token_count > GRANDCHILD_RERANK_TOKEN_LIMIT
+        except Exception as exc:
+            logger.warning("rerank_token_estimate_failed", error=str(exc))
+
+    _publish_phase_progress(job_id, workflow_log, None, span_id=span_id)
     return {
         "empty_scope": False,
         "workflow_log": workflow_log,
         "pool": pool,
         "fused": fused,
         "rerank_inputs": rerank_inputs,
-        "vector_hits": vector_hits,
-        "bm25_hits": bm25_hits,
+        "vector_hits": gc_vec_hits,
+        "bm25_hits": gc_bm25_hits,
         "parent_paths": parent_paths,
         "vram_peak_mb": vram_peak_mb,
+        "rerank_token_count": rerank_token_count,
+        "rerank_over_limit": rerank_over_limit,
     }
 
 
@@ -876,7 +1182,9 @@ def hybrid_search_fusion(
         bm25_hits = fusion_data["bm25_hits"]
         retrieval_tree = _retrieval_tree_from_fused(fused, pool)
 
-        rerank_token_count = jina_runtime.estimate_rerank_prompt_tokens(query, rerank_inputs)
+        rerank_token_count = int(fusion_data.get("rerank_token_count") or 0)
+        if not rerank_token_count and rerank_inputs:
+            rerank_token_count = jina_runtime.estimate_rerank_prompt_tokens(query, rerank_inputs)
         hits_fusion = _build_fusion_hits(fused, pool, parent_paths, rerank_by_idx=None)
 
         latency_ms = int((time.perf_counter() - start) * 1000)
@@ -894,13 +1202,17 @@ def hybrid_search_fusion(
             allowed_paths=allowed_paths,
             scope_meta=scope_meta,
         )
+        fusion_meta["rerank_over_limit"] = bool(fusion_data.get("rerank_over_limit"))
+
+        def _fused_id(h: Any) -> str:
+            return h.grandchild_id if isinstance(h, HierarchicalHit) else h.chunk_id
 
         if job_id:
             slim_pool = _slim_pool_for_pending(pool)
             pending_payload = {
                 "query": query,
                 "rerank_inputs": rerank_inputs,
-                "fused_chunk_ids": [h.chunk_id for h in fused],
+                "fused_chunk_ids": [_fused_id(h) for h in fused],
                 "rerank_k": rerank_k,
                 "cache_key": cache_key,
                 "span_id": resolved_span_id,
@@ -911,20 +1223,21 @@ def hybrid_search_fusion(
                 "pool": slim_pool,
                 "fused": [
                     {
-                        "chunk_id": h.chunk_id,
+                        "chunk_id": _fused_id(h),
                         "final_score": h.final_score,
                         "display_score": h.display_score,
+                        "vector_score": float(getattr(h, "vector_score", 0.0) or 0.0),
                     }
                     for h in fused
                 ],
                 "parent_paths": parent_paths,
                 "retrieval_tree": retrieval_tree,
-                # jobs.confirm_rerank skip path should call retrieval_memory.save_retrieval_tree
                 "w1": w1,
                 "w2": w2,
                 "recall_k": recall_k,
                 "coarse_dim": coarse_dim,
                 "allowed_paths": allowed_paths,
+                "rerank_over_limit": bool(fusion_data.get("rerank_over_limit")),
             }
             pending_rerank.save_pending(job_id, pending_payload)
 
@@ -983,7 +1296,7 @@ def hybrid_search_rerank(parent_job_id: str, traceparent: str = "") -> dict[str,
             chunk_id=item["chunk_id"],
             final_score=float(item["final_score"]),
             display_score=float(item["display_score"]),
-            vector_score=0.0,
+            vector_score=float(item.get("vector_score", 0.0) or 0.0),
             bm25_score=0.0,
         )
         for item in fused_raw
@@ -1090,3 +1403,134 @@ def hybrid_search(
         allowed_paths,
         scope_meta,
     )
+
+
+@check_health
+@worker_trace("extract_memory_graph")
+def extract_memory_graph(
+    query_text: str,
+    grandchild_ids: list[str],
+    user_query_id: str | None = None,
+    session_id: str | None = None,
+    traceparent: str = "",
+    span_id: str | None = None,
+) -> dict[str, Any]:
+    """Manual GraphRAG extract: Liquid → Neo4j graph + communities + episodic Redis."""
+    from app.services import episodic_memory, graph_community, liquid_extract, liquid_runtime
+    from app.services.memory_key import (
+        compute_memory_key,
+        new_memory_id,
+        source_query_id as resolve_source_query_id,
+    )
+
+    del traceparent
+    client = get_neo4j_client()
+    uq_id = resolve_source_query_id(query_text, user_query_id)
+    mem_key = compute_memory_key(uq_id, grandchild_ids)
+    memory_id = new_memory_id()
+
+    chunk_rows = client.get_grandchild_contents(grandchild_ids)
+    if not chunk_rows:
+        raise ValueError("No Knowledgechunk_grand nodes found for grandchild_ids")
+
+    chunks = [
+        {
+            "id": row["id"],
+            "grandchild_id": row["id"],
+            "content": row.get("content") or "",
+            "source_file": row.get("source_file"),
+        }
+        for row in chunk_rows
+    ]
+
+    llm = None
+    try:
+        llm = liquid_runtime.load_extract_model()
+        graph = liquid_extract.extract_graph_from_chunks(chunks, query_text, llm=llm)
+        communities = graph_community.partition_entities(graph.entities, graph.relations)
+        summaries = graph_community.build_community_summaries(communities, graph, llm=llm)
+
+        entity_payload = [
+            {
+                "entity_id": e.entity_id,
+                "name": e.name,
+                "type": e.type,
+                "grandchild_id": grandchild_ids[0] if grandchild_ids else None,
+            }
+            for e in graph.entities
+        ]
+        relation_payload = [
+            {
+                "source_id": r.source_id,
+                "target_id": r.target_id,
+                "type": r.type,
+                "weight": r.weight,
+            }
+            for r in graph.relations
+        ]
+        claim_payload = [
+            {
+                "claim_id": c.claim_id,
+                "text": c.text,
+                "entity_id": c.entity_id,
+                "confidence": c.confidence,
+                "grandchild_id": c.grandchild_id or (grandchild_ids[0] if grandchild_ids else None),
+            }
+            for c in graph.claims
+        ]
+        community_payload = [
+            {
+                "community_id": c.community_id,
+                "level": c.level,
+                "entity_ids": c.entity_ids,
+            }
+            for c in communities
+        ]
+        summary_payload = [
+            {
+                "summary_id": s.summary_id,
+                "community_id": s.community_id,
+                "level": s.level,
+                "text": s.text,
+            }
+            for s in summaries
+        ]
+
+        result = client.merge_memory_graph(
+            memory_key=mem_key,
+            memory_id=memory_id,
+            query_text=query_text,
+            user_query_id=uq_id,
+            trace_id=span_id,
+            summary=graph.summary,
+            grandchild_ids=grandchild_ids,
+            entities=entity_payload,
+            relations=relation_payload,
+            claims=claim_payload,
+            communities=community_payload,
+            summaries=summary_payload,
+        )
+
+        if session_id:
+            retrieval_tree = retrieval_memory.load_retrieval_tree(session_id)
+            tree_payload = (retrieval_tree or {}).get("retrieval_tree") or {}
+            episodic_memory.save_episodic_session(
+                session_id,
+                query=query_text,
+                grandchild_ids=grandchild_ids,
+                memory_key=mem_key,
+                span_id=span_id,
+                retrieval_tree=tree_payload,
+            )
+
+        push_metrics(
+            {
+                "stage": "extract_memory_graph",
+                "entities": result.get("entities_created", 0),
+                "communities": result.get("communities_created", 0),
+            }
+        )
+        return result
+    finally:
+        if llm is not None:
+            liquid_runtime.release_extract_model(llm)

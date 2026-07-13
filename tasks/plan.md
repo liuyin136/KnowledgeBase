@@ -1,28 +1,32 @@
-# Phase 1 — Hybrid Search MVP (Checkpoint-Driven)
+# Active implementation plan (pointer)
 
-Implementation completed per checkpoint plan. See `tasks/todo.md` for checklist.
+> **Do not treat this file as the full plan.** It points to the current agent implementation plan. Project status: [PHASE_STATUS.md](PHASE_STATUS.md). Bootstrap: [AGENTS.md](../AGENTS.md).
 
-## Key changes
+| Field | Value |
+|-------|-------|
+| **Active plan** | [plan-phase-2.02.md](../Download/RAG%20Workflow%20template/plan-phase-2.02.md) |
+| **Spec canon** | [Download/RAG Workflow template/plan-phase-2.02.md](../Download/RAG%20Workflow%20template/plan-phase-2.02.md) |
+| **Outcome Gates** | [tasks/CP-2.02-E2E.md](CP-2.02-E2E.md) |
+| **Phase** | 2.02 Question subgraph (next) |
+| **Updated** | 2026-07-14 |
+| **Checklist** | [tasks/todo.md](todo.md) |
 
-- **Chunking:** Fixed tail-discard to use global token overlap (plan Task 1.2)
-- **Fusion:** Added `compute_recall_at_k`; benchmark reports recall@5
-- **API:** `w1 + w2` validation; `ingest_job_id` on save response
-- **Tests:** GPU integration via RQ (skips if CUDA OOM); synthetic benchmark gate
-- **Frontend:** RagShell sidebar, skeletons, date filter, ingest job polling
-- **Docker:** Mount `backend/app`, `tests` on api-worker for dev verification
+## Completed (2026-07-14)
 
-## Verification
+| Plan | Phase |
+|------|-------|
+| [phase_2.01_extraction_prep.plan.md](../.cursor/plans/RAG/phase_2.01_extraction_prep.plan.md) | 2.01 Extraction model prep (SHIP) |
 
-```bash
-docker compose exec -e IN_WORKER_EXEC=1 api-worker python -m pytest \
-  tests/test_chunking.py tests/test_fusion.py tests/test_hybrid_benchmark.py \
-  tests/test_search_schemas.py tests/test_hybrid_integration.py -q
-```
+## Rules
 
-Manual E2E: `tasks/CP-C-E2E.md`
+- **BUILD** reads only the plan linked above (via this pointer).
+- `.cursor/plans/` files **without** a row here are archives — not active spec.
+- Spec canon remains `Download/RAG Workflow template/` on conflict.
+- **Step 1** in active plan is Docker/infra — developer runs `docker compose build api-worker` (not agent).
 
-Benchmark ingest (optional, run when GPU idle):
+## Historical
 
-```bash
-docker compose exec -e ALLOW_BENCHMARK_INGEST=1 api-worker python scripts/ingest_benchmark_fixture.py
-```
+| Plan | Phase |
+|------|-------|
+| [phase_2_graphrag_memory_20260712.plan.md](../.cursor/plans/RAG/phase_2_graphrag_memory_20260712.plan.md) | 2.0 GraphRAG + Memory (SHIP) |
+| [phase_2_spec_rewrite_20260712.plan.md](../.cursor/plans/RAG/phase_2_spec_rewrite_20260712.plan.md) | DEFINE (spec + Outcome Gates design) |

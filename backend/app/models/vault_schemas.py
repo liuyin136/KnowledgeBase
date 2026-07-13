@@ -121,6 +121,59 @@ class ReindexResponse(BaseModel):
     ingest_job_id: str
 
 
+class IngestPreviewRequest(BaseModel):
+    file_ids: list[str] = Field(min_length=1)
+
+
+class IngestPreviewItem(BaseModel):
+    file_id: str
+    relative_path: str
+    estimated_tokens: int
+    ingestible: bool
+    block_reason: str | None = None
+
+
+class IngestPreviewResponse(BaseModel):
+    items: list[IngestPreviewItem]
+    total_estimated_tokens: int
+    file_count: int
+
+
+class BatchIngestRequest(BaseModel):
+    file_ids: list[str] = Field(min_length=1)
+
+
+class BatchIngestSkippedItem(BaseModel):
+    file_id: str
+    reason: str
+
+
+class BatchIngestResponse(BaseModel):
+    batch_id: str
+    queued: list[str]
+    skipped: list[BatchIngestSkippedItem]
+
+
+class ClearIndexResponse(BaseModel):
+    file_id: str
+    relative_path: str
+    index_status: IndexStatus
+
+
+class MigrateV16JobEntry(BaseModel):
+    file_id: str
+    relative_path: str
+    ingest_job_id: str
+
+
+class MigrateV16Response(BaseModel):
+    total_files: int
+    job_ids: list[MigrateV16JobEntry]
+    dry_run: bool = False
+    neo4j_stats: dict[str, int] = Field(default_factory=dict)
+    redis_keys_deleted: int = 0
+
+
 class UploadResponse(BaseModel):
     file: VaultFile
     ingest_job_id: str | None = None
@@ -163,6 +216,7 @@ class FileListQuery(BaseModel):
     folder_id: str | None = None
     keyword: str | None = None
     index_status: IndexStatus | None = None
+    search_content: bool = False
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=10)
 

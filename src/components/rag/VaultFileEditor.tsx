@@ -6,13 +6,16 @@ import { useCallback, useEffect, useState } from "react";
 import {
   getVaultFileByPath,
   getVaultFileContent,
+  ingestVaultFile,
   languageFromPath,
+  previewIngest,
   saveVaultFileContent,
   type VaultFile,
 } from "@/lib/api/vault";
 import { pollJobUntilDone } from "@/lib/api/jobs";
 import type { IngestPhase, IngestPhaseName } from "@/lib/api/ingest";
-import { IngestWorkflowLog } from "@/components/rag/IngestWorkflowLog";
+import { IngestConfirmDialog } from "@/components/rag/IngestConfirmDialog";
+import { IngestProgressModal } from "@/components/rag/IngestProgressModal";
 import { VaultMarkdownPreview } from "@/components/rag/VaultMarkdownPreview";
 import { VaultStatusBadge } from "@/components/rag/VaultStatusBadge";
 
@@ -36,6 +39,12 @@ export function VaultFileEditor({ relativePath }: { relativePath: string }) {
   const [ingestLog, setIngestLog] = useState<IngestPhase[] | null>(null);
   const [ingestActivePhase, setIngestActivePhase] = useState<IngestPhaseName | null>(null);
   const [ingesting, setIngesting] = useState(false);
+  const [progressOpen, setProgressOpen] = useState(false);
+  const [ingestConfirmOpen, setIngestConfirmOpen] = useState(false);
+  const [ingestPreview, setIngestPreview] = useState<Awaited<
+    ReturnType<typeof previewIngest>
+  > | null>(null);
+  const [confirmingIngest, setConfirmingIngest] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -62,6 +71,36 @@ export function VaultFileEditor({ relativePath }: { relativePath: string }) {
     load();
   }, [load]);
 
+  async function pollIngestJob(jobId: string) {
+    setIngesting(true);
+    setProgressOpen(true);
+    setIngestLog([]);
+    setIngestActivePhase("front_matter");
+    try {
+      const job = await pollJobUntilDone(jobId, {
+        timeoutMs: 300_000,
+        onProgress: (status) => {
+          const prog = status.ingest_progress;
+          if (prog) {
+            setIngestLog(prog.workflow_log);
+            setIngestActivePhase(prog.active_phase);
+          }
+        },
+      });
+      if (job.status === "failed") {
+        throw new Error(job.error || "Ingest job failed");
+      }
+      const prog = job.ingest_progress;
+      if (prog) {
+        setIngestLog(prog.workflow_log);
+        setIngestActivePhase(null);
+      }
+      await load();
+    } finally {
+      setIngesting(false);
+    }
+  }
+
   async function handleSave() {
     if (!file) return;
     if (!file.mutable || file.ingest_locked) {
@@ -69,9 +108,6 @@ export function VaultFileEditor({ relativePath }: { relativePath: string }) {
       return;
     }
     setSaving(true);
-    setIngesting(true);
-    setIngestLog([]);
-    setIngestActivePhase("ast_split");
     setError(null);
     setToast(null);
     try {
@@ -80,32 +116,39 @@ export function VaultFileEditor({ relativePath }: { relativePath: string }) {
       setDirty(false);
       setFile(res.file);
       if (res.ingest_job_id) {
-        const job = await pollJobUntilDone(res.ingest_job_id, {
-          timeoutMs: 300_000,
-          onProgress: (status) => {
-            const prog = status.ingest_progress;
-            if (prog) {
-              setIngestLog(prog.workflow_log);
-              setIngestActivePhase(prog.active_phase);
-            }
-          },
-        });
-        if (job.status === "failed") {
-          throw new Error(job.error || "Ingest job failed");
-        }
-        const prog = job.ingest_progress;
-        if (prog) {
-          setIngestLog(prog.workflow_log);
-          setIngestActivePhase(null);
-        }
+        setToast("Saved. Re-indexing after save…");
+        await pollIngestJob(res.ingest_job_id);
+        setToast("Saved and re-indexed.");
+      } else {
+        setToast("Saved.");
       }
-      setToast("Saved and re-indexed.");
-      await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to save");
     } finally {
       setSaving(false);
-      setIngesting(false);
+    }
+  }
+
+  async function openIngestConfirm() {
+    if (!file) return;
+    setError(null);
+    const preview = await previewIngest([file.id]);
+    setIngestPreview(preview);
+    setIngestConfirmOpen(true);
+  }
+
+  async function handleConfirmIngest() {
+    if (!file) return;
+    setConfirmingIngest(true);
+    setIngestConfirmOpen(false);
+    try {
+      const res = await ingestVaultFile(file.id);
+      await pollIngestJob(res.ingest_job_id);
+      setToast("Ingest complete.");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Ingest failed");
+    } finally {
+      setConfirmingIngest(false);
     }
   }
 
@@ -113,6 +156,11 @@ export function VaultFileEditor({ relativePath }: { relativePath: string }) {
 
   const locked = !!(file?.ingest_locked || file?.index_status === "pending");
   const readOnly = !file?.mutable || locked;
+  const showIngest =
+    file &&
+    !locked &&
+    (file.index_status === "not_indexed" || file.index_status === "error");
+  const indexedSave = file?.index_status === "indexed";
 
   return (
     <>
@@ -122,14 +170,31 @@ export function VaultFileEditor({ relativePath }: { relativePath: string }) {
         </Link>
         <div>{relativePath}</div>
         {file && <VaultStatusBadge status={file.index_status} />}
-        <button
-          type="button"
-          className="rag-button"
-          onClick={handleSave}
-          disabled={saving || !dirty || readOnly}
-        >
-          {saving ? "Saving..." : readOnly ? "Read-only" : "Save & Re-ingest"}
-        </button>
+        <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+          <button
+            type="button"
+            className="rag-button"
+            onClick={handleSave}
+            disabled={saving || ingesting || !dirty || readOnly}
+          >
+            {saving ? "Saving..." : readOnly ? "Read-only" : "Save"}
+          </button>
+          {showIngest ? (
+            <button
+              type="button"
+              className="rag-button"
+              disabled={saving || ingesting || confirmingIngest}
+              onClick={openIngestConfirm}
+            >
+              Ingest
+            </button>
+          ) : null}
+        </div>
+        {indexedSave && dirty && (
+          <p className="rag-muted" style={{ marginTop: "0.5rem" }}>
+            Saving an indexed file will automatically re-ingest.
+          </p>
+        )}
       </div>
       <div className="vault-editor-tabs" role="tablist" aria-label="Editor mode">
         <button
@@ -153,14 +218,22 @@ export function VaultFileEditor({ relativePath }: { relativePath: string }) {
       </div>
       {error && <div className="rag-error">{error}</div>}
       {toast && <div className="rag-toast">{toast}</div>}
-      {(ingesting || (ingestLog && ingestLog.length > 0)) && (
-        <IngestWorkflowLog
-          workflowLog={ingestLog}
-          activePhase={ingestActivePhase}
-          loading={ingesting}
-          relativePath={relativePath}
-        />
-      )}
+      <IngestConfirmDialog
+        open={ingestConfirmOpen}
+        preview={ingestPreview}
+        confirming={confirmingIngest}
+        onConfirm={handleConfirmIngest}
+        onClose={() => setIngestConfirmOpen(false)}
+      />
+      <IngestProgressModal
+        open={progressOpen}
+        title={indexedSave ? "Re-indexing after save" : "Ingest progress"}
+        relativePath={relativePath}
+        workflowLog={ingestLog}
+        activePhase={ingestActivePhase}
+        loading={ingesting}
+        onClose={() => !ingesting && setProgressOpen(false)}
+      />
       {tab === "source" ? (
         <div style={{ border: "1px solid var(--cp-border)" }}>
           <MonacoEditor

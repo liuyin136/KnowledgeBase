@@ -109,3 +109,20 @@ def release_reranker(reranker: Any) -> None:
     del reranker
     gc.collect()
     _release_slot("jina-reranker")
+
+
+def reset_gpu_slot() -> str | None:
+    """Clear stale slot tracking and run GC before loading another model family."""
+    global _active_slot
+    previous = _active_slot
+    _active_slot = None
+    gc.collect()
+    return previous
+
+
+def acquire_gpu_slot(name: str) -> None:
+    _acquire_slot(name)
+
+
+def release_gpu_slot(name: str) -> None:
+    _release_slot(name)

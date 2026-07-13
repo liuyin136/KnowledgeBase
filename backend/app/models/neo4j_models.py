@@ -36,6 +36,21 @@ class KnowledgeChunk:
 
 
 @dataclass
+class KnowledgeFamily:
+    id: str
+    family_index: int
+    content: str
+    content_hash: str
+    source_file: str
+    token_count: int
+    vector: list[float] = field(default_factory=list)
+    vector_coarse_256: list[float] = field(default_factory=list)
+    vector_coarse_512: list[float] = field(default_factory=list)
+    embedding_model: str = "jina-v5-omni-retrieval-gguf"
+    indexed_at: datetime | None = None
+
+
+@dataclass
 class KnowledgeParent:
     id: str
     parent_index: int
@@ -44,6 +59,12 @@ class KnowledgeParent:
     header_path: str
     source_file: str
     token_count: int
+    family_id: str = ""
+    vector: list[float] = field(default_factory=list)
+    vector_coarse_256: list[float] = field(default_factory=list)
+    vector_coarse_512: list[float] = field(default_factory=list)
+    embedding_model: str = "jina-v5-omni-retrieval-gguf"
+    indexed_at: datetime | None = None
 
 
 @dataclass
@@ -55,6 +76,7 @@ class KnowledgeChild:
     content_hash: str
     token_count: int
     source_file: str
+    block_type: str = "paragraph"
     vector: list[float] = field(default_factory=list)
     vector_coarse_256: list[float] = field(default_factory=list)
     vector_coarse_512: list[float] = field(default_factory=list)
@@ -70,6 +92,13 @@ class KnowledgeGrandchild:
     grandchild_index: int
     content: str
     source_file: str
+    content_hash: str = ""
+    token_count: int = 0
+    vector: list[float] = field(default_factory=list)
+    vector_coarse_256: list[float] = field(default_factory=list)
+    vector_coarse_512: list[float] = field(default_factory=list)
+    embedding_model: str = "jina-v5-omni-retrieval-gguf"
+    indexed_at: datetime | None = None
 
 
 @dataclass

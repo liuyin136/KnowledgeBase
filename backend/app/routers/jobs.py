@@ -55,6 +55,32 @@ def _rerank_preview_from_result(result: dict) -> RerankPreviewMeta | None:
     )
 
 
+def _is_ingest_job_result(result: dict) -> bool:
+    """Finished ingest jobs carry relative_path; search jobs carry fusion_meta."""
+    if "fusion_meta" in result or result.get("status") == "awaiting_rerank":
+        return False
+    if result.get("relative_path") is None:
+        return False
+    phases = [p.get("phase") for p in (result.get("workflow_log") or []) if isinstance(p, dict)]
+    if not phases:
+        return False
+    ingest_markers = {
+        "front_matter",
+        "family_split",
+        "parent_split",
+        "child_split",
+        "grandchild_split",
+        "embed_family",
+        "embed_parent",
+        "embed_child",
+        "embed_grandchild",
+        "neo4j_upsert",
+        "ast_split",
+        "embed_children",
+    }
+    return any(p in ingest_markers for p in phases)
+
+
 @router.get("/{job_id}")
 def get_job_status(job_id: str) -> dict:
     try:
@@ -99,6 +125,14 @@ def get_job_status(job_id: str) -> dict:
                     active_phase=ingest_raw.get("active_phase"),
                     relative_path=ingest_raw.get("relative_path"),
                 ).model_dump()
+    elif mapped == "finished" and isinstance(result, dict) and result.get("workflow_log"):
+        if _is_ingest_job_result(result):
+            ingest_log = [IngestPhase(**p) for p in result["workflow_log"]]
+            payload["ingest_progress"] = IngestProgress(
+                workflow_log=ingest_log,
+                active_phase=None,
+                relative_path=result.get("relative_path"),
+            ).model_dump()
     if isinstance(result, dict) and result_status == "awaiting_rerank":
         preview = _rerank_preview_from_result(result)
         if preview:

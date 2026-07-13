@@ -23,13 +23,13 @@ import {
   type SearchScopeValue,
 } from "@/components/rag/SearchScopeFilters";
 import { SearchWorkflowLog } from "@/components/rag/SearchWorkflowLog";
+import { saveMemorySearchSession } from "@/lib/api/memorySession";
 
 function scopeIsActive(scope: SearchScopeValue): boolean {
   return (
     scope.folderIds.length > 0 ||
     Boolean(scope.createdAfter) ||
-    Boolean(scope.createdBefore) ||
-    !scope.indexedOnly
+    Boolean(scope.createdBefore)
   );
 }
 
@@ -38,7 +38,6 @@ function scopeToRequest(scope: SearchScopeValue): Partial<SearchRequest> {
   if (scope.folderIds.length > 0) payload.folder_ids = scope.folderIds;
   if (scope.createdAfter) payload.created_after = scope.createdAfter;
   if (scope.createdBefore) payload.created_before = scope.createdBefore;
-  if (!scope.indexedOnly) payload.indexed_only = false;
   return payload;
 }
 
@@ -76,7 +75,6 @@ export default function RagSearchPage() {
   const [awaitingRerank, setAwaitingRerank] = useState(false);
   const [rerankPreview, setRerankPreview] = useState<RerankPreviewMeta | null>(null);
   const [confirmingRerank, setConfirmingRerank] = useState(false);
-  const [showRerankScores, setShowRerankScores] = useState(false);
 
   useEffect(() => {
     listFolders()
@@ -93,21 +91,40 @@ export default function RagSearchPage() {
     if (progress.span_id) setSpanId(progress.span_id);
   }
 
-  function applySearchResult(result: {
-    hits?: SearchHit[];
-    workflow_log?: WorkflowPhase[] | null;
-    fusion_meta?: FusionMeta | null;
-    span_id?: string | null;
-    cached?: boolean;
-    withRerank?: boolean;
-  }) {
+  function applySearchResult(
+    result: {
+      hits?: SearchHit[];
+      workflow_log?: WorkflowPhase[] | null;
+      fusion_meta?: FusionMeta | null;
+      span_id?: string | null;
+      cached?: boolean;
+      withRerank?: boolean;
+    },
+    sessionId?: string | null
+  ) {
     setHits(result.hits ?? []);
     setWorkflowLog(result.workflow_log ?? null);
     setFusionMeta(result.fusion_meta ?? null);
     if (result.span_id) setSpanId(result.span_id);
     if (result.cached !== undefined) setCached(result.cached);
-    setShowRerankScores(result.withRerank ?? false);
     setActivePhase(null);
+
+    const hitList = result.hits ?? [];
+    if (hitList.length > 0 && query.trim()) {
+      const sid =
+        sessionId ||
+        fusionJobId ||
+        (typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `session-${Date.now()}`);
+      saveMemorySearchSession({
+        query: query.trim(),
+        hits: hitList,
+        span_id: result.span_id ?? spanId,
+        session_id: sid,
+        saved_at: new Date().toISOString(),
+      });
+    }
   }
 
   async function onSubmit(e: React.FormEvent) {
@@ -126,7 +143,6 @@ export default function RagSearchPage() {
     setFusionJobId(null);
     setAwaitingRerank(false);
     setRerankPreview(null);
-    setShowRerankScores(false);
     try {
       const res = await searchDocuments({
         query: query.trim(),
@@ -170,26 +186,32 @@ export default function RagSearchPage() {
       }
       const result = job.result;
       if (job.status === "awaiting_rerank" && result) {
-        applySearchResult({
-          hits: result.hits,
-          workflow_log: result.workflow_log,
-          fusion_meta: result.fusion_meta,
-          span_id: result.span_id,
-          cached: false,
-          withRerank: false,
-        });
+        applySearchResult(
+          {
+            hits: result.hits,
+            workflow_log: result.workflow_log,
+            fusion_meta: result.fusion_meta,
+            span_id: result.span_id,
+            cached: false,
+            withRerank: false,
+          },
+          res.job_id
+        );
         setAwaitingRerank(true);
         setRerankPreview(previewFromJob(job.rerank_preview, result));
         return;
       }
-      applySearchResult({
-        hits: result?.hits,
-        workflow_log: result?.workflow_log,
-        fusion_meta: result?.fusion_meta,
-        span_id: result?.span_id,
-        cached: false,
-        withRerank: Boolean(result?.workflow_log?.some((p) => p.phase === "rerank")),
-      });
+      applySearchResult(
+        {
+          hits: result?.hits,
+          workflow_log: result?.workflow_log,
+          fusion_meta: result?.fusion_meta,
+          span_id: result?.span_id,
+          cached: false,
+          withRerank: Boolean(result?.workflow_log?.some((p) => p.phase === "rerank")),
+        },
+        res.job_id
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Search failed");
     } finally {
@@ -217,14 +239,17 @@ export default function RagSearchPage() {
         throw new Error(rerankJob.error || "Rerank job failed");
       }
       const result = rerankJob.result;
-      applySearchResult({
-        hits: result?.hits,
-        workflow_log: result?.workflow_log,
-        fusion_meta: result?.fusion_meta,
-        span_id: result?.span_id ?? confirmRes.span_id ?? undefined,
-        cached: false,
-        withRerank: true,
-      });
+      applySearchResult(
+        {
+          hits: result?.hits,
+          workflow_log: result?.workflow_log,
+          fusion_meta: result?.fusion_meta,
+          span_id: result?.span_id ?? confirmRes.span_id ?? undefined,
+          cached: false,
+          withRerank: true,
+        },
+        fusionJobId
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Rerank failed");
     } finally {
@@ -296,7 +321,7 @@ export default function RagSearchPage() {
       {workflowLoading ? (
         <SearchSkeleton />
       ) : (
-        <SearchResults hits={hits} cached={cached} showRerankScores={showRerankScores} />
+        <SearchResults hits={hits} cached={cached} />
       )}
 
       <RerankConfirmDialog

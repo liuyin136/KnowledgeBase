@@ -8,7 +8,6 @@ import {
   type CreateLogRequest,
   createLog,
 } from "@/lib/api/files";
-import { pollJobUntilDone } from "@/lib/api/jobs";
 
 const FIELD_CONFIG: Record<
   Category,
@@ -53,14 +52,8 @@ export function LogCreateForm() {
     setError(null);
     setToast(null);
     try {
-      const res = await createLog({ category, title: title.trim(), ...fields });
-      if (res.ingest_job_id) {
-        const job = await pollJobUntilDone(res.ingest_job_id, { timeoutMs: 300_000 });
-        if (job.status === "failed") {
-          throw new Error(job.error || "Ingest job failed");
-        }
-      }
-      setToast("Document created and indexed.");
+      await createLog({ category, title: title.trim(), ...fields });
+      setToast("Document created. Use Ingest in the library to index for search.");
       router.push("/rag/library");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create document");
@@ -114,7 +107,7 @@ export function LogCreateForm() {
       {error && <div className="rag-error">{error}</div>}
       {toast && <div className="rag-toast">{toast}</div>}
       <button type="submit" className="rag-button" disabled={!category || submitting} style={{ marginTop: "1rem" }}>
-        {submitting ? "Creating..." : "Create & Ingest"}
+        {submitting ? "Creating..." : "Create"}
       </button>
     </form>
   );

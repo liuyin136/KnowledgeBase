@@ -3,20 +3,45 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   batchDeleteVaultFiles,
+  batchIngestVaultFiles,
+  clearVaultIndex,
+  getBatchStatus,
+  ingestVaultFile,
   listFolders,
   listVaultFiles,
-  reindexVaultFile,
+  migrateVaultV16,
+  previewIngest,
   syncVault,
   type VaultFile,
   type VaultFolder,
 } from "@/lib/api/vault";
+import { pollJobUntilDone } from "@/lib/api/jobs";
+import type { IngestPhase, IngestPhaseName } from "@/lib/api/ingest";
+import { IngestConfirmDialog } from "@/components/rag/IngestConfirmDialog";
+import { IngestProgressModal } from "@/components/rag/IngestProgressModal";
 import { VaultFolderTree } from "@/components/rag/VaultFolderTree";
 import { VaultFileList } from "@/components/rag/VaultFileList";
 import { VaultUploadPanel } from "@/components/rag/VaultUploadPanel";
-import { pollJobUntilDone } from "@/lib/api/jobs";
-import type { IngestPhase, IngestPhaseName } from "@/lib/api/ingest";
-import { IngestWorkflowLog } from "@/components/rag/IngestWorkflowLog";
 import { LibrarySkeleton } from "@/components/rag/LibraryList";
+
+function deleteConfirmMessage(selectedFiles: VaultFile[]): string {
+  const indexed = selectedFiles.filter(
+    (f) => f.index_status === "indexed" || f.index_status === "error"
+  ).length;
+  const notIndexed = selectedFiles.filter((f) => f.index_status === "not_indexed").length;
+  const parts = [`Delete ${selectedFiles.length} file(s)?`];
+  if (indexed) {
+    parts.push(
+      `${indexed} indexed file(s) will also remove their Neo4j index.`
+    );
+  }
+  if (notIndexed) {
+    parts.push(
+      `${notIndexed} not-indexed file(s) will remove disk + metadata only.`
+    );
+  }
+  return parts.join(" ");
+}
 
 export default function RagLibraryPage() {
   const [folders, setFolders] = useState<VaultFolder[]>([]);
@@ -33,7 +58,16 @@ export default function RagLibraryPage() {
   const [toast, setToast] = useState<string | null>(null);
   const [ingestLog, setIngestLog] = useState<IngestPhase[] | null>(null);
   const [ingestActivePhase, setIngestActivePhase] = useState<IngestPhaseName | null>(null);
+  const [ingestRelativePath, setIngestRelativePath] = useState<string | null>(null);
   const [ingesting, setIngesting] = useState(false);
+  const [progressOpen, setProgressOpen] = useState(false);
+  const [migrating, setMigrating] = useState(false);
+  const [ingestConfirmOpen, setIngestConfirmOpen] = useState(false);
+  const [ingestPreview, setIngestPreview] = useState<Awaited<
+    ReturnType<typeof previewIngest>
+  > | null>(null);
+  const [pendingIngestIds, setPendingIngestIds] = useState<string[]>([]);
+  const [confirmingIngest, setConfirmingIngest] = useState(false);
 
   const loadFolders = useCallback(async () => {
     const list = await listFolders();
@@ -47,6 +81,7 @@ export default function RagLibraryPage() {
       const res = await listVaultFiles({
         folder_id: folderId || undefined,
         keyword: keyword || undefined,
+        search_content: Boolean(keyword),
         page,
         page_size: pageSize,
       });
@@ -69,6 +104,97 @@ export default function RagLibraryPage() {
     loadFiles();
   }, [loadFiles]);
 
+  async function pollIngestJob(jobId: string, relativePath: string | null) {
+    const job = await pollJobUntilDone(jobId, {
+      timeoutMs: 600_000,
+      onProgress: (status) => {
+        const prog = status.ingest_progress;
+        if (prog) {
+          setIngestLog(prog.workflow_log);
+          setIngestActivePhase(prog.active_phase);
+          if (prog.relative_path) setIngestRelativePath(prog.relative_path);
+        }
+      },
+    });
+    if (job.status === "failed") {
+      throw new Error(job.error || `Ingest failed for ${relativePath ?? jobId}`);
+    }
+    const finalProg = job.ingest_progress;
+    if (finalProg) {
+      setIngestLog(finalProg.workflow_log);
+      setIngestActivePhase(null);
+    }
+  }
+
+  async function runSequentialIngest(fileIds: string[]) {
+    setIngesting(true);
+    setProgressOpen(true);
+    setIngestLog([]);
+    setIngestActivePhase("front_matter");
+    setError(null);
+    try {
+      const batch = await batchIngestVaultFiles(fileIds);
+      if (batch.skipped.length) {
+        setToast(
+          `Skipped ${batch.skipped.length} file(s): ${batch.skipped.map((s) => s.reason).join("; ")}`
+        );
+      }
+      const status = await getBatchStatus(batch.batch_id);
+      for (const entry of status.files) {
+        if (!entry.job_id) continue;
+        const row = files.find((f) => f.id === entry.file_id);
+        setIngestRelativePath(row?.relative_path ?? entry.filename);
+        setIngestLog([]);
+        setIngestActivePhase("front_matter");
+        await pollIngestJob(entry.job_id, row?.relative_path ?? entry.filename);
+        await loadFiles();
+      }
+      setToast(`Ingest complete for ${batch.queued.length} file(s).`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Ingest failed");
+    } finally {
+      setIngesting(false);
+    }
+  }
+
+  async function openIngestConfirm(ids: string[]) {
+    if (!ids.length) return;
+    setError(null);
+    const preview = await previewIngest(ids);
+    setIngestPreview(preview);
+    setPendingIngestIds(ids);
+    setIngestConfirmOpen(true);
+  }
+
+  async function onConfirmIngest() {
+    setConfirmingIngest(true);
+    setIngestConfirmOpen(false);
+    try {
+      const ingestible = ingestPreview?.items.filter((i) => i.ingestible).map((i) => i.file_id) ?? [];
+      const ids = pendingIngestIds.filter((id) => ingestible.includes(id));
+      if (ids.length === 1) {
+        setIngesting(true);
+        setProgressOpen(true);
+        setIngestLog([]);
+        setIngestActivePhase("front_matter");
+        const res = await ingestVaultFile(ids[0]);
+        setIngestRelativePath(res.relative_path);
+        await pollIngestJob(res.ingest_job_id, res.relative_path);
+        setToast("Ingest complete.");
+        await loadFiles();
+        setIngesting(false);
+      } else {
+        await runSequentialIngest(ids);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Ingest failed");
+      setIngesting(false);
+    } finally {
+      setConfirmingIngest(false);
+      setPendingIngestIds([]);
+    }
+  }
+
   async function onRescan() {
     setToast(null);
     setError(null);
@@ -86,9 +212,8 @@ export default function RagLibraryPage() {
 
   async function onBulkDelete() {
     if (selected.size === 0) return;
-    if (!window.confirm(
-      `Delete ${selected.size} file(s)? This removes the file on disk, SQLite metadata, and Neo4j index.`
-    )) return;
+    const selectedFiles = files.filter((f) => selected.has(f.id));
+    if (!window.confirm(deleteConfirmMessage(selectedFiles))) return;
     setError(null);
     try {
       const result = await batchDeleteVaultFiles([...selected]);
@@ -102,37 +227,93 @@ export default function RagLibraryPage() {
     }
   }
 
-  async function onReindex(id: string) {
-    setIngesting(true);
-    setIngestLog([]);
-    setIngestActivePhase("ast_split");
+  async function onClearIndex(id: string) {
+    const row = files.find((f) => f.id === id);
+    if (!row) return;
+    if (
+      !window.confirm(
+        `Clear index for ${row.relative_path}? The file stays on disk; search will no longer include it until re-ingested.`
+      )
+    ) {
+      return;
+    }
     setError(null);
     try {
-      const res = await reindexVaultFile(id);
-      if (res.ingest_job_id) {
-        const job = await pollJobUntilDone(res.ingest_job_id, {
-          timeoutMs: 300_000,
-          onProgress: (status) => {
-            const prog = status.ingest_progress;
-            if (prog) {
-              setIngestLog(prog.workflow_log);
-              setIngestActivePhase(prog.active_phase);
-            }
-          },
-        });
-        if (job.status === "failed") {
-          throw new Error(job.error || "Reindex failed");
-        }
-      }
-      setToast("Reindex complete.");
+      await clearVaultIndex(id);
+      setToast("Index cleared.");
       await loadFiles();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Reindex failed");
-    } finally {
-      setIngesting(false);
-      setIngestActivePhase(null);
+      setError(e instanceof Error ? e.message : "Clear index failed");
     }
   }
+
+  async function onBulkClearIndex() {
+    const indexed = files.filter(
+      (f) =>
+        selected.has(f.id) &&
+        (f.index_status === "indexed" || f.index_status === "error")
+    );
+    if (!indexed.length) {
+      setError("Select indexed file(s) to clear.");
+      return;
+    }
+    if (
+      !window.confirm(
+        `Clear index for ${indexed.length} file(s)? Files remain on disk; use Ingest to re-index.`
+      )
+    ) {
+      return;
+    }
+    setError(null);
+    let failed = 0;
+    for (const f of indexed) {
+      try {
+        await clearVaultIndex(f.id);
+      } catch {
+        failed += 1;
+      }
+    }
+    setToast(
+      failed
+        ? `Cleared ${indexed.length - failed} file(s); ${failed} failed.`
+        : `Cleared index for ${indexed.length} file(s).`
+    );
+    await loadFiles();
+  }
+
+  async function onMigrateAll() {
+    if (
+      !window.confirm(
+        "Migrate All will purge Neo4j ingestion data, clear search caches, " +
+          "reset vault index status to not_indexed, and resync files. " +
+          "You must run bulk Ingest afterward. Continue?"
+      )
+    ) {
+      return;
+    }
+    setMigrating(true);
+    setError(null);
+    setToast(null);
+    try {
+      const migration = await migrateVaultV16();
+      setToast(
+        `Migration complete: ${migration.total_files} file(s) set to not_indexed. ` +
+          "Use Ingest selected to re-index."
+      );
+      await loadFolders();
+      await loadFiles();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Migration failed");
+    } finally {
+      setMigrating(false);
+    }
+  }
+
+  const selectedIndexed = files.filter(
+    (f) =>
+      selected.has(f.id) &&
+      (f.index_status === "indexed" || f.index_status === "error")
+  ).length;
 
   return (
     <>
@@ -142,20 +323,44 @@ export default function RagLibraryPage() {
       </div>
 
       <div style={{ display: "flex", gap: "0.5rem", marginBottom: "1rem", flexWrap: "wrap" }}>
-        <button type="button" className="rag-button" onClick={onRescan}>
+        <button type="button" className="rag-button" onClick={onRescan} disabled={migrating || ingesting}>
           Rescan
         </button>
         <button
           type="button"
           className="rag-button"
-          disabled={selected.size === 0}
+          disabled={migrating || ingesting}
+          onClick={onMigrateAll}
+        >
+          Migrate All
+        </button>
+        <button
+          type="button"
+          className="rag-button"
+          disabled={selected.size === 0 || migrating || ingesting}
+          onClick={() => openIngestConfirm([...selected])}
+        >
+          Ingest selected ({selected.size})
+        </button>
+        <button
+          type="button"
+          className="rag-button"
+          disabled={selectedIndexed === 0 || migrating || ingesting}
+          onClick={onBulkClearIndex}
+        >
+          Clear index ({selectedIndexed})
+        </button>
+        <button
+          type="button"
+          className="rag-button"
+          disabled={selected.size === 0 || migrating || ingesting}
           onClick={onBulkDelete}
         >
           Delete selected ({selected.size})
         </button>
         <input
           className="rag-input"
-          placeholder="Filter filename"
+          placeholder="Filter filename or content"
           value={keyword}
           onChange={(e) => {
             setPage(1);
@@ -166,13 +371,26 @@ export default function RagLibraryPage() {
 
       {toast && <div className="rag-toast">{toast}</div>}
       {error && <div className="rag-error">{error}</div>}
-      {(ingesting || (ingestLog && ingestLog.length > 0)) && (
-        <IngestWorkflowLog
-          workflowLog={ingestLog}
-          activePhase={ingestActivePhase}
-          loading={ingesting}
-        />
-      )}
+
+      <IngestConfirmDialog
+        open={ingestConfirmOpen}
+        preview={ingestPreview}
+        confirming={confirmingIngest}
+        onConfirm={onConfirmIngest}
+        onClose={() => {
+          setIngestConfirmOpen(false);
+          setPendingIngestIds([]);
+        }}
+      />
+      <IngestProgressModal
+        open={progressOpen}
+        title="Ingest progress"
+        relativePath={ingestRelativePath}
+        workflowLog={ingestLog}
+        activePhase={ingestActivePhase}
+        loading={ingesting}
+        onClose={() => !ingesting && setProgressOpen(false)}
+      />
 
       <div
         className="vault-library-grid"
@@ -225,7 +443,9 @@ export default function RagLibraryPage() {
                   setSelected(new Set(files.map((f) => f.id)));
                 }
               }}
-              onReindex={onReindex}
+              onIngest={(id) => openIngestConfirm([id])}
+              onClearIndex={onClearIndex}
+              globalMigrating={migrating}
               page={page}
               pageSize={pageSize}
               total={total}

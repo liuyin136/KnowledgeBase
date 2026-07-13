@@ -18,11 +18,15 @@ from app.services.vault_store import (
 logger = get_logger("rag.vault.sync")
 
 
+def _purge_neo4j_ingestion(source_file: str) -> dict[str, int]:
+    from app.services.neo4j_client import get_neo4j_client
+
+    return get_neo4j_client().delete_ingestion_tree_for_source(source_file)
+
+
 def _purge_neo4j(source_file: str) -> None:
     try:
-        from app.services.neo4j_client import get_neo4j_client
-
-        get_neo4j_client().delete_knowledge_by_source(source_file)
+        _purge_neo4j_ingestion(source_file)
     except Exception as exc:
         logger.warning("neo4j_purge_failed", source_file=source_file, error=str(exc))
 

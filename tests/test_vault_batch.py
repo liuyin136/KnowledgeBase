@@ -33,20 +33,23 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
 def test_batch_delete_partial_lock(client: TestClient) -> None:
     folder = client.post("/api/v1/rag/vault/folders", json={"name": "News"}).json()
-    with patch("app.routers.vault.enqueue_vault_ingest", return_value="job-x"):
-        a = client.post(
-            "/api/v1/rag/vault/files",
-            json={"folder_id": folder["id"], "filename": "a.md", "content": "a"},
-        ).json()["file"]
-        b = client.post(
-            "/api/v1/rag/vault/files",
-            json={"folder_id": folder["id"], "filename": "b.md", "content": "b"},
-        ).json()["file"]
+    a = client.post(
+        "/api/v1/rag/vault/files",
+        json={"folder_id": folder["id"], "filename": "a.md", "content": "a"},
+    ).json()["file"]
+    b = client.post(
+        "/api/v1/rag/vault/files",
+        json={"folder_id": folder["id"], "filename": "b.md", "content": "b"},
+    ).json()["file"]
 
+    vault_db.update_file_fields(a["id"], index_status="indexed", chunk_count=1)
     vault_db.update_file_fields(b["id"], ingest_lock_job_id="lock-1", index_status="pending")
 
     with patch("app.services.neo4j_client.get_neo4j_client") as mock_get:
-        mock_get.return_value.delete_knowledge_by_source.return_value = 0
+        mock_get.return_value.delete_ingestion_tree_for_source.return_value = {
+            "grandchildren_deleted": 1,
+            "knowledge_deleted": 1,
+        }
         res = client.request(
             "DELETE",
             "/api/v1/rag/vault/files/batch",
@@ -58,3 +61,24 @@ def test_batch_delete_partial_lock(client: TestClient) -> None:
     assert results[a["id"]]["ok"] is True
     assert results[b["id"]]["ok"] is False
     assert results[b["id"]]["error"]
+    mock_get.return_value.delete_ingestion_tree_for_source.assert_called_once_with(a["relative_path"])
+
+
+def test_delete_not_indexed_skips_neo4j(client: TestClient) -> None:
+    folder = client.post("/api/v1/rag/vault/folders", json={"name": "Del"}).json()
+    created = client.post(
+        "/api/v1/rag/vault/files",
+        json={"folder_id": folder["id"], "filename": "a.md", "content": "a"},
+    ).json()["file"]
+    assert created["index_status"] == "not_indexed"
+
+    with patch("app.services.neo4j_client.get_neo4j_client") as mock_get:
+        res = client.request(
+            "DELETE",
+            "/api/v1/rag/vault/files/batch",
+            json={"file_ids": [created["id"]]},
+        )
+
+    assert res.status_code == 200
+    assert res.json()["results"][0]["ok"] is True
+    mock_get.return_value.delete_ingestion_tree_for_source.assert_not_called()

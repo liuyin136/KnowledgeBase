@@ -1,18 +1,28 @@
 import type { IngestPhase, IngestPhaseName } from "@/lib/api/ingest";
 
 const PHASE_ORDER: IngestPhaseName[] = [
-  "ast_split",
+  "front_matter",
+  "family_split",
+  "parent_split",
   "child_split",
   "grandchild_split",
-  "embed_children",
+  "embed_family",
+  "embed_parent",
+  "embed_child",
+  "embed_grandchild",
   "neo4j_upsert",
 ];
 
 const PHASE_LABELS: Record<IngestPhaseName, string> = {
-  ast_split: "AST parent split",
-  child_split: "Child paragraphs",
-  grandchild_split: "Sentence split",
-  embed_children: "Embed children",
+  front_matter: "Front-matter",
+  family_split: "Family split",
+  parent_split: "Parent AST split",
+  child_split: "Child blocks",
+  grandchild_split: "Grandchild sentences",
+  embed_family: "Embed family",
+  embed_parent: "Embed parents",
+  embed_child: "Embed children",
+  embed_grandchild: "Embed grandchildren",
   neo4j_upsert: "Neo4j upsert",
 };
 
@@ -20,9 +30,10 @@ type StepStatus = "done" | "running" | "pending";
 
 function phaseMetrics(phase: IngestPhase): string {
   const parts: string[] = [];
+  if (phase.family_count != null) parts.push(`${phase.family_count} families`);
   if (phase.parent_count != null) parts.push(`${phase.parent_count} parents`);
   if (phase.child_count != null) parts.push(`${phase.child_count} children`);
-  if (phase.grandchild_count != null) parts.push(`${phase.grandchild_count} sentences`);
+  if (phase.grandchild_count != null) parts.push(`${phase.grandchild_count} grandchildren`);
   if (phase.embedded_count != null) parts.push(`${phase.embedded_count} embedded`);
   parts.push(`${phase.latency_ms} ms`);
   return parts.join(" · ");

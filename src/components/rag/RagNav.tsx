@@ -3,6 +3,7 @@ import Link from "next/link";
 const NAV_ITEMS = [
   { href: "/rag/search", label: "Search" },
   { href: "/rag/library", label: "Library" },
+  { href: "/rag/memory", label: "Memory" },
 ] as const;
 
 export function RagNav() {
@@ -13,9 +14,6 @@ export function RagNav() {
           {item.label}
         </Link>
       ))}
-      <span className="rag-nav-disabled" title="Phase 2 — graph memory">
-        Memory
-      </span>
       <Link href="/" className="cp-link rag-nav-home">
         Home
       </Link>
